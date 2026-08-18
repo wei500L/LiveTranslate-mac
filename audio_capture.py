@@ -490,4 +490,4 @@ class AudioCapture:
 # The public class remains stable for main.py and tests.  Importing the macOS
 # implementation is lazy at module end so Windows keeps its WASAPI behavior.
 if sys.platform == "darwin":  # pragma: no cover - requires macOS CoreAudio
-    from audio_capture_pyaudio import PyAudioCapture as AudioCapture
+    from audio_capture_sck import MacAudioCapture as AudioCapture

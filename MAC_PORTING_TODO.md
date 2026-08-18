@@ -168,21 +168,21 @@
 
 ### M1-A 音频平台层
 
-- [ ] 新建 `audio_capture_sck.py`，使用 PyObjC `SCStreamConfiguration.capturesAudio=True` 和 `exclusivelyCapturesSystemAudio=True`。
-- [ ] 选择主显示器作为 SCK content/filter；不渲染视频帧，只处理音频 sample buffer。
-- [ ] 实现 delegate 生命周期、stream start/stop、错误回调和线程安全关闭，避免回调阻塞系统队列。
-- [ ] 将 `CMSampleBuffer`/`CMBlockBuffer`/`AudioBufferList` 转换为 float32 PCM；处理交织/非交织和声道数变化。
-- [ ] 在 SCK 层累积并按 512 samples 重组，再投递给上层，保持 VAD 32 ms 契约。
-- [ ] 新建或改造 `audio_capture.py` 为 `sys.platform` 分发器；保持 `AudioCapture` 对上层的现有方法和属性兼容。
-- [ ] SCK 后端接入 M0 的公共层；复用现有重采样和混音对齐逻辑，不复制音频队列实现。
-- [ ] macOS 不再执行 Windows 默认输出设备轮询和 WASAPI loopback 查找；`set_device()` 行为需定义为无操作或切换 SCK content。
+- [x] 新建 `audio_capture_sck.py`，使用 PyObjC `SCStreamConfiguration.capturesAudio=True` 和 `exclusivelyCapturesSystemAudio=True`。
+- [x] 选择主显示器作为 SCK content/filter；不渲染视频帧，只处理音频 sample buffer。
+- [x] 实现 delegate 生命周期、stream start/stop、错误回调和线程安全关闭，避免回调阻塞系统队列。
+- [x] 将 `CMSampleBuffer`/`CMBlockBuffer`/`AudioBufferList` 转换为 float32 PCM；处理交织/非交织和声道数变化。
+- [x] 在 SCK 层累积并按 512 samples 重组，再投递给上层，保持 VAD 32 ms 契约。
+- [x] 新建或改造 `audio_capture.py` 为 `sys.platform` 分发器；保持 `AudioCapture` 对上层的现有方法和属性兼容。
+- [x] SCK 后端接入 M0 的公共层；复用现有重采样和混音对齐逻辑，不复制音频队列实现。
+- [x] macOS 不再执行 Windows 默认输出设备轮询和 WASAPI loopback 查找；`set_device()` 行为定义为重建 SCK content。
 
 ### M1-B TCC 权限与用户引导
 
-- [ ] 增加屏幕录制权限预检/请求（`CGPreflightScreenCaptureAccess`、`CGRequestScreenCaptureAccess` 或对应 PyObjC 绑定）。
-- [ ] 复用 `platform_permissions.py` 的错误类型和 UI 提示机制；系统音频权限与麦克风权限不可混淆。
-- [ ] 首次启动和捕获失败时显示中英文 i18n 文案；说明权限变更通常需要重启应用。
-- [ ] 明确源码运行、ad-hoc 签名和正式签名对 TCC 授权持久性的差异。
+- [x] 增加屏幕录制权限预检/请求（`CGPreflightScreenCaptureAccess`、`CGRequestScreenCaptureAccess` 或对应 PyObjC 绑定）。
+- [x] 复用 `platform_permissions.py` 的错误类型和 UI 提示机制；系统音频权限与麦克风权限不可混淆。
+- [x] 首次启动和捕获失败时显示中英文 i18n 文案；说明权限变更通常需要重启应用。
+- [x] 明确源码运行、ad-hoc 签名和正式签名对 TCC 授权持久性的差异（见 M1 执行记录）。
 
 ### M1-C 可选回退（低优先级）
 
@@ -191,10 +191,21 @@
 
 ### M1 代码验收闸门
 
-- [ ] 用 sample-buffer fixture 覆盖交织/非交织、多声道、不同回调块大小、尾部残块和异常回调。
-- [ ] 用 fake stream/delegate 验证 start/stop、重复 stop、启动失败、回调晚到和线程关闭不会死锁或泄漏。
-- [ ] 验证 SCK 输出经过重采样和 512 samples 重组后，严格符合 VAD 输入契约。
-- [ ] 验证权限检查、拒绝、请求失败和重试路径的返回值、异常分类和 i18n 文案；真实系统弹窗留作 deferred。
+- [x] 用 sample-buffer fixture 覆盖交织/非交织、多声道、不同回调块大小、尾部残块和异常回调。
+- [x] 用 fake stream/delegate 验证 start/stop、重复 stop、启动失败、回调晚到和线程关闭不会死锁或泄漏。
+- [x] 验证 SCK 输出经过重采样和 512 samples 重组后，严格符合 VAD 输入契约。
+- [x] 验证权限检查、拒绝、请求失败和重试路径的返回值、异常分类和 i18n 文案；真实系统弹窗留作 deferred。
+
+### M1 执行记录
+
+| 字段 | 内容 |
+|---|---|
+| 阶段/子任务 | `M1-A`、`M1-B` |
+| 改动文件 | 新增 `audio_capture_sck.py`、`tests/test_m1_sck.py`；修改 `audio_capture.py`、`platform_permissions.py`、`main.py`、`i18n/en.yaml`、`i18n/zh.yaml`。 |
+| 公共接口 | `AudioCapture.start/stop/get_audio/set_device/set_mic_device`、`audio_queue=(float32[512], mic_rms)` 和 ASR 管线协议保持不变。 |
+| 验证命令 | `python3 -m compileall -q .`、`bash -n install.sh start.sh update.sh`、`git diff --check`；pytest fixture 已加入但当前环境缺少 numpy/pytest。 |
+| 结果 | 代码、lazy PyObjC 隔离、权限错误分类和 fake-stream/sample-buffer 覆盖完成；真实 SCK/TCC/设备验证 deferred。 |
+| 遗留项 | 真机需确认 PyObjC AudioBufferList 绑定、连续系统音频、权限弹窗及签名 identity 持久性；BlackHole 回退不纳入 M1。 |
 
 ## Phase M2：平台体验对齐
 

@@ -41,6 +41,10 @@ import os
 import torch  # noqa: F401
 
 from audio_capture import AudioCapture
+from platform_permissions import (
+    PermissionDeniedError,
+    PlatformUnavailableError,
+)
 from torch_backend import (
     accelerator_memory,
     empty_cache,
@@ -82,6 +86,15 @@ from dialogs import (
     _ModelLoadDialog,
 )
 from i18n import t, set_lang, LANGUAGES, COMMON_LANG_CODES
+
+
+def _audio_start_error(exc):
+    """Turn platform capture failures into actionable localized guidance."""
+    if isinstance(exc, PermissionDeniedError):
+        return t("error_screen_permission")
+    if isinstance(exc, PlatformUnavailableError):
+        return t("error_screen_dependency").format(error=exc)
+    return str(exc)
 
 _NO_PENDING = object()
 
@@ -1938,7 +1951,7 @@ def main():
             QMessageBox.warning(
                 panel,
                 t("error_title"),
-                t("error_audio_start").format(error=e),
+                t("error_audio_start").format(error=_audio_start_error(e)),
             )
 
     def on_pause():
