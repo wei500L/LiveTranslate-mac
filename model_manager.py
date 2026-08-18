@@ -70,7 +70,7 @@ ASR_MODEL_IDS = {
     "funasr-nano": "FunAudioLLM/Fun-ASR-Nano-2512",
     "funasr-mlt-nano": "FunAudioLLM/Fun-ASR-MLT-Nano-2512",
     "anime-whisper": "litagin/anime-whisper",
-    "gigaam": "salute-ai/GigaAM-v3-RNNT",
+    "gigaam": "ai-sage/GigaAM-v3",
 }
 
 FUNASR_MODEL_PROFILES = {
@@ -120,7 +120,7 @@ FUNASR_LEGACY_ENGINE_ALIASES = {
 # SenseVoice lives under `iic/` on ModelScope but `FunAudioLLM/` on HuggingFace.
 ASR_MODEL_IDS_HF = {
     "sensevoice": "FunAudioLLM/SenseVoiceSmall",
-    "gigaam": "salute-ai/GigaAM-v3-RNNT",
+    "gigaam": "ai-sage/GigaAM-v3",
 }
 
 
@@ -677,7 +677,12 @@ def download_asr(engine, model_size="medium", hub="ms", proxy="system"):
 
             model_id = ASR_MODEL_IDS[engine]
             log.info(f"Downloading {model_id} from HuggingFace...")
-            snapshot_download(repo_id=model_id, cache_dir=hf_cache)
+            if engine == "gigaam":
+                snapshot_download(
+                    repo_id=model_id, revision="e2e_rnnt", cache_dir=hf_cache
+                )
+            else:
+                snapshot_download(repo_id=model_id, cache_dir=hf_cache)
         elif engine == "whisper":
             if model_size not in _WHISPER_SIZES:
                 raise ValueError(f"Invalid local faster-whisper model: {model_size}")

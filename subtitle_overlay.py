@@ -826,6 +826,9 @@ class DragHandle(QWidget):
             self._source_lang.setCurrentIndex(idx)
             self._source_lang.blockSignals(False)
 
+    def set_source_language_enabled(self, enabled: bool):
+        self._source_lang.setEnabled(enabled)
+
     def set_models(self, models: list, active_index: int = 0):
         self._model_combo.blockSignals(True)
         self._model_combo.clear()
@@ -1271,6 +1274,9 @@ class SubtitleOverlay(QWidget):
 
     def set_source_language(self, lang: str):
         self._handle.set_source_language(lang)
+
+    def set_source_language_enabled(self, enabled: bool):
+        self._handle.set_source_language_enabled(enabled)
 
     def set_models(self, models: list, active_index: int = 0):
         self._handle.set_models(models, active_index)

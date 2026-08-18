@@ -417,8 +417,19 @@ class LiveTranslateApp:
             client.shutdown()
 
     def _set_asr_language(self, language: str):
+        if self._asr_type == "gigaam":
+            language = "ru"
         with self._asr_pending_lock:
             self._asr_pending_language = language
+
+    def _get_asr_language_setting(self) -> str:
+        """Return the active language hint, including fixed-language engines."""
+        configured = (
+            self._panel.get_settings().get("asr_language", "auto")
+            if self._panel
+            else "auto"
+        )
+        return "ru" if self._asr_type == "gigaam" else configured
 
     def _set_asr_padding(self, engine_type: str, pad_seconds):
         with self._asr_pending_lock:
@@ -579,7 +590,7 @@ class LiveTranslateApp:
             # URL is part of the identity so editing it triggers a reconnect.
             signature_model = remote_asr_url
         elif engine_type == "gigaam":
-            signature_model = "salute-ai/GigaAM-v3-RNNT"
+            signature_model = "ai-sage/GigaAM-v3@e2e_rnnt"
         else:
             signature_model = engine_type
         signature = (engine_type, signature_model, device, hub, compute)
@@ -1336,7 +1347,7 @@ class LiveTranslateApp:
             return
 
         source_lang = result["language"]
-        asr_lang_setting = self._panel.get_settings().get("asr_language", "auto") if self._panel else "auto"
+        asr_lang_setting = self._get_asr_language_setting()
         if asr_lang_setting != "auto" and source_lang != asr_lang_setting:
             log.info(
                 f"Language filter: expected '{asr_lang_setting}' but got '{source_lang}', "
@@ -1582,7 +1593,7 @@ class LiveTranslateApp:
         if not original_text or not any(c.isalnum() for c in original_text):
             return
 
-        asr_lang_setting = self._panel.get_settings().get("asr_language", "auto") if self._panel else "auto"
+        asr_lang_setting = self._get_asr_language_setting()
         if asr_lang_setting != "auto" and source_lang != asr_lang_setting:
             log.info(f"Language filter: expected '{asr_lang_setting}' but got '{source_lang}', discarding: {original_text[:60]}")
             return
@@ -1643,7 +1654,7 @@ class LiveTranslateApp:
             if self._interim_pending:
                 text = self._interim_pending
                 self._interim_pending = ""
-                lang = self._panel.get_settings().get("asr_language", "auto") if self._panel else "auto"
+                lang = self._get_asr_language_setting()
                 if lang == "auto":
                     lang = "unknown"
                 self._process_segment_text(text, lang)
@@ -2319,6 +2330,7 @@ def main():
     for code, native in LANGUAGES:
         label = t("asr_lang_auto") if code == "auto" else native
         action = QAction(f"{code} - {label}", checkable=True)
+        action.setData(code)
         asr_lang_action_group.addAction(action)
         action.triggered.connect(lambda checked, c=code: _on_tray_asr_lang(c))
         if code in COMMON_LANG_CODES:
@@ -2329,13 +2341,39 @@ def main():
 
     asr_lang_menu.addMenu(asr_more_menu)
 
-    current_asr_lang = panel.get_settings().get("asr_language", "auto")
+    def _sync_asr_language_controls(index=None):
+        """Keep every source-language entry point consistent with GigaAM."""
+        is_gigaam = (panel._asr_engine.currentIndex() if index is None else index) == 3
+        if is_gigaam:
+            ru_idx = panel._asr_lang.findData("ru")
+            if ru_idx >= 0 and panel._asr_lang.currentData() != "ru":
+                panel._asr_lang.blockSignals(True)
+                panel._asr_lang.setCurrentIndex(ru_idx)
+                panel._asr_lang.blockSignals(False)
+            overlay.set_source_language("ru")
+        panel._asr_lang.setEnabled(not is_gigaam)
+        overlay.set_source_language_enabled(not is_gigaam)
+        selected = "ru" if is_gigaam else (panel._asr_lang.currentData() or "auto")
+        for action in _asr_lang_actions.values():
+            action.setEnabled(not is_gigaam)
+            action.setChecked(action.data() == selected)
+
+    panel._asr_engine.currentIndexChanged.connect(_sync_asr_language_controls)
+    _sync_asr_language_controls()
+
+    current_asr_lang = (
+        "ru"
+        if panel._asr_engine.currentIndex() == 3
+        else panel.get_settings().get("asr_language", "auto")
+    )
     if current_asr_lang in _asr_lang_actions:
         _asr_lang_actions[current_asr_lang].setChecked(True)
 
     def _on_tray_asr_lang(code):
         from control_panel import _save_settings
 
+        if panel._asr_engine.currentIndex() == 3:
+            code = "ru"
         live_trans._set_asr_language(code)
         settings = panel.get_settings()
         settings["asr_language"] = code
@@ -2381,12 +2419,16 @@ def main():
 
     def _on_overlay_source_lang(code):
         """Overlay source language combo → sync to panel + ASR engine + tray."""
+        if panel._asr_engine.currentIndex() == 3:
+            code = "ru"
         _on_tray_asr_lang(code)
         overlay.set_source_language(code)
 
     def _on_panel_asr_lang_changed(_index):
         """Panel ASR language combo → sync to overlay."""
-        code = panel._asr_lang.currentData() or "auto"
+        code = "ru" if panel._asr_engine.currentIndex() == 3 else (
+            panel._asr_lang.currentData() or "auto"
+        )
         overlay.set_source_language(code)
 
     overlay.source_language_changed.connect(_on_overlay_source_lang)
