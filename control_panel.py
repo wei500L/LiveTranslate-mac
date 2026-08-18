@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import subprocess
 import sys
 import threading
 from pathlib import Path
@@ -58,6 +59,17 @@ from torch_backend import available_devices, mps_available, normalize_device
 log = logging.getLogger("LiveTranslate.Panel")
 
 SETTINGS_FILE = Path(__file__).parent / "user_settings.json"
+
+
+def _open_folder(path):
+    """Open a folder using the host platform's file manager."""
+    path = str(path)
+    if sys.platform == "darwin":
+        subprocess.Popen(["open", path])
+    elif sys.platform.startswith("win"):
+        os.startfile(path)
+    else:
+        subprocess.Popen(["xdg-open", path])
 
 
 def _load_saved_settings() -> dict | None:
@@ -1028,12 +1040,7 @@ class ControlPanel(QWidget):
         self._cache_total.setFont(QFont(default_mono_font_family(), 9, QFont.Weight.Bold))
         top_row.addWidget(self._cache_total, 1)
         open_btn = QPushButton(t("btn_open_folder"))
-        open_btn.clicked.connect(
-            lambda: (
-                MODELS_DIR.mkdir(parents=True, exist_ok=True),
-                os.startfile(str(MODELS_DIR)),
-            )
-        )
+        open_btn.clicked.connect(self._open_models_folder)
         top_row.addWidget(open_btn)
         delete_all_btn = QPushButton(t("btn_delete_all_exit"))
         delete_all_btn.clicked.connect(self._delete_all_and_exit)
@@ -1054,7 +1061,11 @@ class ControlPanel(QWidget):
         from pathlib import Path
         ts_dir = Path(__file__).parent / "transcripts"
         ts_dir.mkdir(parents=True, exist_ok=True)
-        os.startfile(str(ts_dir))
+        _open_folder(ts_dir)
+
+    def _open_models_folder(self):
+        MODELS_DIR.mkdir(parents=True, exist_ok=True)
+        _open_folder(MODELS_DIR)
 
     def _on_tab_changed(self, index):
         if index == self._cache_tab_index:

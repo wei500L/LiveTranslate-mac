@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import sys
+import threading
 
 
 class PlatformUnavailableError(RuntimeError):
@@ -51,12 +52,24 @@ def request_microphone_permission() -> bool:
     try:
         from AVFoundation import AVCaptureDevice, AVMediaTypeAudio
 
-        # PyObjC's completion callback is asynchronous; this call only starts
-        # the request.  A subsequent status check reflects the user's choice.
+        # PyObjC invokes the completion handler asynchronously.  Do not let
+        # callers initialize the audio backend until the user's choice is
+        # available; otherwise first-launch permission prompts race PyAudio.
+        completed = threading.Event()
+        result = []
+
+        def completion(granted):
+            result.append(bool(granted))
+            completed.set()
+
         AVCaptureDevice.requestAccessForMediaType_completionHandler_(
-            AVMediaTypeAudio, lambda granted: None
+            AVMediaTypeAudio, completion
         )
-        return microphone_permission_status() != "denied"
+        if not completed.wait(timeout=60):
+            # A callback timeout must not be treated as authorization.  A
+            # status check handles environments where the callback is lost.
+            return microphone_permission_status() == "granted"
+        return result[0]
     except (ImportError, AttributeError) as exc:
         raise PlatformUnavailableError(
             "PyObjC AVFoundation is required for microphone permissions"
@@ -70,4 +83,7 @@ def ensure_microphone_permission(*, request: bool = False) -> None:
             "Microphone access is denied; enable it in System Settings > Privacy & Security"
         )
     if request and status != "granted":
-        request_microphone_permission()
+        if not request_microphone_permission():
+            raise PermissionDeniedError(
+                "Microphone access was not granted; enable it in System Settings > Privacy & Security"
+            )

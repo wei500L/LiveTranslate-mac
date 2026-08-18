@@ -160,13 +160,27 @@ class PyAudioCapture(AudioCaptureBase):
     def set_mic_device(self, device_name):
         if device_name == self._mic_device_name:
             return True
+        previous_device = self._mic_device_name
         was_running = self._running
         if was_running:
             self.stop()
         self._mic_device_name = device_name
         if was_running:
             self._metrics.restart_count += 1
-            self.start()
+            try:
+                self.start()
+            except Exception as exc:
+                # A failed replacement must not leave the pipeline pointing at
+                # a stopped backend.  Restore the previous device and attempt
+                # to resume it before reporting the change as unsuccessful.
+                self._metrics.last_error = str(exc)
+                self._mic_device_name = previous_device
+                try:
+                    self.start()
+                except Exception as restore_exc:
+                    self._metrics.last_error = str(restore_exc)
+                    log.error("Failed to restore microphone after switch: %s", restore_exc)
+                return False
         return True
 
     def stop(self):

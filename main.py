@@ -336,7 +336,14 @@ class LiveTranslateApp:
                 if self._overlay:
                     self._overlay.update_monitor(0.0, 0.0)
         if "mic_device" in settings:
-            self._audio.set_mic_device(settings["mic_device"])
+            mic_changed = self._audio.set_mic_device(settings["mic_device"])
+            if mic_changed is False:
+                log.warning("Microphone switch failed; keeping the previous device")
+                # PyAudioCapture attempts to restore the old stream.  If that
+                # recovery also failed, stop the pipeline instead of leaving
+                # its capture thread waiting on a dead backend.
+                if self._running and not getattr(self._audio, "_running", True):
+                    self.stop()
         if "incremental_asr" in settings:
             self._incremental_enabled = settings["incremental_asr"]
         if "interim_interval" in settings:
