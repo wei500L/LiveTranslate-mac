@@ -232,6 +232,7 @@ class ControlPanel(QWidget):
                 f"[{t('asr_accurate')}] Whisper (faster-whisper)",
                 f"[{t('asr_fast')}] FunASR",
                 "Anime-Whisper (ja, anime/galgame)",
+                t("asr_gigaam"),
                 "Remote Whisper (remote GPU server)",
             ]
         )
@@ -239,7 +240,8 @@ class ControlPanel(QWidget):
             "whisper": 0,
             "funasr": 1,
             "anime-whisper": 2,
-            "remote-whisper": 3,
+            "gigaam": 3,
+            "remote-whisper": 4,
         }
         engine_idx = engine_map_idx.get(s.get("asr_engine"), 0)
         self._asr_engine.setCurrentIndex(engine_idx)
@@ -431,7 +433,7 @@ class ControlPanel(QWidget):
         self._remote_url_edit.editingFinished.connect(self._auto_save)
         remote_layout.addWidget(self._remote_url_edit, 1)
         layout.addWidget(self._remote_group)
-        self._remote_group.setVisible(engine_idx == 3)
+        self._remote_group.setVisible(engine_idx == 4)
 
         mode_group = QGroupBox(t("group_vad_mode"))
         mode_layout = QVBoxLayout(mode_group)
@@ -1130,6 +1132,15 @@ class ControlPanel(QWidget):
     def _on_engine_changed_whisper_vis(self, index):
         self._whisper_group.setVisible(index == 0)
         is_funasr = index == 1
+        is_gigaam = index == 3
+        if hasattr(self, "_asr_lang"):
+            self._asr_lang.setEnabled(not is_gigaam)
+            if is_gigaam:
+                ru_idx = self._asr_lang.findData("ru")
+                if ru_idx >= 0:
+                    self._asr_lang.blockSignals(True)
+                    self._asr_lang.setCurrentIndex(ru_idx)
+                    self._asr_lang.blockSignals(False)
         if hasattr(self, "_funasr_model_combo"):
             self._funasr_model_label.setVisible(is_funasr)
             self._funasr_model_combo.setVisible(is_funasr)
@@ -1144,7 +1155,7 @@ class ControlPanel(QWidget):
             self._sensevoice_pad_label.setVisible(show_funasr_pad)
             self._sensevoice_pad_seconds.setVisible(show_funasr_pad)
         if hasattr(self, "_remote_group"):
-            self._remote_group.setVisible(index == 3)
+            self._remote_group.setVisible(index == 4)
         # Resize window to fit content after whisper group visibility change
         QTimer.singleShot(0, self._fit_height)
 
@@ -1452,12 +1463,15 @@ class ControlPanel(QWidget):
             self._prompt_preset.blockSignals(False)
 
     def _apply_settings(self):
-        self._current_settings["asr_language"] = self._get_asr_lang_code()
+        self._current_settings["asr_language"] = (
+            "ru" if self._asr_engine.currentIndex() == 3 else self._get_asr_lang_code()
+        )
         engine_map = {
             0: "whisper",
             1: "funasr",
             2: "anime-whisper",
-            3: "remote-whisper",
+            3: "gigaam",
+            4: "remote-whisper",
         }
         self._current_settings["asr_engine"] = engine_map.get(
             self._asr_engine.currentIndex(), "whisper"

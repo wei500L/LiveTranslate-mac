@@ -70,6 +70,7 @@ ASR_MODEL_IDS = {
     "funasr-nano": "FunAudioLLM/Fun-ASR-Nano-2512",
     "funasr-mlt-nano": "FunAudioLLM/Fun-ASR-MLT-Nano-2512",
     "anime-whisper": "litagin/anime-whisper",
+    "gigaam": "salute-ai/GigaAM-v3-RNNT",
 }
 
 FUNASR_MODEL_PROFILES = {
@@ -119,6 +120,7 @@ FUNASR_LEGACY_ENGINE_ALIASES = {
 # SenseVoice lives under `iic/` on ModelScope but `FunAudioLLM/` on HuggingFace.
 ASR_MODEL_IDS_HF = {
     "sensevoice": "FunAudioLLM/SenseVoiceSmall",
+    "gigaam": "salute-ai/GigaAM-v3-RNNT",
 }
 
 
@@ -142,6 +144,7 @@ ASR_DISPLAY_NAMES = {
     "whisper": "Whisper",
     "anime-whisper": "Anime-Whisper",
     "remote-whisper": "Remote-Whisper",
+    "gigaam": "GigaAM (ru)",
 }
 
 _MODEL_SIZE_BYTES = {
@@ -155,6 +158,7 @@ _MODEL_SIZE_BYTES = {
     "whisper-medium": 1_530_000_000,
     "whisper-large-v3": 3_100_000_000,
     "anime-whisper": 3_100_000_000,
+    "gigaam": 1_200_000_000,
 }
 
 _WHISPER_SIZES = ["tiny", "base", "small", "medium", "large-v3"]
@@ -164,6 +168,7 @@ _CACHE_MODELS = [
     ("Fun-ASR-Nano", "funasr", "funasr-nano-2512"),
     ("Fun-ASR-MLT-Nano", "funasr", "funasr-mlt-nano-2512"),
     ("Anime-Whisper", "anime-whisper"),
+    ("GigaAM (ru)", "gigaam"),
 ]
 
 
@@ -441,6 +446,21 @@ def is_asr_cached(engine_type, model_size="medium", hub="ms") -> bool:
             if has_weights and has_config:
                 return True
         return False
+    if engine_type == "gigaam":
+        model_id = ASR_MODEL_IDS_HF[engine_type]
+        org, name = model_id.split("/", 1)
+        snap_root = (
+            MODELS_DIR / "huggingface" / "hub" / f"models--{org}--{name}" / "snapshots"
+        )
+        if not snap_root.exists():
+            return False
+        for snap in snap_root.iterdir():
+            has_weights = any(
+                (snap / fn).exists() for fn in ("model.safetensors", "pytorch_model.bin")
+            ) or any(snap.glob("*.safetensors"))
+            if snap.is_dir() and (snap / "config.json").exists() and has_weights:
+                return True
+        return False
     elif engine_type == "whisper":
         if model_size not in _WHISPER_SIZES:
             return resolve_custom_whisper_model(model_size) is not None
@@ -651,7 +671,7 @@ def download_asr(engine, model_size="medium", hub="ms", proxy="system"):
             neutralize_funasr_requirements(funasr_dir)
             if funasr_dir and funasr_profile(model_key)["family"] == "funasr-nano":
                 ensure_qwen_weights(funasr_dir, hub=hub)
-        elif engine == "anime-whisper":
+        elif engine in ("anime-whisper", "gigaam"):
             # HF-only, ignore hub setting
             from huggingface_hub import snapshot_download
 
@@ -727,7 +747,7 @@ def get_cache_entries():
         hf_org, hf_model = asr_model_id(engine, "hf", model_key).split("/")
         ms_path = _ms_model_path(ms_org, ms_model)
         hf_path = hf_base / f"models--{hf_org}--{hf_model}"
-        if ms_path.exists():
+        if engine != "gigaam" and ms_path.exists():
             entries.append((f"{name} (ModelScope)", ms_path))
         if hf_path.exists():
             entries.append((f"{name} (HuggingFace)", hf_path))

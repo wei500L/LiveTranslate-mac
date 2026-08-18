@@ -2,7 +2,7 @@
 
 [English](README.md) | **中文**
 
-Windows 实时音频翻译工具。捕获系统音频（WASAPI loopback）和可选的麦克风输入，语音识别后调用 LLM API 翻译，结果显示在透明悬浮字幕窗口上。
+Windows/macOS 实时音频翻译工具。Windows 使用 WASAPI loopback，macOS 使用 ScreenCaptureKit，并支持可选麦克风输入；语音识别后调用 LLM API 翻译，结果显示在透明悬浮字幕窗口上。
 
 适用于看外语视频、直播、语音对话等场景——无需修改播放器，全局音频捕获即开即用。
 
@@ -21,7 +21,7 @@ Windows 实时音频翻译工具。捕获系统音频（WASAPI loopback）和可
 ## 功能特性
 
 - **实时翻译管线**：系统音频 → VAD → ASR → LLM 翻译 → 字幕显示
-- **多 ASR 引擎**：faster-whisper、SenseVoice、FunASR Nano、Anime-Whisper
+- **多 ASR 引擎**：faster-whisper、SenseVoice、FunASR Nano、Anime-Whisper、GigaAM（俄语）
 - **远程 ASR**：通过 HTTP 把语音识别放到 GPU 机器上跑 —— 见 [REMOTE_ASR.md](REMOTE_ASR.md)
 - **兼容任意 OpenAI 格式 API**：DeepSeek、Grok、Qwen、GPT、Ollama、vLLM 等
 - **流式翻译显示**：翻译结果逐字实时显示
@@ -29,7 +29,7 @@ Windows 实时音频翻译工具。捕获系统音频（WASAPI loopback）和可
 - **麦克风混音**：可选将麦克风输入混合到系统音频一起识别
 - **低延迟 VAD**：32ms 音频块 + Silero VAD，自适应静音检测
 - **透明悬浮窗**：始终置顶、鼠标穿透、可拖拽，14 种配色主题
-- **CUDA 加速**：ASR 模型 GPU 推理
+- **硬件加速**：Windows 支持 CUDA；Apple Silicon 的 torch ASR 使用 MPS，并自动回退 CPU
 - **模型自动管理**：首次启动向导，支持 ModelScope / HuggingFace 双源
 - **内置基准测试**：对比翻译模型速度和质量
 
@@ -108,7 +108,7 @@ pip install -r requirements.txt
 ## 架构
 
 ```
-Audio (WASAPI 32ms) → VAD (Silero) → ASR → LLM Translation → Overlay
+Audio (WASAPI/SCK，32ms) → VAD (Silero) → ASR → LLM Translation → Overlay
          ↑ 可选麦克风混音
 ```
 
@@ -121,6 +121,7 @@ main.py                 主入口，管线编排
 ├── asr_sensevoice.py   SenseVoice 后端
 ├── asr_funasr_nano.py  FunASR Nano 后端
 ├── asr_anime_whisper.py Anime-Whisper 后端 (日语动画/Galgame)
+├── asr_gigaam.py        GigaAM 后端（仅俄语，MPS/CPU）
 ├── asr_remote.py        远程 Whisper 客户端 (→ asr_server.py, 见 REMOTE_ASR.md)
 ├── translator.py       OpenAI 兼容翻译客户端 (流式/JSON/上下文)
 ├── model_manager.py    模型下载与缓存管理

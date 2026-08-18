@@ -30,6 +30,7 @@ from PyQt6.QtGui import (
 from PyQt6.QtWidgets import QApplication, QWidget, QVBoxLayout
 from platform_clickthrough import set_click_through
 from platform_fonts import default_cjk_font_family
+from platform_app import is_macos, position_is_visible
 
 
 def _resolve_image_path(path: str) -> str:
@@ -524,11 +525,7 @@ class SubtitleWindow(QWidget):
 
     @staticmethod
     def _is_pos_visible(x, y, margin=50):
-        for screen in QApplication.screens():
-            geo = screen.availableGeometry()
-            if geo.left() <= x + margin and x < geo.right() and geo.top() <= y + margin and y < geo.bottom():
-                return True
-        return False
+        return position_is_visible(x, y, margin)
 
     def _clamp_to_screen(self):
         x, y = self.x(), self.y()
@@ -543,10 +540,12 @@ class SubtitleWindow(QWidget):
         self.move(nx, ny)
 
     def _setup_ui(self):
-        self.setWindowFlags(
-            Qt.WindowType.FramelessWindowHint
-            | Qt.WindowType.WindowStaysOnTopHint
-        )
+        flags = Qt.WindowType.FramelessWindowHint | Qt.WindowType.WindowStaysOnTopHint
+        # Keep the OBS subtitle surface out of Dock/Cmd-Tab on macOS.  Windows
+        # retains its historical taskbar behavior and can toggle Qt.Tool later.
+        if is_macos():
+            flags |= Qt.WindowType.Tool
+        self.setWindowFlags(flags)
         self.setWindowTitle("LiveTranslate Subtitle")
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground, True)

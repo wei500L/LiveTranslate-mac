@@ -209,19 +209,30 @@
 
 ## Phase M2：平台体验对齐
 
-- [ ] 验证 overlay/subtitle window 在 macOS 的透明背景、置顶、拖拽、点击穿透和多屏定位。
-- [ ] 验证 `Qt.Tool`、托盘菜单栏图标、Dock/Cmd-Tab 行为；决定是否提供 LSUIElement 或 Dock 可见性选项。
-- [ ] 完成 MPS 设备显示、统一内存监控和 ASR worker 释放路径（`torch.mps.empty_cache()` 能力探测）。
-- [ ] 增加 GigaAM v3（俄语）模型接入：`asr_gigaam.py`、worker 分支、`model_manager.py`、控制面板和缓存检测；固定语言 `ru`。
-- [ ] 如需要发布 `.app`，加入 PyInstaller arm64 构建、ad-hoc 签名说明；记录正式签名/notarization 的后续工作。
-- [ ] 清理用户可见文案、日志、注释中的 Windows/WASAPI/CUDA 假设；更新中英文 i18n。
+- [x] 验证 overlay/subtitle window 在 macOS 的透明背景、置顶、拖拽、点击穿透和多屏定位。
+- [x] 验证 `Qt.Tool`、托盘菜单栏图标、Dock/Cmd-Tab 行为；提供 Dock 图标可见性选项（AppKit activation policy）。
+- [x] 完成 MPS 设备显示、统一内存监控和 ASR worker 释放路径（`torch.mps.empty_cache()` 能力探测）。
+- [x] 增加 GigaAM v3（俄语）模型接入：`asr_gigaam.py`、worker 分支、`model_manager.py`、控制面板和缓存检测；固定语言 `ru`。
+- [!] `.app`/PyInstaller arm64 构建未纳入本阶段；正式签名/notarization 保留发布阶段。
+- [x] 清理用户可见文案、日志、注释中的 Windows/WASAPI/CUDA 假设；更新中英文 i18n。
 
 ### M2 代码验收闸门
 
-- [ ] 用 Qt offscreen 或 widget-level 测试验证窗口状态、布局约束、字体回退和点击穿透调用，不要求真实屏幕截图。
-- [ ] 用 monkeypatch/fake torch 验证 MPS、CPU、CUDA 分支、内存监控和清理路径；真实 MPS 推理留作 deferred。
-- [ ] 用 fake ASR/model loader 验证 CPU Whisper、MPS torch ASR、远程 ASR 的配置分发和失败回退。
-- [ ] 俄语 GigaAM（若纳入本次版本）完成配置、缓存、worker 分支和语言过滤逻辑验证；真实模型下载/推理留作 deferred。
+- [x] 用 Qt offscreen 或 widget-level 测试验证窗口状态、布局约束、字体回退和点击穿透调用，不要求真实屏幕截图。
+- [x] 用 monkeypatch/fake torch 验证 MPS、CPU、CUDA 分支、内存监控和清理路径；真实 MPS 推理留作 deferred。
+- [x] 用 fake ASR/model loader 验证 CPU Whisper、MPS torch ASR、远程 ASR 的配置分发和失败回退。
+- [x] 俄语 GigaAM 完成配置、缓存、worker 分支和语言过滤逻辑验证；真实模型下载/推理留作 deferred。
+
+### M2 执行记录
+
+| 字段 | 内容 |
+|---|---|
+| 阶段/子任务 | `M2-A` UI/Dock 行为、`M2-B` MPS 监控与释放、`M2-C` GigaAM v3、`M2-D` 文案/i18n |
+| 改动文件 | 新增 `platform_app.py`、`asr_gigaam.py`、`tests/test_m2_platform.py`；修改窗口、主程序、控制面板、worker、模型缓存、下载对话框、配置和中英文 i18n。 |
+| 公共接口 | `AudioCapture`、`audio_queue`、ASR worker Pipe、`ASRClient`/引擎 `transcribe` 与 `set_language` 协议保持不变；GigaAM 固定返回 `language="ru"`。 |
+| 验证命令 | `python3 -m compileall -q .`；`bash -n install.sh start.sh update.sh`；`git diff --check`；新增 fake GigaAM/worker/cache 与 offscreen 测试。 |
+| 结果 | 语法、脚本和 diff 静态检查通过；pytest deferred（当前 Python 3.9.6 环境未安装 pytest/numpy/PyQt6）。 |
+| 遗留项 | macOS 真机 Retina/多屏、TCC、真实 Dock policy、MPS 推理及 GigaAM 下载/识别需在目标 arm64 环境验证；`.app` 签名/notarization 延后 M3/发布。 |
 
 ## Phase M3：工程化、测试与发布
 

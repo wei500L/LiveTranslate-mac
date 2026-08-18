@@ -28,6 +28,7 @@ def _mac_ns_window(window):
         return native
     try:
         import objc
+        from ctypes import c_void_p
     except ImportError as exc:
         raise ClickThroughUnavailableError(
             "PyObjC AppKit is required for macOS click-through"

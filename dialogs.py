@@ -437,6 +437,7 @@ class ModelDownloadDialog(QDialog):
                     "funasr-nano",
                     "funasr-mlt-nano",
                     "anime-whisper",
+                    "gigaam",
                 ):
                     download_asr(m["type"], hub=self._hub, proxy=self._proxy)
                 elif m["type"].startswith("funasr:"):
@@ -800,4 +801,3 @@ def _load_latest_changelog() -> tuple[str, str]:
     # Drop the top-level file heading (# Title) — keep everything from first H2 onwards
     body = text[m.start():]
     return title, _changelog_to_html(body)
-

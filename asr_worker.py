@@ -88,6 +88,10 @@ def _load_engine(config: dict):
         else:
             worker_device = torch_device
         engine = AnimeWhisperEngine(device=worker_device, hub=hub)
+    elif engine_type == "gigaam":
+        from asr_gigaam import GigaAMEngine
+
+        engine = GigaAMEngine(device=torch_device, hub="hf")
     else:
         from asr_engine import ASREngine
 
@@ -108,7 +112,7 @@ def _load_engine(config: dict):
         )
 
     if hasattr(engine, "set_language"):
-        engine.set_language(language)
+        engine.set_language("ru" if engine_type == "gigaam" else language)
     return engine
 
 

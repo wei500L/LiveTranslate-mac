@@ -1,7 +1,4 @@
-"""
-LiveTranslate - Phase 0 Prototype
-Real-time audio translation using WASAPI loopback + faster-whisper + LLM.
-"""
+"""LiveTranslate cross-platform real-time audio translation application."""
 
 import sys
 import signal
@@ -37,7 +34,7 @@ apply_cache_env()
 
 import os
 
-# torch must be imported before PyQt6 to avoid DLL conflicts on Windows
+# Keep torch initialization ahead of Qt for consistent backend startup.
 import torch  # noqa: F401
 
 from audio_capture import AudioCapture
@@ -54,6 +51,7 @@ from torch_backend import (
     normalize_device,
 )
 from platform_fonts import default_mono_font_family, default_ui_font_family
+from platform_app import configure_application, set_dock_visible
 from platform_config import normalize_config
 from vad_processor import VADProcessor
 from asr_client import ASRClient, ASRWorkerError, ASRWorkerExited, ASRWorkerTimeout
@@ -324,6 +322,8 @@ class LiveTranslateApp:
             self._overlay.apply_style(settings["style"])
         if "asr_language" in settings:
             self._set_asr_language(settings["asr_language"])
+            if self._overlay:
+                self._overlay.set_source_language(settings["asr_language"])
         if "sensevoice_pad_seconds" in settings:
             self._set_asr_padding("funasr", settings["sensevoice_pad_seconds"])
         if "whisper_pad_seconds" in settings:
@@ -578,6 +578,8 @@ class LiveTranslateApp:
         elif engine_type == "remote-whisper":
             # URL is part of the identity so editing it triggers a reconnect.
             signature_model = remote_asr_url
+        elif engine_type == "gigaam":
+            signature_model = "salute-ai/GigaAM-v3-RNNT"
         else:
             signature_model = engine_type
         signature = (engine_type, signature_model, device, hub, compute)
@@ -616,6 +618,8 @@ class LiveTranslateApp:
             display_name = f"Whisper {display_model}"
         elif engine_type == "funasr":
             display_name = funasr_display_name(funasr_model)
+        elif engine_type == "gigaam":
+            display_name = ASR_DISPLAY_NAMES["gigaam"]
 
         parent = (
             self._panel if self._panel and self._panel.isVisible() else self._overlay
@@ -628,8 +632,12 @@ class LiveTranslateApp:
             "device": device,
             "compute_type": compute,
             "hub": hub,
-            "language": settings.get(
-                "asr_language", self._config["asr"].get("language", "auto")
+            "language": (
+                "ru"
+                if engine_type == "gigaam"
+                else settings.get(
+                    "asr_language", self._config["asr"].get("language", "auto")
+                )
             ),
             "pad_seconds": (
                 settings.get(
@@ -1823,9 +1831,10 @@ def main():
         "qt.text.font.db=false;qt.qpa.fonts.warning=false"
     )
     app = QApplication(sys.argv)
-    app.setQuitOnLastWindowClosed(False)
-    # Pin a guaranteed TrueType UI font to avoid DirectWrite failures on the
-    # legacy "MS Sans Serif" bitmap font Windows may resolve as the default
+    dock_visible = bool((saved or {}).get("dock_visible", True))
+    configure_application(app, dock_visible=dock_visible)
+    # Pin the platform UI family when Qt has it available; this also avoids
+    # bitmap fallback fonts on older desktop environments.
     ui_font = default_ui_font_family()
     if ui_font in QFontDatabase.families():
         app.setFont(QFont(ui_font, 9))
@@ -2168,6 +2177,9 @@ def main():
     autoscroll_action = QAction(t("auto_scroll"), checkable=True)
     autoscroll_action.setChecked(True)
     taskbar_action = QAction(t("taskbar"), checkable=True)
+    dock_action = QAction(t("dock_icon"), checkable=True)
+    dock_action.setChecked(dock_visible)
+    dock_action.setVisible(sys.platform == "darwin")
 
     # Tray → overlay sync
     ct_action.toggled.connect(lambda v: overlay._handle._ct_check.setChecked(v))
@@ -2180,6 +2192,13 @@ def main():
     taskbar_action.toggled.connect(
         lambda v: overlay._handle._taskbar_check.setChecked(v)
     )
+    def _set_dock_policy(visible):
+        if set_dock_visible(visible) or sys.platform != "darwin":
+            settings = panel.get_settings()
+            settings["dock_visible"] = bool(visible)
+            panel._current_settings["dock_visible"] = bool(visible)
+            _save_settings(settings)
+    dock_action.toggled.connect(_set_dock_policy)
 
     # Overlay → tray sync
     overlay._handle.click_through_toggled.connect(lambda v: ct_action.setChecked(v))
@@ -2193,6 +2212,7 @@ def main():
     overlay_menu.addAction(topmost_action)
     overlay_menu.addAction(autoscroll_action)
     overlay_menu.addAction(taskbar_action)
+    overlay_menu.addAction(dock_action)
     menu.addMenu(overlay_menu)
 
     # --- Model submenu ---

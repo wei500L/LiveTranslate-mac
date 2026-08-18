@@ -2,7 +2,7 @@
 
 **English** | [中文](README_zh.md)
 
-Real-time audio translation for Windows. Captures system audio (WASAPI loopback) and optional microphone input, runs ASR, translates via LLM API, and displays results in a transparent overlay.
+Real-time audio translation for Windows and macOS. Captures system audio (WASAPI loopback on Windows, ScreenCaptureKit on macOS) plus optional microphone input, runs ASR, translates via LLM API, and displays results in a transparent overlay.
 
 Works with any system audio — videos, livestreams, voice chat. No player modifications needed.
 
@@ -21,7 +21,7 @@ Works with any system audio — videos, livestreams, voice chat. No player modif
 ## Features
 
 - **Real-time pipeline**: System audio → VAD → ASR → LLM translation → overlay
-- **Multiple ASR engines**: faster-whisper, SenseVoice, FunASR Nano, Anime-Whisper
+- **Multiple ASR engines**: faster-whisper, SenseVoice, FunASR Nano, Anime-Whisper, GigaAM (Russian)
 - **Remote ASR**: offload speech recognition to a GPU machine over HTTP — see [REMOTE_ASR.md](REMOTE_ASR.md)
 - **Any OpenAI-compatible API**: DeepSeek, Grok, Qwen, GPT, Ollama, vLLM, etc.
 - **Streaming translation display**: Real-time character-by-character translation output
@@ -29,7 +29,7 @@ Works with any system audio — videos, livestreams, voice chat. No player modif
 - **Microphone mix-in**: Optionally mix microphone input with system audio for ASR
 - **Low-latency VAD**: 32ms chunks + Silero VAD with adaptive silence detection
 - **Transparent overlay**: Always-on-top, click-through, draggable, 14 color themes
-- **CUDA acceleration**: GPU-accelerated ASR inference
+- **Hardware acceleration**: CUDA on supported Windows setups; MPS on Apple Silicon for torch ASR, with CPU fallback
 - **Auto model management**: Setup wizard, ModelScope / HuggingFace dual sources
 - **Built-in benchmark**: Compare translation model speed and quality
 
@@ -108,7 +108,7 @@ Settings → Translation tab:
 ## Architecture
 
 ```
-Audio (WASAPI 32ms) → VAD (Silero) → ASR → LLM Translation → Overlay
+Audio (WASAPI/SCK, 32ms) → VAD (Silero) → ASR → LLM Translation → Overlay
          ↑ optional mic mix-in
 ```
 
@@ -121,6 +121,7 @@ main.py                 Entry point & pipeline
 ├── asr_sensevoice.py   SenseVoice backend
 ├── asr_funasr_nano.py  FunASR Nano backend
 ├── asr_anime_whisper.py Anime-Whisper backend (ja anime/galgame)
+├── asr_gigaam.py        GigaAM backend (Russian-only, MPS/CPU)
 ├── asr_remote.py        Remote Whisper client (→ asr_server.py, see REMOTE_ASR.md)
 ├── translator.py       OpenAI-compatible client (streaming, JSON schema, context)
 ├── model_manager.py    Model download & cache

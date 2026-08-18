@@ -931,7 +931,7 @@ class SubtitleOverlay(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
 
-        screen = QApplication.primaryScreen()
+        screen = QApplication.screenAt(QCursor.pos()) or QApplication.primaryScreen()
         geo = screen.availableGeometry()
         width = 620
         height = 500
