@@ -14,6 +14,10 @@ class PermissionDeniedError(PermissionError):
     pass
 
 
+class MicrophonePermissionDeniedError(PermissionDeniedError):
+    """Microphone TCC denial, distinct from Screen Recording denial."""
+
+
 class DeviceUnavailableError(RuntimeError):
     pass
 
@@ -79,12 +83,12 @@ def request_microphone_permission() -> bool:
 def ensure_microphone_permission(*, request: bool = False) -> None:
     status = microphone_permission_status()
     if status == "denied":
-        raise PermissionDeniedError(
+        raise MicrophonePermissionDeniedError(
             "Microphone access is denied; enable it in System Settings > Privacy & Security"
         )
     if request and status != "granted":
         if not request_microphone_permission():
-            raise PermissionDeniedError(
+            raise MicrophonePermissionDeniedError(
                 "Microphone access was not granted; enable it in System Settings > Privacy & Security"
             )
 

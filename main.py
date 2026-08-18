@@ -42,6 +42,8 @@ import torch  # noqa: F401
 
 from audio_capture import AudioCapture
 from platform_permissions import (
+    CaptureRuntimeError,
+    MicrophonePermissionDeniedError,
     PermissionDeniedError,
     PlatformUnavailableError,
 )
@@ -90,6 +92,8 @@ from i18n import t, set_lang, LANGUAGES, COMMON_LANG_CODES
 
 def _audio_start_error(exc):
     """Turn platform capture failures into actionable localized guidance."""
+    if isinstance(exc, MicrophonePermissionDeniedError):
+        return t("error_microphone_permission")
     if isinstance(exc, PermissionDeniedError):
         return t("error_screen_permission")
     if isinstance(exc, PlatformUnavailableError):
@@ -1667,7 +1671,16 @@ class LiveTranslateApp:
             dtype=np.float32,
         )
         while self._running:
-            item = self._audio.get_audio(timeout=1.0)
+            try:
+                item = self._audio.get_audio(timeout=1.0)
+            except CaptureRuntimeError as exc:
+                log.error("Audio capture stopped unexpectedly: %s", exc)
+                self._running = False
+                try:
+                    self._audio.stop()
+                except Exception as stop_exc:
+                    log.warning("Failed to clean up audio capture: %s", stop_exc)
+                break
             if item is None:
                 if self._vad._is_speaking and not self._paused:
                     n = self._vad._get_effective_silence_limit() + 1

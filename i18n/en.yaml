@@ -237,6 +237,7 @@ error_load_asr: "Failed to load ASR model:\n{error}"
 error_audio_start: "Failed to start audio capture:\n{error}"
 error_screen_permission: "Screen Recording permission is required. Enable LiveTranslate in System Settings > Privacy & Security > Screen Recording, then restart the app."
 error_screen_dependency: "Screen Recording capture is unavailable ({error}). Install the macOS dependencies and restart the app."
+error_microphone_permission: "Microphone permission is required. Enable LiveTranslate in System Settings > Privacy & Security > Microphone, then restart the app."
 asr_restore_succeeded: "Previous ASR worker was restored."
 asr_restore_failed: "Failed to restore previous ASR worker: {error}"
 

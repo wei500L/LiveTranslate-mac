@@ -10,9 +10,11 @@ psutil>=5.9.0
 pyaudio>=0.2.14
 pyobjc-framework-ScreenCaptureKit>=9.2
 pyobjc-framework-CoreMedia>=9.2
+pyobjc-framework-CoreAudio>=9.2
 pyobjc-framework-AVFoundation>=9.2
 pyobjc-framework-AppKit>=9.2
 pyobjc-framework-Quartz>=9.2
+pyobjc-framework-libdispatch>=9.2
 
 # Install native arm64 torch/torchaudio wheels for the active Python version.
 # Do not run this environment under Rosetta (platform.machine() must be arm64).

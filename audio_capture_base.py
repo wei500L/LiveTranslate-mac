@@ -97,6 +97,8 @@ class AudioCaptureBase:
         mic_rms=None,
         native_channels=1,
         native_rate=16000,
+        mic_native_channels=1,
+        mic_native_rate=16000,
     ):
         """Push a chunk; optional native format arguments normalize it first."""
         with self._lock:
@@ -106,7 +108,10 @@ class AudioCaptureBase:
             )
             if mic_audio is not None:
                 mic_audio = self.resample_to_mono(
-                    mic_audio, native_channels, native_rate, self.sample_rate
+                    mic_audio,
+                    mic_native_channels,
+                    mic_native_rate,
+                    self.sample_rate,
                 )
                 self._pending_mic = np.concatenate(
                     (

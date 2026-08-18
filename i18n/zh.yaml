@@ -236,6 +236,7 @@ error_load_asr: "ASR 模型加载失败:\n{error}"
 error_audio_start: "音频采集启动失败:\n{error}"
 error_screen_permission: "需要屏幕录制权限。请在‘系统设置 > 隐私与安全性 > 屏幕录制’中允许 LiveTranslate，然后重启应用。"
 error_screen_dependency: "屏幕录制采集不可用（{error}）。请安装 macOS 依赖后重启应用。"
+error_microphone_permission: "需要麦克风权限。请在‘系统设置 > 隐私与安全性 > 麦克风’中允许 LiveTranslate，然后重启应用。"
 asr_restore_succeeded: "已恢复上一个 ASR worker。"
 asr_restore_failed: "恢复上一个 ASR worker 也失败: {error}"
 

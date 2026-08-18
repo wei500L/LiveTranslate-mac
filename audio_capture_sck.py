@@ -58,7 +58,9 @@ def _decode_pcm(data, sample_format="float32", *, channels=1, interleaved=True):
     """Decode fixture/native bytes or arrays to mono float32 samples."""
     if isinstance(data, (list, tuple)) and data and isinstance(data[0], Mapping):
         data = [plane.get("data", plane.get("mData", b"")) for plane in data]
-    if isinstance(data, (list, tuple)) and data and isinstance(data[0], (bytes, bytearray)):
+    if isinstance(data, (list, tuple)) and data and isinstance(
+        data[0], (bytes, bytearray, memoryview)
+    ):
         planes = [
             _decode_pcm(plane, sample_format, channels=1, interleaved=True)
             for plane in data
@@ -110,6 +112,104 @@ def _sample_buffer_fixture(sample_buffer):
     return _decode_pcm(data, fmt, channels=channels, interleaved=interleaved), rate
 
 
+def _audio_buffer_list_planes(buffer_list):
+    """Extract the byte planes from common PyObjC AudioBufferList shapes."""
+    if buffer_list is None:
+        return None
+    if isinstance(buffer_list, Mapping):
+        buffers = buffer_list.get("mBuffers", buffer_list.get("buffers"))
+        if buffers is None and any(key in buffer_list for key in ("mData", "data")):
+            buffers = [buffer_list]
+    else:
+        buffers = getattr(buffer_list, "mBuffers", getattr(buffer_list, "buffers", None))
+        if buffers is None and any(hasattr(buffer_list, key) for key in ("mData", "data")):
+            buffers = [buffer_list]
+    if buffers is None:
+        if isinstance(buffer_list, (list, tuple)):
+            buffers = buffer_list
+        else:
+            try:
+                buffers = [buffer_list[index] for index in range(len(buffer_list))]
+            except (TypeError, IndexError, AttributeError):
+                return None
+    try:
+        buffers = list(buffers)
+    except TypeError:
+        buffers = [buffers]
+    planes = []
+    for buffer in buffers:
+        data = _field(buffer, "mData", _field(buffer, "data"))
+        if data is None:
+            continue
+        if isinstance(data, (bytes, bytearray, memoryview, np.ndarray)):
+            planes.append(data)
+    return planes or None
+
+
+def _sample_buffer_audio_buffer_list(CoreMedia, sample_buffer, channels):
+    """Best-effort bridge for PyObjC's AudioBufferList out-parameter API."""
+    for name in ("audio_buffer_list", "audioBufferList", "buffer_list"):
+        value = _field(sample_buffer, name)
+        planes = _audio_buffer_list_planes(value)
+        if planes:
+            return planes
+
+    getter = getattr(CoreMedia, "CMSampleBufferGetAudioBufferListWithRetainedBlockBuffer", None)
+    if getter is None:
+        return None
+    # PyObjC releases have exposed this C function both as a direct-return
+    # helper and as an out-parameter function. Try the supported shapes and
+    # inspect returned values rather than assuming one bridge representation.
+    calls = (
+        (sample_buffer,),
+        (sample_buffer, None, None, 0, None, None, 0, None),
+        (sample_buffer, None, 0, None, None, 0, None),
+    )
+    size_needed = 0
+    for args in calls:
+        try:
+            result = getter(*args)
+        except Exception:
+            continue
+        candidates = result if isinstance(result, tuple) else (result,)
+        for candidate in candidates:
+            planes = _audio_buffer_list_planes(candidate)
+            if planes:
+                return planes
+            if isinstance(candidate, int) and candidate > size_needed:
+                size_needed = candidate
+
+    # The normal PyObjC binding exposes AudioBufferList as an in/out argument;
+    # allocate the variable-length structure using CoreAudio's manual wrapper
+    # and call the API again with the required size discovered above.
+    if size_needed:
+        try:
+            import CoreAudio
+
+            buffer_list = CoreAudio.AudioBufferList(max(1, int(channels)))
+            result = getter(
+                sample_buffer,
+                None,
+                buffer_list,
+                size_needed,
+                None,
+                None,
+                0,
+                None,
+            )
+            planes = _audio_buffer_list_planes(buffer_list)
+            if planes:
+                return planes
+            candidates = result if isinstance(result, tuple) else (result,)
+            for candidate in candidates:
+                planes = _audio_buffer_list_planes(candidate)
+                if planes:
+                    return planes
+        except Exception:
+            pass
+    return None
+
+
 def sample_buffer_to_float32(sample_buffer):
     """Convert a CMSampleBuffer (or an offline fixture) to ``(audio, rate)``.
 
@@ -132,6 +232,14 @@ def sample_buffer_to_float32(sample_buffer):
         is_float = bool(flags & 1)
         bits = int(getattr(asbd, "mBitsPerChannel", 32) or 32)
         fmt = "float32" if is_float and bits <= 32 else ("int16" if bits <= 16 else "int32")
+
+        if non_interleaved:
+            planes = _sample_buffer_audio_buffer_list(CoreMedia, sample_buffer, channels)
+            if planes:
+                return _decode_pcm(planes, fmt, channels=len(planes), interleaved=False), rate
+            raise CaptureRuntimeError(
+                "ScreenCaptureKit returned non-interleaved audio without an AudioBufferList"
+            )
 
         block = CoreMedia.CMSampleBufferGetDataBuffer(sample_buffer)
         if block is None:
@@ -208,7 +316,16 @@ class SCKAudioCapture(AudioCaptureBase):
     def _stream_error(self, error):
         self._stream_error_value = str(error)
         self._metrics.last_error = self._stream_error_value
+        self._running = False
+        self._stop_event.set()
         log.warning("ScreenCaptureKit stream stopped with error: %s", error)
+        # Tear down the native stream immediately. The capture loop will see
+        # the retained typed error through get_audio() and can report it.
+        try:
+            self.stop()
+        except Exception as exc:
+            self._metrics.last_error = str(exc)
+            log.warning("Failed to stop ScreenCaptureKit after stream error: %s", exc)
 
     def _next_mic(self, count):
         if self._mic_capture is None:
@@ -233,8 +350,15 @@ class SCKAudioCapture(AudioCaptureBase):
             try:
                 audio, rate = sample_buffer_to_float32(sample)
                 if audio.size:
-                    mic = self._next_mic(audio.size)
-                    self.push_audio(audio, mic_audio=mic, native_rate=rate)
+                    mic_count = max(1, int(round(audio.size * self.sample_rate / rate)))
+                    mic = self._next_mic(mic_count)
+                    self.push_audio(
+                        audio,
+                        mic_audio=mic,
+                        native_rate=rate,
+                        mic_native_channels=1,
+                        mic_native_rate=self.sample_rate,
+                    )
             except Exception as exc:
                 self._metrics.last_error = str(exc)
                 log.warning("ScreenCaptureKit audio callback failed: %s", exc)
@@ -300,14 +424,22 @@ class SCKAudioCapture(AudioCaptureBase):
 
     def _make_sample_handler_queue(self):
         """Create the queue SCK invokes for audio callbacks when available."""
+        # Offline/fake streams invoke delegates synchronously and do not need
+        # an Objective-C dispatch queue. Real SCStream instances do.
+        if self._stream_factory is not None:
+            return None
         try:
             import dispatch
-
-            return dispatch.dispatch_queue_create("LiveTranslate.ScreenCaptureKit", None)
-        except (ImportError, AttributeError):
-            # Fake streams and older PyObjC builds accept ``None``.  Real
-            # builds normally provide the dispatch module through PyObjC.
-            return None
+            create_queue = getattr(dispatch, "dispatch_queue_create")
+            callback_queue = create_queue("LiveTranslate.ScreenCaptureKit", None)
+            if callback_queue is None:
+                raise RuntimeError("dispatch_queue_create returned nil")
+            return callback_queue
+        except (ImportError, AttributeError, RuntimeError) as exc:
+            raise PlatformUnavailableError(
+                "PyObjC libdispatch is required for ScreenCaptureKit callbacks; "
+                "install requirements-mac.txt"
+            ) from exc
 
     def start(self):
         if self._running:
@@ -325,6 +457,7 @@ class SCKAudioCapture(AudioCaptureBase):
                 self._mic_capture = None
                 raise
         self._delegate = _SCKStreamDelegate(self)
+        self._stream_error_value = None
         try:
             self._stream = self._build_stream()
             self._running = True
@@ -374,6 +507,14 @@ class SCKAudioCapture(AudioCaptureBase):
                 # SCK restarts; its lifecycle is controlled by that caller.
                 self._mic_pending = np.empty(0, dtype=np.float32)
             self._owns_mic_capture = False
+
+    def get_audio(self, timeout=1.0):
+        """Return a block or surface a terminal ScreenCaptureKit failure."""
+        if self._stream_error_value is not None:
+            raise CaptureRuntimeError(
+                f"ScreenCaptureKit stream stopped with error: {self._stream_error_value}"
+            )
+        return super().get_audio(timeout)
 
     def set_device(self, device_name):
         self._device_name = device_name

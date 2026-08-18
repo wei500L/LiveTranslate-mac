@@ -16,7 +16,8 @@ from platform_config import normalize_config
 from torch_backend import normalize_device
 import platform_clickthrough
 import torch_backend
-from platform_permissions import PlatformUnavailableError
+import platform_permissions
+from platform_permissions import MicrophonePermissionDeniedError, PlatformUnavailableError
 
 
 def test_audio_base_downmixes_resamples_and_emits_fixed_blocks():
@@ -108,6 +109,12 @@ def test_m0_rejects_system_audio_until_screencapturekit_backend_exists():
     capture = PyAudioCapture(system_audio="enabled", require_permission=False)
     with pytest.raises(PlatformUnavailableError, match="ScreenCaptureKit"):
         capture.start()
+
+
+def test_microphone_permission_failure_has_a_distinct_error_type(monkeypatch):
+    monkeypatch.setattr(platform_permissions, "microphone_permission_status", lambda: "denied")
+    with pytest.raises(MicrophonePermissionDeniedError):
+        platform_permissions.ensure_microphone_permission()
 
 
 def test_legacy_windows_config_migrates_to_mac_defaults_without_losing_fields():

@@ -69,6 +69,8 @@ def test_mac_requirements_use_coreaudio_without_windows_patch():
     text = Path("requirements-mac.txt").read_text(encoding="utf-8").lower()
     assert "pyaudio>=0.2.14" in text
     assert "pyobjc-framework-screencapturekit" in text
+    assert "pyobjc-framework-coreaudio" in text
+    assert "pyobjc-framework-libdispatch" in text
     assert "pyaudiowpatch" not in text
 
 
