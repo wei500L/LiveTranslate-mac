@@ -8,7 +8,6 @@ Usage:
   - OBS: Window Capture → select "LiveTranslate Subtitle" → check "Allow Transparency"
 """
 
-import ctypes
 import time
 from pathlib import Path
 
@@ -29,12 +28,8 @@ from PyQt6.QtGui import (
     QPixmap,
 )
 from PyQt6.QtWidgets import QApplication, QWidget, QVBoxLayout
-
-# Win32 extended window style bits for OS-level mouse click-through (same
-# mechanism as the main overlay): a window with WS_EX_TRANSPARENT passes clicks
-# to whatever is behind it, so it never blocks the video player / browser.
-_GWL_EXSTYLE = -20
-_WS_EX_TRANSPARENT = 0x20
+from platform_clickthrough import set_click_through
+from platform_fonts import default_cjk_font_family
 
 
 def _resolve_image_path(path: str) -> str:
@@ -65,7 +60,7 @@ DEFAULT_SUBTITLE_WIN_SETTINGS = {
         {
             "type": "original",
             "enabled": True,
-            "font_family": "Microsoft YaHei",
+            "font_family": default_cjk_font_family(),
             "font_size": 24,
             "color": "#FFFFFF",
             "opacity": 255,
@@ -82,7 +77,7 @@ DEFAULT_SUBTITLE_WIN_SETTINGS = {
             "type": "translation",
             "lang": "zh",
             "enabled": True,
-            "font_family": "Microsoft YaHei",
+            "font_family": default_cjk_font_family(),
             "font_size": 28,
             "color": "#FFD700",
             "opacity": 255,
@@ -128,7 +123,7 @@ class _SubtitleTextWidget(QWidget):
         super().__init__(parent)
         self._text = ""
         self._wrapped_lines = []
-        self._font = QFont("Microsoft YaHei", 24)
+        self._font = QFont(default_cjk_font_family(), 24)
         self._color = QColor(255, 255, 255)
         self._outline_enabled = True
         self._outline_color = QColor(0, 0, 0)
@@ -179,7 +174,7 @@ class _SubtitleTextWidget(QWidget):
     slide_offset_y = pyqtProperty(float, _get_slide_offset_y, _set_slide_offset_y)
 
     def set_config(self, cfg: dict):
-        self._font = QFont(cfg.get("font_family", "Microsoft YaHei"), cfg.get("font_size", 24))
+        self._font = QFont(cfg.get("font_family", default_cjk_font_family()), cfg.get("font_size", 24))
         c = QColor(cfg.get("color", "#FFFFFF"))
         c.setAlpha(cfg.get("opacity", 255))
         self._color = c
@@ -767,17 +762,7 @@ class SubtitleWindow(QWidget):
 
     def _apply_click_through(self):
         try:
-            hwnd = int(self.winId())
-            style = ctypes.windll.user32.GetWindowLongW(hwnd, _GWL_EXSTYLE)
-            if self._click_through:
-                if not (style & _WS_EX_TRANSPARENT):
-                    ctypes.windll.user32.SetWindowLongW(
-                        hwnd, _GWL_EXSTYLE, style | _WS_EX_TRANSPARENT
-                    )
-            elif style & _WS_EX_TRANSPARENT:
-                ctypes.windll.user32.SetWindowLongW(
-                    hwnd, _GWL_EXSTYLE, style & ~_WS_EX_TRANSPARENT
-                )
+            set_click_through(self, self._click_through)
         except Exception:
             pass
 

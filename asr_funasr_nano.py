@@ -17,6 +17,9 @@ class FunASRNanoEngine:
     """Speech-to-text using Fun-ASR-Nano-2512 or Fun-ASR-MLT-Nano-2512."""
 
     def __init__(self, device="cuda", hub="ms", engine_type="funasr-nano"):
+        from torch_backend import normalize_device
+
+        device = normalize_device(device)
         if _NANO_DIR not in sys.path:
             sys.path.insert(0, _NANO_DIR)
 
@@ -62,6 +65,9 @@ class FunASRNanoEngine:
         log.info(f"Fun-ASR-Nano language: {old} -> {self.language}")
 
     def to_device(self, device: str):
+        from torch_backend import normalize_device
+
+        device = normalize_device(device)
         self._model.model.to(device)
         log.info(f"Fun-ASR-Nano moved to {device}")
 

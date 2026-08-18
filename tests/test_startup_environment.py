@@ -35,3 +35,28 @@ def test_portable_launcher_repairs_interrupted_bootstraps():
     assert builder.rindex("set-content -literalpath $ready") > builder.rindex(
         "pip check --python $py"
     )
+
+
+def test_mac_install_and_update_only_mark_verified_environments_ready():
+    installer = _read("install.sh")
+    updater = _read("update.sh")
+
+    assert ".livetranslate-ready" in installer
+    assert installer.index('rm -f "$ready_marker"') < installer.index("pip install")
+    assert installer.rindex("printf 'ready") > installer.rindex("pip check")
+    assert updater.index('rm -f "$ready_marker"') < updater.index("pip install")
+    assert updater.rindex("printf 'ready") > updater.rindex("pip check")
+
+
+def test_mac_source_launcher_rejects_an_incomplete_environment():
+    launcher = _read("start.sh")
+    assert ".livetranslate-ready" in launcher
+    assert "setup is incomplete" in launcher
+
+
+def test_mac_installer_rejects_rosetta_and_unsupported_python():
+    installer = _read("install.sh")
+    assert "uname -m" in installer
+    assert "platform.machine()" in installer
+    assert "(3, 10)" in installer
+    assert "(3, 12)" in installer

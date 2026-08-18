@@ -1,6 +1,7 @@
 import json
 import logging
 import os
+import sys
 import threading
 from pathlib import Path
 
@@ -51,6 +52,8 @@ from model_manager import (
 )
 from i18n import t, LANGUAGES
 from subtitle_settings import SubtitleSettingsWidget
+from platform_fonts import default_mono_font_family, default_ui_font_family
+from torch_backend import available_devices, mps_available, normalize_device
 
 log = logging.getLogger("LiveTranslate.Panel")
 
@@ -117,7 +120,7 @@ class ControlPanel(QWidget):
                 "funasr_model": config["asr"].get(
                     "funasr_model", DEFAULT_FUNASR_MODEL
                 ),
-                "asr_device": "cuda",
+                "asr_device": normalize_device(config["asr"].get("device", "cpu")),
                 "sensevoice_pad_seconds": config["asr"].get(
                     "sensevoice_pad_seconds", 0.5
                 ),
@@ -245,19 +248,13 @@ class ControlPanel(QWidget):
         self._asr_lang.currentIndexChanged.connect(self._auto_save)
 
         self._asr_device = QComboBox()
-        devices = ["cuda", "cpu"]
-        try:
-            import torch
-
-            for i in range(torch.cuda.device_count()):
-                name = torch.cuda.get_device_name(i)
-                devices.insert(i, f"cuda:{i} ({name})")
-            if torch.cuda.device_count() > 0:
-                devices = [d for d in devices if d != "cuda"]
-        except Exception:
-            pass
+        devices = available_devices()
         self._asr_device.addItems(devices)
-        saved_dev = s.get("asr_device", self._config["asr"].get("device", "cuda"))
+        raw_device = s.get("asr_device", self._config["asr"].get("device", "cpu"))
+        if sys.platform == "darwin" and str(raw_device).startswith("cuda"):
+            saved_dev = "mps" if mps_available() else "cpu"
+        else:
+            saved_dev = normalize_device(raw_device)
         for i in range(self._asr_device.count()):
             if self._asr_device.itemText(i).startswith(saved_dev):
                 self._asr_device.setCurrentIndex(i)
@@ -318,14 +315,15 @@ class ControlPanel(QWidget):
 
         self._audio_device = QComboBox()
         self._audio_device.addItem(t("audio_disabled"))
-        self._audio_device.addItem(t("system_default"))
-        try:
-            from audio_capture import list_output_devices
+        if sys.platform != "darwin":
+            self._audio_device.addItem(t("system_default"))
+            try:
+                from audio_capture import list_output_devices
 
-            for name in list_output_devices():
-                self._audio_device.addItem(name)
-        except Exception:
-            pass
+                for name in list_output_devices():
+                    self._audio_device.addItem(name)
+            except Exception:
+                pass
         saved_audio = s.get("audio_device")
         if saved_audio == "__disabled__":
             self._audio_device.setCurrentIndex(0)
@@ -333,8 +331,11 @@ class ControlPanel(QWidget):
             idx = self._audio_device.findText(saved_audio)
             if idx >= 0:
                 self._audio_device.setCurrentIndex(idx)
-        else:
+        elif sys.platform != "darwin":
             self._audio_device.setCurrentIndex(1)  # system default
+        else:
+            self._audio_device.setCurrentIndex(0)
+            self._audio_device.setEnabled(False)
         asr_layout.addWidget(QLabel(t("label_audio")), 6, 0)
         asr_layout.addWidget(self._audio_device, 6, 1)
         self._audio_device.currentIndexChanged.connect(self._auto_save)
@@ -349,7 +350,7 @@ class ControlPanel(QWidget):
                 self._mic_device.addItem(name)
         except Exception:
             pass
-        saved_mic = s.get("mic_device")
+        saved_mic = s.get("mic_device", self._config["audio"].get("mic_device"))
         if saved_mic:
             if saved_mic in ("__default__", "default"):
                 self._mic_device.setCurrentIndex(1)
@@ -440,7 +441,7 @@ class ControlPanel(QWidget):
         self._vad_threshold_slider.valueChanged.connect(self._on_threshold_changed)
         self._vad_threshold_slider.sliderReleased.connect(self._auto_save)
         self._vad_threshold_label = QLabel(f"{vad_pct}%")
-        self._vad_threshold_label.setFont(QFont("Consolas", 11, QFont.Weight.Bold))
+        self._vad_threshold_label.setFont(QFont(default_mono_font_family(), 11, QFont.Weight.Bold))
         silero_layout.addWidget(QLabel(t("label_threshold")), 0, 0)
         silero_layout.addWidget(self._vad_threshold_slider, 0, 1)
         silero_layout.addWidget(self._vad_threshold_label, 0, 2)
@@ -455,7 +456,7 @@ class ControlPanel(QWidget):
         self._energy_slider.valueChanged.connect(self._on_energy_changed)
         self._energy_slider.sliderReleased.connect(self._auto_save)
         self._energy_label = QLabel(f"{energy_pm}\u2030")
-        self._energy_label.setFont(QFont("Consolas", 11, QFont.Weight.Bold))
+        self._energy_label.setFont(QFont(default_mono_font_family(), 11, QFont.Weight.Bold))
         energy_layout.addWidget(QLabel(t("label_threshold")), 0, 0)
         energy_layout.addWidget(self._energy_slider, 0, 1)
         energy_layout.addWidget(self._energy_label, 0, 2)
@@ -542,7 +543,7 @@ class ControlPanel(QWidget):
         models_layout = QVBoxLayout(models_group)
 
         self._model_list = QListWidget()
-        self._model_list.setFont(QFont("Consolas", 9))
+        self._model_list.setFont(QFont(default_mono_font_family(), 9))
         self._model_list.itemDoubleClicked.connect(self._on_model_double_clicked)
         self._refresh_model_list()
         models_layout.addWidget(self._model_list)
@@ -593,7 +594,7 @@ class ControlPanel(QWidget):
 
         # Prompt text editor
         self._prompt_edit = QTextEdit()
-        self._prompt_edit.setFont(QFont("Consolas", 9))
+        self._prompt_edit.setFont(QFont(default_mono_font_family(), 9))
         self._prompt_edit.setMaximumHeight(100)
         self._prompt_edit.setPlainText(current_prompt)
         self._prompt_debounce = QTimer()
@@ -979,7 +980,7 @@ class ControlPanel(QWidget):
 
         self._bench_output = QTextEdit()
         self._bench_output.setReadOnly(True)
-        self._bench_output.setFont(QFont("Consolas", 9))
+        self._bench_output.setFont(QFont(default_mono_font_family(), 9))
         self._bench_output.setStyleSheet(
             "background: #1e1e2e; color: #cdd6f4; border: 1px solid #444;"
         )
@@ -998,7 +999,7 @@ class ControlPanel(QWidget):
         browser = QTextBrowser()
         browser.setOpenExternalLinks(True)
         browser.setHtml(html)
-        browser.setFont(QFont("Microsoft YaHei UI", 10))
+        browser.setFont(QFont(default_ui_font_family(), 10))
         layout.addWidget(browser)
         return widget
 
@@ -1024,7 +1025,7 @@ class ControlPanel(QWidget):
 
         top_row = QHBoxLayout()
         self._cache_total = QLabel("")
-        self._cache_total.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
+        self._cache_total.setFont(QFont(default_mono_font_family(), 9, QFont.Weight.Bold))
         top_row.addWidget(self._cache_total, 1)
         open_btn = QPushButton(t("btn_open_folder"))
         open_btn.clicked.connect(
@@ -1040,7 +1041,7 @@ class ControlPanel(QWidget):
         layout.addLayout(top_row)
 
         self._cache_list = QListWidget()
-        self._cache_list.setFont(QFont("Consolas", 9))
+        self._cache_list.setFont(QFont(default_mono_font_family(), 9))
         self._cache_list.setAlternatingRowColors(True)
         layout.addWidget(self._cache_list, 1)
 

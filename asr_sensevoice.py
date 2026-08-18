@@ -89,11 +89,13 @@ class SenseVoiceEngine:
             log.info("SenseVoice input padding disabled")
 
     @staticmethod
-    def _is_cuda_device(device: str) -> bool:
-        return str(device).lower().startswith("cuda") and torch.cuda.is_available()
+    def _device_supports_fp16(device: str) -> bool:
+        from torch_backend import device_supports_fp16
+
+        return device_supports_fp16(device)
 
     def _set_precision(self, device: str):
-        self._use_fp16 = self._is_cuda_device(device)
+        self._use_fp16 = self._device_supports_fp16(device)
         self._precision = "fp16" if self._use_fp16 else "fp32"
 
     def _apply_model_precision(self):
@@ -142,6 +144,9 @@ class SenseVoiceEngine:
             self._log_input_padding()
 
     def to_device(self, device: str):
+        from torch_backend import normalize_device
+
+        device = normalize_device(device)
         self._set_precision(device)
         if self._use_fp16:
             self._apply_model_precision()

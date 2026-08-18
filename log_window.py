@@ -10,6 +10,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import pyqtSignal, pyqtSlot
 from PyQt6.QtGui import QFont, QTextCursor
 from i18n import t
+from platform_fonts import default_mono_font_family
 
 
 class QLogHandler(logging.Handler):
@@ -43,7 +44,7 @@ class LogWindow(QWidget):
         self._text.setReadOnly(True)
         self._text.setUndoRedoEnabled(False)
         self._text.document().setMaximumBlockCount(2000)
-        self._text.setFont(QFont("Consolas", 9))
+        self._text.setFont(QFont(default_mono_font_family(), 9))
         self._text.setStyleSheet("background-color: #1e1e1e; color: #d4d4d4;")
         layout.addWidget(self._text)
 

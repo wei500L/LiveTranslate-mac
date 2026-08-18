@@ -1,8 +1,12 @@
 # LiveTrans Configuration
 
 audio:
-  # WASAPI loopback device name (null = default output device)
+  # System audio mode: auto (Windows loopback enabled, macOS M0 microphone-only).
+  system_audio: "auto"
+  # Device name (null = platform default; __disabled__ is retained for old configs)
   device: null
+  # Microphone: auto selects the macOS default input; Windows keeps it disabled.
+  mic_device: "auto"
   # Sample rate for capture
   sample_rate: 16000
   # Audio chunk duration in seconds for VAD processing (32ms = Silero VAD native window)
@@ -15,8 +19,8 @@ asr:
   model_size: "medium"
   # FunASR model: sensevoice-small, funasr-nano-2512, funasr-mlt-nano-2512
   funasr_model: "sensevoice-small"
-  # Device: cuda or cpu
-  device: "cuda"
+  # Device: auto selects MPS on Apple Silicon, CUDA on Windows, then CPU
+  device: "auto"
   # Compute type: float16, int8_float16, int8
   compute_type: "float16"
   # Language: auto, en, ja, zh, ko, etc.
@@ -62,8 +66,8 @@ translation:
     {context}
 
 subtitle:
-  # Font family
-  font_family: "Microsoft YaHei"
+  # Font family (auto = platform CJK default)
+  font_family: "auto"
   # Font size
   font_size: 28
   # Font color (hex)

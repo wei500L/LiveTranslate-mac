@@ -31,6 +31,7 @@ from PyQt6.QtWidgets import (
 
 from model_manager import download_asr, download_silero
 from i18n import t, get_lang
+from platform_fonts import default_mono_font_family
 
 log = logging.getLogger("LiveTranslate.Dialogs")
 
@@ -144,7 +145,7 @@ class _ModelLoadDialog(QDialog):
 
         self._log_view = QTextEdit()
         self._log_view.setReadOnly(True)
-        self._log_view.setFont(QFont("Consolas", 8))
+        self._log_view.setFont(QFont(default_mono_font_family(), 8))
         self._log_view.setStyleSheet(
             "background: #1e1e2e; color: #cdd6f4; border: 1px solid #444;"
         )
@@ -227,7 +228,7 @@ class SetupWizardDialog(QDialog):
 
         self._log_view = QTextEdit()
         self._log_view.setReadOnly(True)
-        self._log_view.setFont(QFont("Consolas", 8))
+        self._log_view.setFont(QFont(default_mono_font_family(), 8))
         self._log_view.setStyleSheet(
             "background: #1e1e2e; color: #cdd6f4; border: 1px solid #444;"
         )
@@ -384,7 +385,7 @@ class ModelDownloadDialog(QDialog):
 
         self._log_view = QTextEdit()
         self._log_view.setReadOnly(True)
-        self._log_view.setFont(QFont("Consolas", 8))
+        self._log_view.setFont(QFont(default_mono_font_family(), 8))
         self._log_view.setStyleSheet(
             "background: #1e1e2e; color: #cdd6f4; border: 1px solid #444;"
         )
@@ -799,5 +800,4 @@ def _load_latest_changelog() -> tuple[str, str]:
     # Drop the top-level file heading (# Title) — keep everything from first H2 onwards
     body = text[m.start():]
     return title, _changelog_to_html(body)
-
 

@@ -44,11 +44,15 @@ def _ok_response(msg_id: str | None, response_type: str, payload: Any = None) ->
 
 
 def _parse_device(device: str) -> tuple[str, int]:
+    from torch_backend import normalize_device
+
     device = str(device or "cpu").split(" (", 1)[0].strip()
     if device.startswith("cuda:"):
         index = int(device.split(":", 1)[1])
         return "cuda", index
-    return device, 0
+    # CTranslate2/faster-whisper has no MPS backend; keep its public device
+    # selection while mapping the engine to Apple Silicon CPU.
+    return normalize_device(device, for_ct2=True), 0
 
 
 def _load_engine(config: dict):
@@ -63,20 +67,26 @@ def _load_engine(config: dict):
     pad_seconds = config.get("pad_seconds")
 
     parsed_device, device_index = _parse_device(device)
+    torch_device = normalize_torch_device(device)
 
     if engine_type == "funasr":
         from asr_funasr import FunASREngine
 
         engine = FunASREngine(
             model_key=config.get("funasr_model"),
-            device=device,
+            device=torch_device,
             hub=hub,
             pad_seconds=pad_seconds,
         )
     elif engine_type == "anime-whisper":
         from asr_anime_whisper import AnimeWhisperEngine
 
-        worker_device = parsed_device if parsed_device == "cpu" else f"cuda:{device_index}"
+        if torch_device == "cpu":
+            worker_device = "cpu"
+        elif torch_device.startswith("cuda"):
+            worker_device = f"cuda:{device_index}"
+        else:
+            worker_device = torch_device
         engine = AnimeWhisperEngine(device=worker_device, hub=hub)
     else:
         from asr_engine import ASREngine
@@ -102,6 +112,12 @@ def _load_engine(config: dict):
     return engine
 
 
+def normalize_torch_device(device: str | None) -> str:
+    from torch_backend import normalize_device
+
+    return normalize_device(device)
+
+
 def _transcribe(engine, payload: dict):
     audio = payload.get("audio")
     if not isinstance(audio, np.ndarray):
@@ -122,10 +138,9 @@ def _cleanup_engine(engine):
             log.warning("ASR engine unload failed", exc_info=True)
     gc.collect()
     try:
-        import torch
+        from torch_backend import empty_cache
 
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
+        empty_cache()
     except Exception:
         pass
 

@@ -18,9 +18,9 @@ class AnimeWhisperEngine:
         from transformers import pipeline
         from model_manager import get_local_model_path
 
-        if device.startswith("cuda") and not torch.cuda.is_available():
-            log.warning("CUDA not available, falling back to CPU")
-            device = "cpu"
+        from torch_backend import normalize_device
+
+        device = normalize_device(device)
 
         local = get_local_model_path("anime-whisper", hub=hub)
         model = local or MODEL_ID
@@ -47,10 +47,12 @@ class AnimeWhisperEngine:
     def to_device(self, device: str):
         try:
             import torch
+            from torch_backend import normalize_device
 
+            device = normalize_device(device)
             model = self._pipe.model
-            if device == "cpu":
-                model.to("cpu", dtype=torch.float32)
+            if device in ("cpu", "mps"):
+                model.to(device, dtype=torch.float32)
             else:
                 model.to(device, dtype=torch.float16)
             self._pipe.device = model.device

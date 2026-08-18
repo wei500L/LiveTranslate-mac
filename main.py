@@ -41,6 +41,14 @@ import os
 import torch  # noqa: F401
 
 from audio_capture import AudioCapture
+from torch_backend import (
+    accelerator_memory,
+    empty_cache,
+    mps_available,
+    normalize_device,
+)
+from platform_fonts import default_mono_font_family, default_ui_font_family
+from platform_config import normalize_config
 from vad_processor import VADProcessor
 from asr_client import ASRClient, ASRWorkerError, ASRWorkerExited, ASRWorkerTimeout
 from translator import Translator, RepetitionError
@@ -143,7 +151,7 @@ def create_app_icon() -> QIcon:
     p.setPen(Qt.PenStyle.NoPen)
     p.drawRoundedRect(4, 4, 56, 56, 12, 12)
     p.setPen(QColor(255, 255, 255))
-    p.setFont(QFont("Consolas", 28, QFont.Weight.Bold))
+    p.setFont(QFont(default_mono_font_family(), 28, QFont.Weight.Bold))
     p.drawText(pix.rect(), Qt.AlignmentFlag.AlignCenter, "LT")
     p.end()
     return QIcon(pix)
@@ -152,7 +160,13 @@ def create_app_icon() -> QIcon:
 def load_config():
     config_path = Path(__file__).parent / "config.yaml"
     with open(config_path, "r", encoding="utf-8") as f:
-        return yaml.safe_load(f)
+        config = yaml.safe_load(f) or {}
+    return normalize_config(
+        config,
+        platform_name=sys.platform,
+        mps_is_available=mps_available(),
+        cuda_is_available=torch.cuda.is_available(),
+    )
 
 
 class LiveTranslateApp:
@@ -163,7 +177,13 @@ class LiveTranslateApp:
         self._asr_ready = False  # True when ASR model is loaded
 
         self._audio = AudioCapture(
-            device=config["audio"].get("device"),
+            device=(
+                "__disabled__"
+                if config["audio"].get("system_audio") == "disabled"
+                else config["audio"].get("device")
+            ),
+            mic_device=config["audio"].get("mic_device"),
+            system_audio=config["audio"].get("system_audio", "disabled"),
             sample_rate=config["audio"]["sample_rate"],
             chunk_duration=config["audio"]["chunk_duration"],
         )
@@ -179,7 +199,7 @@ class LiveTranslateApp:
         self._asr_signature = None
         self._asr_config = None
         self._asr_error_count = 0
-        self._asr_device = config["asr"]["device"]
+        self._asr_device = normalize_device(config["asr"]["device"])
         self._whisper_model_size = config["asr"]["model_size"]
         self._funasr_model_key = normalize_funasr_model_key(
             config["asr"].get("funasr_model", DEFAULT_FUNASR_MODEL)
@@ -795,12 +815,9 @@ class LiveTranslateApp:
                 worker_rss_mb = 0.0
         gpu_alloc_mb = 0.0
         gpu_reserved_mb = 0.0
-        try:
-            if torch.cuda.is_available():
-                gpu_alloc_mb = torch.cuda.memory_allocated() / 1024 / 1024
-                gpu_reserved_mb = torch.cuda.memory_reserved() / 1024 / 1024
-        except Exception:
-            pass
+        memory = accelerator_memory(self._asr_device)
+        if memory:
+            gpu_alloc_mb, gpu_reserved_mb, _ = memory
         msgs = len(self._overlay._messages) if self._overlay else 0
         vad_buf = len(self._vad._speech_buffer)
         return {
@@ -831,11 +848,7 @@ class LiveTranslateApp:
 
     def _release_memory_caches(self):
         gc.collect()
-        try:
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
-        except Exception:
-            pass
+        empty_cache(self._asr_device)
 
     def _run_asr(self, audio: np.ndarray, kind: str, **kwargs):
         audio_seconds = len(audio) / 16000
@@ -1171,7 +1184,12 @@ class LiveTranslateApp:
         self._asr_queue = queue.Queue(maxsize=16)
         self._running = True
         self._paused = False
-        self._audio.start()
+        try:
+            self._audio.start()
+        except Exception:
+            self._running = False
+            self._tl_executor.shutdown(wait=False, cancel_futures=True)
+            raise
         self._capture_thread = threading.Thread(
             target=self._capture_loop, daemon=True
         )
@@ -1775,8 +1793,9 @@ def main():
     app.setQuitOnLastWindowClosed(False)
     # Pin a guaranteed TrueType UI font to avoid DirectWrite failures on the
     # legacy "MS Sans Serif" bitmap font Windows may resolve as the default
-    if "Segoe UI" in QFontDatabase.families():
-        app.setFont(QFont("Segoe UI", 9))
+    ui_font = default_ui_font_family()
+    if ui_font in QFontDatabase.families():
+        app.setFont(QFont(ui_font, 9))
     _app_icon = create_app_icon()
     app.setWindowIcon(_app_icon)
 
@@ -1906,6 +1925,14 @@ def main():
             pause_action.setText(t("tray_pause"))
         except Exception as e:
             log.error(f"Start error: {e}", exc_info=True)
+            overlay.set_running(False)
+            _is_running[0] = False
+            pause_action.setText(t("tray_resume"))
+            QMessageBox.warning(
+                panel,
+                t("error_title"),
+                t("error_audio_start").format(error=e),
+            )
 
     def on_pause():
         live_trans.pause()
@@ -1914,6 +1941,9 @@ def main():
         pause_action.setText(t("tray_resume"))
 
     def on_resume():
+        if not live_trans._running:
+            on_start()
+            return
         live_trans.resume()
         overlay.set_running(True)
         _is_running[0] = True

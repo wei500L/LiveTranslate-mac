@@ -27,6 +27,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from platform_fonts import default_cjk_font_family
 
 from dialogs import available_screen_height, make_scroll_area
 from i18n import t, LANGUAGES
@@ -165,7 +166,7 @@ class LineEditDialog(QDialog):
         grid.addWidget(QLabel(t("subwin_font")), r, 0)
         self._font_combo = QComboBox()
         self._font_combo.addItems(QFontDatabase.families())
-        idx = self._font_combo.findText(self._cfg.get("font_family", "Microsoft YaHei"))
+        idx = self._font_combo.findText(self._cfg.get("font_family", default_cjk_font_family()))
         if idx >= 0:
             self._font_combo.setCurrentIndex(idx)
         grid.addWidget(self._font_combo, r, 1)
@@ -510,7 +511,7 @@ class SubtitleSettingsWidget(QWidget):
             label = t("subwin_original") if line_type == "original" else t("subwin_translation")
             if line_type == "translation":
                 label += f" ({cfg.get('lang', 'zh')})"
-            font = cfg.get("font_family", "Microsoft YaHei")
+            font = cfg.get("font_family", default_cjk_font_family())
             size = cfg.get("font_size", 24)
             color = cfg.get("color", "#FFF")
             align = cfg.get("align", "center")
@@ -554,7 +555,7 @@ class SubtitleSettingsWidget(QWidget):
             "type": "translation",
             "lang": "en",
             "enabled": True,
-            "font_family": "Microsoft YaHei",
+            "font_family": default_cjk_font_family(),
             "font_size": 24,
             "color": "#FFFFFF",
             "opacity": 255,

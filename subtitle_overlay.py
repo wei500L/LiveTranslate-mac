@@ -1,4 +1,3 @@
-import ctypes
 import os
 
 import psutil
@@ -22,9 +21,9 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-
-_GWL_EXSTYLE = -20
-_WS_EX_TRANSPARENT = 0x20
+from platform_clickthrough import set_click_through
+from platform_fonts import default_cjk_font_family, default_mono_font_family
+from torch_backend import accelerator_memory
 
 DEFAULT_STYLE = {
     "preset": "default",
@@ -33,8 +32,8 @@ DEFAULT_STYLE = {
     "header_color": "#1a1a2e",
     "header_opacity": 230,
     "border_radius": 8,
-    "original_font_family": "Microsoft YaHei",
-    "translation_font_family": "Microsoft YaHei",
+    "original_font_family": default_cjk_font_family(),
+    "translation_font_family": default_cjk_font_family(),
     "original_font_size": 11,
     "translation_font_size": 14,
     "original_color": "#cccccc",
@@ -402,7 +401,7 @@ class MonitorBar(QWidget):
         # MIC bar (hidden when mic is disabled)
         self._mic_lbl = QLabel("MIC")
         self._mic_lbl.setFixedWidth(26)
-        self._mic_lbl.setFont(QFont("Consolas", 8))
+        self._mic_lbl.setFont(QFont(default_mono_font_family(), 8))
         self._mic_lbl.setStyleSheet("color: #888; background: transparent;")
         self._mic_lbl.setVisible(False)
         row1.addWidget(self._mic_lbl)
@@ -418,7 +417,7 @@ class MonitorBar(QWidget):
 
         rms_lbl = QLabel("RMS:")
         rms_lbl.setFixedWidth(26)
-        rms_lbl.setFont(QFont("Consolas", 8))
+        rms_lbl.setFont(QFont(default_mono_font_family(), 8))
         rms_lbl.setStyleSheet("color: #888; background: transparent;")
         row1.addWidget(rms_lbl)
 
@@ -432,7 +431,7 @@ class MonitorBar(QWidget):
 
         vad_lbl = QLabel("VAD:")
         vad_lbl.setFixedWidth(26)
-        vad_lbl.setFont(QFont("Consolas", 8))
+        vad_lbl.setFont(QFont(default_mono_font_family(), 8))
         vad_lbl.setStyleSheet("color: #888; background: transparent;")
         row1.addWidget(vad_lbl)
 
@@ -447,7 +446,7 @@ class MonitorBar(QWidget):
         layout.addLayout(row1)
 
         self._stats_label = QLabel()
-        self._stats_label.setFont(QFont("Consolas", 8))
+        self._stats_label.setFont(QFont(default_mono_font_family(), 8))
         self._stats_label.setStyleSheet("color: #888; background: transparent;")
         self._stats_label.setTextFormat(Qt.TextFormat.RichText)
         self._stats_label.setWordWrap(True)
@@ -501,15 +500,11 @@ class MonitorBar(QWidget):
             self._ram_mb = self._proc.memory_info().rss / 1024 / 1024
         except Exception:
             pass
-        try:
-            import torch
-
-            if torch.cuda.is_available():
-                alloc = torch.cuda.memory_allocated() / 1024 / 1024
-                self._gpu_text = f"{alloc:.0f}MB"
-            else:
-                self._gpu_text = "N/A"
-        except Exception:
+        memory = accelerator_memory(self._asr_device)
+        if memory:
+            alloc, _, label = memory
+            self._gpu_text = f"{label} {alloc:.0f}MB" if alloc else label
+        else:
             self._gpu_text = "N/A"
         self._refresh_stats()
 
@@ -635,7 +630,7 @@ class DragHandle(QWidget):
         drag_layout.setSpacing(6)
 
         title = QLabel("\u2630 LiveTranslate")
-        title.setFont(QFont("Consolas", 9, QFont.Weight.Bold))
+        title.setFont(QFont(default_mono_font_family(), 9, QFont.Weight.Bold))
         title.setStyleSheet("color: #aaa; background: transparent;")
         drag_layout.addWidget(title)
         drag_layout.addStretch()
@@ -645,7 +640,7 @@ class DragHandle(QWidget):
             b = QPushButton(text)
             b.setFixedHeight(20)
             b.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
-            b.setFont(QFont("Consolas", 8))
+            b.setFont(QFont(default_mono_font_family(), 8))
             b.setStyleSheet(_BTN_CSS)
             if tip:
                 b.setToolTip(tip)
@@ -701,14 +696,14 @@ class DragHandle(QWidget):
         row2a.setSpacing(6)
 
         self._ct_check = QCheckBox(t("click_through"))
-        self._ct_check.setFont(QFont("Consolas", 8))
+        self._ct_check.setFont(QFont(default_mono_font_family(), 8))
         self._ct_check.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self._ct_check.setStyleSheet(_CHECK_CSS)
         self._ct_check.toggled.connect(self.click_through_toggled.emit)
         row2a.addWidget(self._ct_check)
 
         self._topmost_check = QCheckBox(t("top_most"))
-        self._topmost_check.setFont(QFont("Consolas", 8))
+        self._topmost_check.setFont(QFont(default_mono_font_family(), 8))
         self._topmost_check.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self._topmost_check.setStyleSheet(_CHECK_CSS)
         self._topmost_check.setChecked(True)
@@ -716,7 +711,7 @@ class DragHandle(QWidget):
         row2a.addWidget(self._topmost_check)
 
         self._auto_scroll = QCheckBox(t("auto_scroll"))
-        self._auto_scroll.setFont(QFont("Consolas", 8))
+        self._auto_scroll.setFont(QFont(default_mono_font_family(), 8))
         self._auto_scroll.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self._auto_scroll.setStyleSheet(_CHECK_CSS)
         self._auto_scroll.setChecked(True)
@@ -724,7 +719,7 @@ class DragHandle(QWidget):
         row2a.addWidget(self._auto_scroll)
 
         self._taskbar_check = QCheckBox(t("taskbar"))
-        self._taskbar_check.setFont(QFont("Consolas", 8))
+        self._taskbar_check.setFont(QFont(default_mono_font_family(), 8))
         self._taskbar_check.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
         self._taskbar_check.setStyleSheet(_CHECK_CSS)
         self._taskbar_check.setChecked(False)
@@ -740,8 +735,8 @@ class DragHandle(QWidget):
         row2b.setSpacing(4)
 
         _lbl_css = "color: #888; background: transparent;"
-        _lbl_font = QFont("Consolas", 8)
-        _combo_font = QFont("Consolas", 8)
+        _lbl_font = QFont(default_mono_font_family(), 8)
+        _combo_font = QFont(default_mono_font_family(), 8)
 
         model_lbl = QLabel(t("model_label"))
         model_lbl.setFont(_lbl_font)
@@ -1063,35 +1058,33 @@ class SubtitleOverlay(QWidget):
 
     def _set_click_through(self, enabled: bool):
         self._click_through = enabled
-        if not enabled:
-            hwnd = int(self.winId())
-            style = ctypes.windll.user32.GetWindowLongW(hwnd, _GWL_EXSTYLE)
-            if style & _WS_EX_TRANSPARENT:
-                ctypes.windll.user32.SetWindowLongW(
-                    hwnd, _GWL_EXSTYLE, style & ~_WS_EX_TRANSPARENT
-                )
+        if self.isVisible():
+            try:
+                set_click_through(self, enabled)
+            except Exception:
+                pass
 
     def _check_click_through(self):
         if not self._click_through:
             return
         cursor = QCursor.pos()
         local = self.mapFromGlobal(cursor)
-        hwnd = int(self.winId())
-        style = ctypes.windll.user32.GetWindowLongW(hwnd, _GWL_EXSTYLE)
-
         scroll_top = self._scroll.mapTo(self, QPoint(0, 0)).y()
         in_header = 0 <= local.x() <= self.width() and 0 <= local.y() < scroll_top
+        try:
+            set_click_through(self, not in_header)
+        except Exception:
+            pass
 
-        if in_header:
-            if style & _WS_EX_TRANSPARENT:
-                ctypes.windll.user32.SetWindowLongW(
-                    hwnd, _GWL_EXSTYLE, style & ~_WS_EX_TRANSPARENT
-                )
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self._click_through:
+            QTimer.singleShot(0, self._check_click_through)
         else:
-            if not (style & _WS_EX_TRANSPARENT):
-                ctypes.windll.user32.SetWindowLongW(
-                    hwnd, _GWL_EXSTYLE, style | _WS_EX_TRANSPARENT
-                )
+            try:
+                set_click_through(self, False)
+            except Exception:
+                pass
 
     def _on_mode_changed(self, mode: str):
         compact = mode == "compact"

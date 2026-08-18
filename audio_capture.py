@@ -2,8 +2,18 @@ import logging
 import threading
 import queue
 import time
+import sys
 import numpy as np
-import pyaudiowpatch as pyaudio
+from audio_capture_base import CaptureMetrics
+
+if sys.platform == "win32":
+    try:
+        import pyaudiowpatch as pyaudio
+    except ImportError:  # pragma: no cover - depends on Windows installation
+        pyaudio = None
+else:
+    # Keep the Windows dependency out of macOS/Linux import paths entirely.
+    pyaudio = None
 
 log = logging.getLogger("LiveTranslate.Audio")
 
@@ -12,6 +22,12 @@ DEVICE_CHECK_INTERVAL = 2.0  # seconds
 
 def list_output_devices():
     """Return list of WASAPI output device names."""
+    if sys.platform == "darwin":
+        from audio_capture_pyaudio import list_output_devices as _list
+
+        return _list()
+    if pyaudio is None:
+        return []
     pa = pyaudio.PyAudio()
     devices = []
     wasapi_idx = None
@@ -35,6 +51,12 @@ def list_output_devices():
 
 def list_input_devices():
     """Return list of WASAPI input (microphone) device names."""
+    if sys.platform == "darwin":
+        from audio_capture_pyaudio import list_input_devices as _list
+
+        return _list()
+    if pyaudio is None:
+        return []
     pa = pyaudio.PyAudio()
     devices = []
     wasapi_idx = None
@@ -59,13 +81,15 @@ def list_input_devices():
 class AudioCapture:
     """Capture system audio via WASAPI loopback using pyaudiowpatch."""
 
-    def __init__(self, device=None, sample_rate=16000, chunk_duration=0.5):
+    def __init__(self, device=None, sample_rate=16000, chunk_duration=0.5,
+                 mic_device=None, system_audio="enabled"):
         self.sample_rate = sample_rate
         self.chunk_duration = chunk_duration
         self.audio_queue = queue.Queue(maxsize=100)
         self._stream = None
         self._running = False
         self._device_name = device
+        self._system_audio = system_audio
         self._pa = pyaudio.PyAudio()
         self._read_thread = None
         self._native_channels = 2
@@ -75,12 +99,13 @@ class AudioCapture:
         self._lock = threading.Lock()
         self._restart_event = threading.Event()
         # Microphone input
-        self._mic_device_name = None
+        self._mic_device_name = mic_device
         self._mic_stream = None
         self._mic_native_rate = 44100
         self._mic_native_channels = 1
         self._mic_restart_event = threading.Event()
         self._mic_buf = np.array([], dtype=np.float32)
+        self._metrics = CaptureMetrics()
 
     def _get_wasapi_info(self):
         for i in range(self._pa.get_host_api_count()):
@@ -356,12 +381,14 @@ class AudioCapture:
                             data, self._native_channels, self._native_rate
                         )
                 except Exception as e:
+                    self._metrics.last_error = str(e)
                     if self._restart_event.is_set():
                         continue
                     log.warning(f"Read error (device may have changed): {e}")
                     try:
                         time.sleep(0.5)
                         self._restart_stream()
+                        self._metrics.restart_count += 1
                         log.info("Stream restarted after read error")
                     except Exception as re:
                         log.error(f"Restart failed: {re}")
@@ -403,12 +430,18 @@ class AudioCapture:
                 audio = loopback_audio + mic_chunk
 
             try:
+                self._metrics.callback_blocks += 1
                 self.audio_queue.put_nowait((audio, mic_rms))
             except queue.Full:
+                self._metrics.dropped_blocks += 1
                 self.audio_queue.get_nowait()
                 self.audio_queue.put_nowait((audio, mic_rms))
+            self._metrics.output_blocks += 1
+            self._metrics.queue_depth = self.audio_queue.qsize()
 
     def start(self):
+        if self._running:
+            return
         self._loopback_disabled = self._device_name == "__disabled__"
         if not self._loopback_disabled:
             self._open_stream()
@@ -438,6 +471,23 @@ class AudioCapture:
         except queue.Empty:
             return None
 
+    def metrics(self) -> dict:
+        self._metrics.queue_depth = self.audio_queue.qsize()
+        return {
+            "callback_blocks": self._metrics.callback_blocks,
+            "output_blocks": self._metrics.output_blocks,
+            "dropped_blocks": self._metrics.dropped_blocks,
+            "queue_depth": self._metrics.queue_depth,
+            "restart_count": self._metrics.restart_count,
+            "last_error": self._metrics.last_error,
+        }
+
     def __del__(self):
         if self._pa:
             self._pa.terminate()
+
+
+# The public class remains stable for main.py and tests.  Importing the macOS
+# implementation is lazy at module end so Windows keeps its WASAPI behavior.
+if sys.platform == "darwin":  # pragma: no cover - requires macOS CoreAudio
+    from audio_capture_pyaudio import PyAudioCapture as AudioCapture

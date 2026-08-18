@@ -63,3 +63,36 @@ def test_readmes_do_not_describe_the_removed_editdistance_workaround():
         text = path.read_text(encoding="utf-8").lower()
         assert "--no-deps" not in text
         assert "editdistance-s" not in text
+
+
+def test_mac_requirements_use_coreaudio_without_windows_patch():
+    text = Path("requirements-mac.txt").read_text(encoding="utf-8").lower()
+    assert "pyaudio>=0.2.14" in text
+    assert "pyobjc-framework-screencapturekit" in text
+    assert "pyaudiowpatch" not in text
+
+
+def test_mac_launchers_require_the_verified_environment_marker():
+    for path in ("install.sh", "start.sh", "update.sh"):
+        text = Path(path).read_text(encoding="utf-8").lower()
+        assert ".livetranslate-ready" in text
+    assert "setup is incomplete" in Path("start.sh").read_text(encoding="utf-8").lower()
+
+
+def test_mac_installers_pin_yasbd_and_resolve_dependencies_normally():
+    for path in ("install.sh", "update.sh"):
+        text = Path(path).read_text(encoding="utf-8").lower()
+        assert 'yasbd-lib>=0.15,<1.0' in text
+        assert "-r \"$root_dir/requirements-mac.txt\"" in text
+        assert "--no-deps" not in text
+
+
+def test_mac_requirements_contain_every_cross_platform_dependency():
+    windows = _requirement_lines()
+    mac = {
+        line.split("#", 1)[0].strip().lower()
+        for line in Path("requirements-mac.txt").read_text(encoding="utf-8").splitlines()
+        if line.split("#", 1)[0].strip()
+    }
+    common = {line for line in windows if not line.startswith("pyaudiowpatch")}
+    assert common <= mac
