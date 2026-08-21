@@ -1,5 +1,11 @@
 # 更新日志
 
+## 2026-08-22
+- 新增 macOS 13+ Apple Silicon 支持说明，以及运行离线平台/音频测试的原生 arm64 CI job。
+- 新增 macOS arm64 源码包产物（`LiveTranslate-macos-arm64-*.tar.gz`）；签名和公证仍属于后续发布工作。
+- 音频诊断默认执行无需设备的格式归一化 smoke test；Windows WASAPI 探测改为显式使用 `--live-windows`。
+- 补充 ScreenCaptureKit/麦克风权限、CTranslate2 仅 CPU、MPS 预期和未签名 app 的 TCC 限制说明。
+
 ## 2026-08-17
 - 增量 ASR 的分句库从 PySBD 切换到 yasbd-lib (#37): API 兼容无行为变化, 新增韩语等 17 种语言的原生分句规则 (此前韩语回退英语规则), 长文本分割速度大幅提升
 - 修复 DeepSeek 默认开启思考模式导致翻译返回空、界面显示原文的问题 (#38): DeepSeek 需要 thinking.type=disabled 才能关闭思考, 此前发送的 enable_thinking=false 是 Qwen 风格参数对其无效; 模型编辑对话框新增「禁用思考」风格选择 (自动识别 / DeepSeek·火山方舟·GLM / Qwen·百炼·硅基流动 / vLLM·SGLang 自部署 / OpenAI·Grok reasoning_effort / 不发送), 自动识别对 OpenAI 等会拒绝未知参数的官方端点不再乱发参数; 思考耗尽 token 返回空时输出诊断日志

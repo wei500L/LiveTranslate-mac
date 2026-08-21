@@ -7,7 +7,7 @@ Windows/macOS 实时音频翻译工具。Windows 使用 WASAPI loopback，macOS 
 适用于看外语视频、直播、语音对话等场景——无需修改播放器，全局音频捕获即开即用。
 
 ![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue)
-![Windows](https://img.shields.io/badge/Platform-Windows-0078d4)
+![平台](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS-0078d4)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
 ## 截图
@@ -39,9 +39,9 @@ Windows/macOS 实时音频翻译工具。Windows 使用 WASAPI loopback，macOS 
 
 ## 系统要求
 
-- **操作系统**：Windows 10/11
+- **操作系统**：Windows 10/11，或 macOS 13+ Apple Silicon（arm64）
 - **Python**：3.10–3.12（绿色版免装）
-- **GPU**（推荐）：NVIDIA 显卡 + CUDA 12.6（RTX 50 系列等 Blackwell 架构需要 CUDA 12.8）
+- **GPU**（推荐）：Windows 使用 NVIDIA + CUDA 12.6（RTX 50 系列等 Blackwell 架构需要 CUDA 12.8）；Apple Silicon 的 torch ASR 使用 MPS，faster-whisper 使用 CPU
 - **网络**：需要访问翻译 API
 
 ## 快速开始
@@ -88,6 +88,17 @@ pip install -r requirements.txt
 
 </details>
 
+### macOS（Apple Silicon）
+
+请使用原生 arm64 的 Python 3.10–3.12。安装脚本会拒绝 Rosetta/x86_64 Python：
+
+```bash
+./install.sh
+./start.sh
+```
+
+macOS 系统音频通过 ScreenCaptureKit 捕获，需要授予“屏幕录制”权限；麦克风混音需要“麦克风”权限。修改权限后通常需要重启应用。SCK 捕获主显示器系统音频，不提供 Windows 风格的 WASAPI 设备名。faster-whisper/CTranslate2 在 CPU（int8）上运行，支持的 torch ASR 使用 MPS。
+
 ## 首次使用
 
 1. 弹出设置向导——选择下载源（ModelScope 适合国内，HuggingFace 适合海外）和缓存路径
@@ -114,7 +125,7 @@ Audio (WASAPI/SCK，32ms) → VAD (Silero) → ASR → LLM Translation → Overl
 
 ```
 main.py                 主入口，管线编排
-├── audio_capture.py    WASAPI loopback + 麦克风混音
+├── audio_capture.py    平台音频分发（WASAPI/SCK/CoreAudio）
 ├── vad_processor.py    Silero VAD
 ├── asr_engine.py       faster-whisper 后端
 ├── asr_funasr.py       统一 FunASR 模型选择后端

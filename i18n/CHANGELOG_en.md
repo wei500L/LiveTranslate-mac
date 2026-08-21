@@ -1,5 +1,11 @@
 # Changelog
 
+## 2026-08-22
+- Added macOS 13+ Apple Silicon support documentation and a native arm64 CI job with offline platform/audio tests.
+- Added a macOS arm64 source bundle artifact (`LiveTranslate-macos-arm64-*.tar.gz`); signing and notarization remain release follow-ups.
+- The audio diagnostic now runs a device-free normalization smoke test by default; Windows WASAPI probing is opt-in with `--live-windows`.
+- Documented ScreenCaptureKit and microphone permissions, CPU-only CTranslate2 behavior, MPS expectations, and known unsigned-app TCC limitations.
+
 ## 2026-08-17
 - Incremental ASR sentence segmentation switched from PySBD to yasbd-lib (#37): API-compatible with no behavior change, adds native rules for Korean and 16 more languages (Korean previously fell back to English rules), and is much faster on long text
 - Fixed empty translations showing up as untranslated same-language text with DeepSeek (#38): DeepSeek defaults to thinking mode ON and only accepts thinking.type=disabled to turn it off, while the previously sent enable_thinking=false is a Qwen-style flag it ignores; the model edit dialog now has a "Disable thinking" style selector (auto-detect / DeepSeek·Volcano Ark·GLM / Qwen·DashScope·SiliconFlow / self-hosted vLLM·SGLang / OpenAI·Grok reasoning_effort / do not send), auto-detect no longer sends unknown parameters to official OpenAI-style endpoints that reject them, and a diagnostic warning is logged when reasoning burns the whole token budget and returns an empty completion

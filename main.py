@@ -46,6 +46,7 @@ from platform_permissions import (
 )
 from torch_backend import (
     accelerator_memory,
+    cuda_available,
     empty_cache,
     mps_available,
     normalize_device,
@@ -180,7 +181,7 @@ def load_config():
         config,
         platform_name=sys.platform,
         mps_is_available=mps_available(),
-        cuda_is_available=torch.cuda.is_available(),
+        cuda_is_available=cuda_available(),
     )
 
 

@@ -81,6 +81,17 @@ def test_font_defaults_are_nonempty():
     assert default_cjk_font_family()
 
 
+def test_platform_font_and_device_fallbacks_without_torch(monkeypatch):
+    monkeypatch.setattr(torch_backend, "_torch", lambda: None)
+    assert torch_backend.cuda_available() is False
+    assert normalize_device("auto") == "cpu"
+    assert normalize_device("mps") == "cpu"
+    assert torch_backend.available_devices() == ["cpu"]
+    assert default_ui_font_family("darwin") == ".AppleSystemUIFont"
+    assert default_mono_font_family("darwin") == "Menlo"
+    assert default_cjk_font_family("darwin") == "PingFang SC"
+
+
 def test_fake_audio_source_is_reusable_for_offline_smoke_pipeline():
     source = FakeAudioCapture([np.ones(512, dtype=np.float32)])
     source.start()

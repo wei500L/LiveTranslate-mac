@@ -98,3 +98,11 @@ def test_mac_requirements_contain_every_cross_platform_dependency():
     }
     common = {line for line in windows if not line.startswith("pyaudiowpatch")}
     assert common <= mac
+
+
+def test_release_workflow_has_arm64_test_and_distinct_macos_artifact():
+    workflow = Path(".github/workflows/release.yml").read_text(encoding="utf-8").lower()
+    assert "test-macos-arm64" in workflow
+    assert "runs-on: macos-14" in workflow
+    assert "livetranslate-macos-arm64" in workflow
+    assert "pytest -q" in workflow

@@ -25,6 +25,15 @@ def mps_available() -> bool:
         return False
 
 
+def cuda_available() -> bool:
+    """Return CUDA availability without exposing torch to platform callers."""
+    torch = _torch()
+    try:
+        return bool(torch and torch.cuda.is_available())
+    except (AttributeError, RuntimeError):
+        return False
+
+
 def normalize_device(device: str | None, *, for_ct2: bool = False) -> str:
     """Resolve a user-facing device, falling back safely when unavailable."""
     value = str(device or "").split(" (", 1)[0].strip().lower()

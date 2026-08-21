@@ -7,7 +7,7 @@ Real-time audio translation for Windows and macOS. Captures system audio (WASAPI
 Works with any system audio — videos, livestreams, voice chat. No player modifications needed.
 
 ![Python 3.10+](https://img.shields.io/badge/Python-3.10%2B-blue)
-![Windows](https://img.shields.io/badge/Platform-Windows-0078d4)
+![Platforms](https://img.shields.io/badge/Platform-Windows%20%7C%20macOS-0078d4)
 ![License](https://img.shields.io/badge/License-MIT-green)
 
 ## Screenshot
@@ -39,9 +39,9 @@ See [English Changelog](i18n/CHANGELOG_en.md) | [中文更新日志](i18n/CHANGE
 
 ## Requirements
 
-- **OS**: Windows 10/11
+- **OS**: Windows 10/11, or macOS 13+ on Apple Silicon (arm64)
 - **Python**: 3.10–3.12 (or use the portable build)
-- **GPU** (recommended): NVIDIA + CUDA 12.6 (Blackwell GPUs like RTX 50xx require CUDA 12.8)
+- **GPU** (recommended): NVIDIA + CUDA 12.6 on Windows (Blackwell GPUs like RTX 50xx require CUDA 12.8); Apple Silicon uses MPS for torch ASR and CPU for faster-whisper
 - **Network**: Access to a translation API
 
 ## Quick Start
@@ -88,6 +88,22 @@ pip install -r requirements.txt
 
 </details>
 
+### macOS (Apple Silicon)
+
+Use a native arm64 Python 3.10–3.12 environment. Rosetta/x86_64 Python is rejected by
+the installer:
+
+```bash
+./install.sh
+./start.sh
+```
+
+macOS system audio uses ScreenCaptureKit and requires Screen Recording permission;
+microphone mixing requires Microphone permission. macOS may require restarting the
+app after changing either permission. The SCK path captures the selected main display
+and does not expose Windows-style loopback device names. Faster-whisper/CTranslate2
+runs on CPU (int8); MPS is used by torch-based ASR engines when supported.
+
 ## First Launch
 
 1. Setup wizard appears — choose download source (ModelScope / HuggingFace) and cache path
@@ -114,7 +130,7 @@ Audio (WASAPI/SCK, 32ms) → VAD (Silero) → ASR → LLM Translation → Overla
 
 ```
 main.py                 Entry point & pipeline
-├── audio_capture.py    WASAPI loopback + mic mix-in
+├── audio_capture.py    Platform audio dispatcher (WASAPI/SCK/CoreAudio)
 ├── vad_processor.py    Silero VAD
 ├── asr_engine.py       faster-whisper backend
 ├── asr_funasr.py       Unified FunASR model selector backend

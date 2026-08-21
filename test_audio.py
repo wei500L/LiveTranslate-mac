@@ -1,11 +1,27 @@
-"""Manual Windows WASAPI loopback diagnostic.
+"""Offline audio smoke test with an optional Windows loopback diagnostic.
 
-This is intentionally not executed during pytest collection. Use
-``python test_audio.py`` on a Windows machine with a loopback device.
+The default command never opens a real device and is suitable for CI. Use
+``python test_audio.py --live-windows`` only on Windows when diagnosing a
+WASAPI loopback installation.
 """
 
+import argparse
 
-def main():
+
+def offline_smoke() -> None:
+    import numpy as np
+    from audio_capture_base import AudioCaptureBase
+
+    capture = AudioCaptureBase(queue_size=2)
+    capture.push_audio(np.ones((960, 2), dtype=np.float32), native_channels=2, native_rate=48000)
+    item = capture.get_audio(timeout=0)
+    if item is None or item[0].shape != (512,) or item[0].dtype != np.float32:
+        raise RuntimeError("offline audio normalization did not produce a 512-sample float32 block")
+    capture.stop()
+    print("offline audio smoke: OK (16 kHz mono, 512 samples)")
+
+
+def windows_loopback_diagnostic():
     import numpy as np
     import pyaudiowpatch as pyaudio
 
@@ -65,4 +81,10 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    parser = argparse.ArgumentParser(description=__doc__)
+    parser.add_argument("--live-windows", action="store_true", help="probe a real Windows WASAPI loopback device")
+    args = parser.parse_args()
+    if args.live_windows:
+        windows_loopback_diagnostic()
+    else:
+        offline_smoke()

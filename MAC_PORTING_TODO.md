@@ -236,13 +236,24 @@
 
 ## Phase M3：工程化、测试与发布
 
-- [ ] `.github/workflows/release.yml` 增加 macOS arm64 job；产物命名与 Windows 产物区分。
-- [ ] 为 SCK 音频层增加 mock 单测：sample buffer 转换、重采样、512 样本重组、队列背压和关闭幂等性。
-- [ ] 增加平台能力单测：点击穿透分发、字体默认值、设备解析、MPS 无 torch/无 MPS 时的 CPU 回退。
-- [ ] 将 `test_audio.py` 改为平台无关的离线/模拟测试；不在 CI 中要求真实音频设备或 TCC 权限。
-- [ ] README/README_zh.md 更新为双平台说明，新增 macOS 安装、权限、arm64、SCK 限制和性能预期。
-- [ ] 更新 CHANGELOG，记录 macOS 支持范围、已知限制（CTranslate2 无 MPS、未签名 app 的 TCC 行为）。
-- [ ] 发布前执行全局检查：`rg -n "windll|PyAudioWPatch|WASAPI|torch\\.cuda|Microsoft YaHei|Segoe UI"`，逐项确认是 Windows 分支、文档说明或待处理项。
+- [x] `.github/workflows/release.yml` 增加 macOS arm64 job；产物命名与 Windows 产物区分。
+- [x] 为 SCK 音频层增加 mock 单测：sample buffer 转换、重采样、512 样本重组、队列背压和关闭幂等性。
+- [x] 增加平台能力单测：点击穿透分发、字体默认值、设备解析、MPS 无 torch/无 MPS 时的 CPU 回退。
+- [x] 将 `test_audio.py` 改为平台无关的离线/模拟测试；不在 CI 中要求真实音频设备或 TCC 权限。
+- [x] README/README_zh.md 更新为双平台说明，新增 macOS 安装、权限、arm64、SCK 限制和性能预期。
+- [x] 更新 CHANGELOG，记录 macOS 支持范围、已知限制（CTranslate2 无 MPS、未签名 app 的 TCC 行为）。
+- [x] 发布前执行全局检查：`rg -n "windll|PyAudioWPatch|WASAPI|torch\\.cuda|Microsoft YaHei|Segoe UI"`，逐项确认是 Windows 分支、文档说明或待处理项。
+
+### M3 执行记录
+
+| 字段 | 内容 |
+|---|---|
+| 阶段/子任务 | `M3-A` CI 与发布、`M3-B` 平台/音频测试、`M3-C` 文档与审计 |
+| 改动文件 | `.github/workflows/release.yml`、`test_audio.py`、`tests/test_requirements.py`、`tests/test_m0_platform.py`、`torch_backend.py`、`main.py`、README 双语文档、双语 CHANGELOG。 |
+| 公共接口 | `AudioCapture`、SCK sample-buffer/512-sample PCM 契约、平台字体/设备解析接口保持不变。 |
+| 验证命令 | `python3 -m compileall -q .`、`bash -n install.sh start.sh update.sh`、`git diff --check`、全局平台假设 `rg` 审计；目标 CI 执行 `python -m pytest -q`。 |
+| 结果 | 代码、工作流 YAML、脚本和文档静态检查通过；本地 pytest deferred（基线 Python 3.9.6 不满足项目 3.10+ 约束，且环境缺少完整测试依赖；macOS CI 使用 Python 3.12 执行）。 |
+| 遗留项 | macOS arm64 真机 SCK/TCC/MPS、签名/公证和正式安装包仍需发布前验收；CI 源码包不包含签名 app。 |
 
 ## 关键风险闸门（代码阶段）
 
