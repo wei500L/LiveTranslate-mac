@@ -55,9 +55,18 @@ from torch_backend import (
 from platform_fonts import default_mono_font_family, default_ui_font_family
 from platform_app import configure_application, set_dock_visible
 from platform_config import normalize_config
+from connection_config import (
+    DEFAULT_REMOTE_ASR_URL,
+    DEFAULT_TRANSLATION_API_BASE,
+    normalize_remote_asr_url,
+    translation_api_base,
+    translation_api_key,
+    translation_model,
+)
 from vad_processor import VADProcessor
 from asr_client import ASRClient, ASRWorkerError, ASRWorkerExited, ASRWorkerTimeout
 from translator import Translator, RepetitionError
+from mlx_service import MLXServiceManager, is_hy_mt_model
 from transcript_writer import TranscriptWriter
 
 from PyQt6.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QDialog, QMessageBox
@@ -247,10 +256,11 @@ class LiveTranslateApp:
         self._asr_recycle_delta_mb = 768
         self._last_speech_activity = time.monotonic()
         self._target_language = config["translation"]["target_language"]
+        self._mlx_service = MLXServiceManager()
         self._translator = Translator(
-            api_base=config["translation"]["api_base"],
-            api_key=config["translation"]["api_key"],
-            model=config["translation"]["model"],
+            api_base=translation_api_base(config["translation"].get("api_base")),
+            api_key=translation_api_key(config["translation"].get("api_key")),
+            model=translation_model(config["translation"].get("model")),
             target_language=self._target_language,
             max_tokens=config["translation"]["max_tokens"],
             temperature=config["translation"]["temperature"],
@@ -326,7 +336,45 @@ class LiveTranslateApp:
         self._panel = panel
         panel.settings_changed.connect(self._on_settings_changed)
         panel.model_changed.connect(self._on_model_changed)
+        panel.mlx_service_state_changed.connect(self._on_mlx_service_state_changed)
+        panel.mlx_health_checked.connect(self._on_mlx_probe_result)
         panel.models_list_changed.connect(self._on_models_list_changed)
+        self._mlx_restart_pending = False
+        self._mlx_monitor_timer = QTimer()
+        self._mlx_monitor_timer.setInterval(5000)
+        self._mlx_monitor_timer.timeout.connect(self._monitor_mlx_service)
+        self._mlx_monitor_timer.start()
+
+    def _monitor_mlx_service(self):
+        """Keep an active managed model usable if its local server exits."""
+        if not self._panel:
+            return
+        active = self._panel.get_active_model()
+        if not is_hy_mt_model(active):
+            self._mlx_restart_pending = False
+            return
+        self._panel.request_mlx_health_check()
+
+    def _on_mlx_probe_result(self, running: bool):
+        if not self._panel or not is_hy_mt_model(self._panel.get_active_model()):
+            return
+        if running:
+            self._mlx_restart_pending = False
+            if self._translator is None:
+                self._on_model_changed(self._panel.get_active_model())
+            return
+        self._disable_translator()
+        if not self._mlx_restart_pending:
+            self._mlx_restart_pending = self._panel.auto_start_mlx_service()
+
+    def _on_mlx_service_state_changed(self, running: bool):
+        active = self._panel.get_active_model() if self._panel else None
+        if not is_hy_mt_model(active):
+            return
+        if running:
+            self._on_model_changed(active)
+        else:
+            self._disable_translator()
 
     def _on_models_list_changed(self, models: list, active_idx: int):
         if self._overlay:
@@ -500,7 +548,7 @@ class LiveTranslateApp:
         if config.get("engine_type") == "remote-whisper":
             from asr_remote import RemoteASREngine
 
-            url = config.get("remote_asr_url") or "http://127.0.0.1:8765"
+            url = normalize_remote_asr_url(config.get("remote_asr_url") or DEFAULT_REMOTE_ASR_URL)
             engine = RemoteASREngine(server_url=url)
             language = config.get("language")
             if language:
@@ -537,18 +585,41 @@ class LiveTranslateApp:
         log.info(
             f"Switching translator: {model_config['name']} ({model_config['model']})"
         )
-        prompt = None
-        if self._panel:
+        if is_hy_mt_model(model_config):
+            if not self._mlx_service.is_running():
+                message = (
+                    "HY-MT 本地服务尚未启动。\n"
+                    "请在‘翻译’设置中的模型配置区域手动启动本地服务后再选择此模型。"
+                )
+                log.warning("HY-MT MLX service is not running; refusing automatic start")
+                self._disable_translator()
+                if self._panel:
+                    QMessageBox.warning(self._panel, t("error_title"), message)
+                return
+
+        prompt = model_config.get("system_prompt")
+        if not prompt and self._panel:
             prompt = self._panel.get_settings().get("system_prompt")
         if not prompt:
             prompt = self._config["translation"].get("system_prompt")
         timeout = 10
         if self._panel:
             timeout = self._panel.get_settings().get("timeout", 10)
+        # Keep the local HY-MT path predictable for classroom real-time use:
+        # streaming on, no reasoning, and a short completion budget.
+        if is_hy_mt_model(model_config):
+            model_config = dict(model_config)
+            model_config["streaming"] = True
+            model_config["no_system_role"] = True
+            model_config["thinking_style"] = "off"
+            overrides = dict(model_config.get("overrides") or {})
+            overrides.update({"max_tokens": 128})
+            model_config["overrides"] = overrides
+
         new_translator = Translator(
-            api_base=model_config["api_base"],
-            api_key=model_config["api_key"],
-            model=model_config["model"],
+            api_base=translation_api_base(model_config.get("api_base")),
+            api_key=translation_api_key(model_config.get("api_key")),
+            model=translation_model(model_config.get("model")),
             target_language=self._target_language,
             max_tokens=self._config["translation"]["max_tokens"],
             temperature=self._config["translation"]["temperature"],
@@ -580,9 +651,18 @@ class LiveTranslateApp:
                     "translation_workers", self._translation_workers
                 )
             )
-        self._set_translation_workers(self._translation_workers)
         self._input_price = model_config.get("input_price", 0)
         self._output_price = model_config.get("output_price", 0)
+
+    def _disable_translator(self):
+        """Disable translation until the selected local service is available."""
+        with self._translation_lock:
+            self._translator = None
+            self._translator_generation += 1
+            self._translation_history.clear()
+            self._translation_order.clear()
+            self._translation_results.clear()
+            self._translation_pending = 0
 
     def _set_translation_workers(self, workers):
         workers = max(4, min(16, int(workers or 8)))
@@ -603,6 +683,8 @@ class LiveTranslateApp:
     def _snapshot_translation_request(self, msg_id, text, target_language=None):
         with self._translation_lock:
             base = self._translator
+            if base is None:
+                raise RuntimeError("No translation service is running")
             generation = self._translator_generation
             request = base.fork_for_request(
                 target_language=target_language or self._target_language,
@@ -689,7 +771,7 @@ class LiveTranslateApp:
 
         remote_asr_url = settings.get(
             "remote_asr_url",
-            self._config["asr"].get("remote_asr_url", "http://127.0.0.1:8765"),
+            self._config["asr"].get("remote_asr_url", DEFAULT_REMOTE_ASR_URL),
         )
 
         compute = self._config["asr"]["compute_type"]
@@ -1483,6 +1565,9 @@ class LiveTranslateApp:
             except Exception:
                 pass
             self._mem_periodic_timer = None
+        if getattr(self, "_mlx_monitor_timer", None) is not None:
+            self._mlx_monitor_timer.stop()
+            self._mlx_monitor_timer = None
         snap = self._mem_snapshot()
         total_delta = snap["rss"] - self._mem_baseline_mb
         log.info(
@@ -1491,6 +1576,7 @@ class LiveTranslateApp:
             f"asr_calls={self._mem_asr_call_count} outputs={self._asr_count}"
         )
         self._shutdown_asr_worker()
+        self._mlx_service.stop()
         log.info("Pipeline stopped")
 
     def pause(self):
@@ -2073,12 +2159,19 @@ def main():
         )
         info.exec()
 
-        dlg = ModelEditDialog(None, {
-            "name": "hunyuan-mt-chimera-7b",
-            "api_base": "http://127.0.0.1:1234/v1",
-            "api_key": "sk-lm-tHzDfNGm:dgxlip7eebn3HIMxivqN",
-            "model": "hunyuan-mt-chimera-7b",
-        })
+        from mlx_service import hy_mt_model_config
+
+        default_model_data = (
+            hy_mt_model_config()
+            if sys.platform == "darwin" and MLXServiceManager().is_model_ready()
+            else {
+                "name": "hunyuan-mt-chimera-7b",
+                "api_base": DEFAULT_TRANSLATION_API_BASE,
+                "api_key": translation_api_key(""),
+                "model": "hunyuan-mt-chimera-7b",
+            }
+        )
+        dlg = ModelEditDialog(None, default_model_data)
         dlg.setWindowTitle(t("setup_api_title"))
         if dlg.exec() == QDialog.DialogCode.Accepted:
             data = dlg.get_data()
@@ -2144,6 +2237,7 @@ def main():
     live_trans.set_overlay(overlay)
     live_trans.set_subtitle_window(subwin)
     live_trans.set_panel(panel)
+    app.aboutToQuit.connect(live_trans._mlx_service.stop)
 
     def _deferred_init():
         panel._apply_settings()
@@ -2159,7 +2253,16 @@ def main():
             overlay.apply_style(style)
         active_model = panel.get_active_model()
         if active_model:
-            live_trans._on_model_changed(active_model)
+            if is_hy_mt_model(active_model) and not live_trans._mlx_service.is_running():
+                # Do not let the constructor's generic translator handle audio
+                # while the managed local service is still booting.
+                live_trans._disable_translator()
+                if panel.auto_start_mlx_service():
+                    log.info("HY-MT is prepared; starting local service automatically")
+                else:
+                    log.info("HY-MT is selected but its local service is unavailable")
+            else:
+                live_trans._on_model_changed(active_model)
 
     QTimer.singleShot(100, _deferred_init)
 

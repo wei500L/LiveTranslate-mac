@@ -6,7 +6,7 @@ import sys
 import threading
 from pathlib import Path
 
-from PyQt6.QtCore import Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QThread, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QApplication,
@@ -25,6 +25,7 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QSlider,
     QSpinBox,
+    QProgressBar,
     QStackedWidget,
     QAbstractItemView,
     QTextEdit,
@@ -33,6 +34,13 @@ from PyQt6.QtWidgets import (
 )
 
 from benchmark import run_benchmark
+from connection_config import (
+    DEFAULT_REMOTE_ASR_URL,
+    normalize_remote_asr_url,
+    translation_api_base,
+    translation_api_key,
+    translation_model,
+)
 from dialogs import (
     ModelEditDialog,
     available_screen_height,
@@ -56,11 +64,73 @@ from i18n import t, LANGUAGES
 from subtitle_settings import SubtitleSettingsWidget
 from platform_fonts import default_mono_font_family, default_ui_font_family
 from torch_backend import available_devices, mps_available, normalize_device
+from mlx_service import (
+    MLXServiceError,
+    MLXServiceManager,
+    ensure_hy_mt_model,
+    is_hy_mt_model,
+)
 
 log = logging.getLogger("LiveTranslate.Panel")
 
 SETTINGS_FILE = Path(__file__).parent / "user_settings.json"
 PERFORMANCE_PROFILE_VERSION = 1
+
+
+class _MLXTaskThread(QThread):
+    """Run model preparation or service startup away from the Qt UI thread."""
+
+    progress = pyqtSignal(str)
+    failed = pyqtSignal(str)
+    succeeded = pyqtSignal()
+
+    def __init__(self, manager, action, parent=None):
+        super().__init__(parent)
+        self.manager = manager
+        self.action = action
+        self.cancel_event = threading.Event()
+
+    def run(self):
+        try:
+            if self.action == "prepare":
+                self.manager.prepare_model(
+                    progress_callback=self.progress.emit,
+                    cancel_event=self.cancel_event,
+                )
+            else:
+                self.manager.ensure_running(
+                    timeout=180,
+                    progress_callback=self.progress.emit,
+                    cancel_event=self.cancel_event,
+                )
+        except Exception as exc:
+            if self.action != "prepare":
+                # A cancelled/failed readiness probe may leave the child
+                # server alive; never orphan an app-owned MLX process.
+                try:
+                    self.manager.stop()
+                except Exception:
+                    pass
+            self.failed.emit(str(exc))
+        else:
+            self.succeeded.emit()
+
+
+class _MLXHealthThread(QThread):
+    """Probe the managed service without blocking the Qt event loop."""
+
+    checked = pyqtSignal(bool)
+
+    def __init__(self, manager, parent=None):
+        super().__init__(parent)
+        self.manager = manager
+
+    def run(self):
+        try:
+            running = self.manager.is_running()
+        except Exception:
+            running = False
+        self.checked.emit(running)
 
 
 def migrate_performance_settings(settings: dict | None) -> dict | None:
@@ -96,7 +166,10 @@ def _load_saved_settings() -> dict | None:
             old_version = int(data.get("performance_profile_version", 0) or 0)
             migrate_funasr_settings(data)
             migrate_performance_settings(data)
+            mlx_changed = ensure_hy_mt_model(data, activate_if_ready=False) if sys.platform == "darwin" else False
             if int(data.get("performance_profile_version", 0) or 0) != old_version:
+                _save_settings(data)
+            elif mlx_changed:
                 _save_settings(data)
             log.info(f"Loaded saved settings from {SETTINGS_FILE}")
             return data
@@ -122,6 +195,8 @@ class ControlPanel(QWidget):
 
     settings_changed = pyqtSignal(dict)
     model_changed = pyqtSignal(dict)
+    mlx_service_state_changed = pyqtSignal(bool)
+    mlx_health_checked = pyqtSignal(bool)
     models_list_changed = pyqtSignal(list, int)
     subtitle_settings_changed = pyqtSignal(dict)
     _bench_result = pyqtSignal(str)
@@ -131,6 +206,10 @@ class ControlPanel(QWidget):
     def __init__(self, config, saved_settings=None):
         super().__init__()
         self._config = config
+        self._mlx_manager = MLXServiceManager()
+        self._mlx_task = None
+        self._mlx_health_task = None
+        self._mlx_task_target_index = None
         self.setWindowTitle(t("window_control_panel"))
         self.setMinimumSize(760, 520)
         self.resize(900, min(760, available_screen_height(self)))
@@ -165,26 +244,29 @@ class ControlPanel(QWidget):
                 "models": [
                     {
                         "name": f"{tc['model']}",
-                        "api_base": tc["api_base"],
-                        "api_key": tc["api_key"],
-                        "model": tc["model"],
+                        "api_base": translation_api_base(tc.get("api_base")),
+                        "api_key": translation_api_key(tc.get("api_key")),
+                        "model": translation_model(tc.get("model")),
                     }
                 ],
                 "active_model": 0,
                 "hub": "ms",
             }
-
         if "models" not in self._current_settings:
             tc = config["translation"]
             self._current_settings["models"] = [
                 {
                     "name": f"{tc['model']}",
-                    "api_base": tc["api_base"],
-                    "api_key": tc["api_key"],
-                    "model": tc["model"],
+                    "api_base": translation_api_base(tc.get("api_base")),
+                    "api_key": translation_api_key(tc.get("api_key")),
+                    "model": translation_model(tc.get("model")),
                 }
             ]
             self._current_settings["active_model"] = 0
+        if sys.platform == "darwin":
+            mlx_changed = ensure_hy_mt_model(self._current_settings, activate_if_ready=False)
+            if mlx_changed:
+                _save_settings(self._current_settings)
 
         self._current_settings.setdefault(
             "funasr_model",
@@ -478,9 +560,9 @@ class ControlPanel(QWidget):
         remote_layout = QHBoxLayout(self._remote_group)
         remote_layout.addWidget(QLabel("URL"))
         self._remote_url_edit = QLineEdit(
-            s.get("remote_asr_url", "http://127.0.0.1:8765")
+            normalize_remote_asr_url(s.get("remote_asr_url", DEFAULT_REMOTE_ASR_URL))
         )
-        self._remote_url_edit.setPlaceholderText("http://127.0.0.1:8765")
+        self._remote_url_edit.setPlaceholderText(DEFAULT_REMOTE_ASR_URL)
         self._remote_url_edit.editingFinished.connect(self._auto_save)
         remote_layout.addWidget(self._remote_url_edit, 1)
         layout.addWidget(self._remote_group)
@@ -610,8 +692,31 @@ class ControlPanel(QWidget):
         self._model_list = QListWidget()
         self._model_list.setFont(QFont(default_mono_font_family(), 9))
         self._model_list.itemDoubleClicked.connect(self._on_model_double_clicked)
+        self._model_list.currentRowChanged.connect(self._update_mlx_controls)
         self._refresh_model_list()
         models_layout.addWidget(self._model_list)
+
+        self._mlx_controls = QWidget()
+        mlx_layout = QHBoxLayout(self._mlx_controls)
+        mlx_layout.setContentsMargins(0, 0, 0, 0)
+        self._mlx_status = QLabel()
+        self._mlx_status.setWordWrap(True)
+        mlx_layout.addWidget(self._mlx_status, 1)
+        self._mlx_progress = QProgressBar()
+        self._mlx_progress.setRange(0, 0)
+        self._mlx_progress.setVisible(False)
+        mlx_layout.addWidget(self._mlx_progress)
+        self._mlx_prepare_btn = QPushButton(t("btn_prepare_local_model"))
+        self._mlx_prepare_btn.clicked.connect(self._prepare_mlx_model)
+        mlx_layout.addWidget(self._mlx_prepare_btn)
+        self._mlx_start_btn = QPushButton(t("btn_start_local_service"))
+        self._mlx_start_btn.clicked.connect(self._start_mlx_service)
+        mlx_layout.addWidget(self._mlx_start_btn)
+        self._mlx_stop_btn = QPushButton(t("btn_stop_local_service"))
+        self._mlx_stop_btn.clicked.connect(self._stop_mlx_service)
+        mlx_layout.addWidget(self._mlx_stop_btn)
+        models_layout.addWidget(self._mlx_controls)
+        self._update_mlx_controls()
 
         btn_row = QHBoxLayout()
         add_btn = QPushButton(t("btn_add"))
@@ -638,6 +743,7 @@ class ControlPanel(QWidget):
         preset_row = QHBoxLayout()
         preset_row.addWidget(QLabel(t("label_prompt_preset")))
         self._prompt_preset = QComboBox()
+        self._prompt_preset.addItem(t("prompt_classroom"), "classroom")
         self._prompt_preset.addItem(t("prompt_daily"), "daily")
         self._prompt_preset.addItem(t("prompt_esports"), "esports")
         self._prompt_preset.addItem(t("prompt_anime"), "anime")
@@ -645,13 +751,11 @@ class ControlPanel(QWidget):
         self._prompt_preset.addItem(t("prompt_custom"), "custom")
 
         current_prompt = s.get("system_prompt", DEFAULT_PROMPT)
-        preset_idx = 4  # default to custom
-        for i, key in enumerate(["daily", "esports", "anime", "webid"]):
+        preset_idx = 5  # default to custom
+        for i, key in enumerate(["classroom", "daily", "esports", "anime", "webid"]):
             if current_prompt.strip() == PROMPT_PRESETS[key].strip():
                 preset_idx = i
                 break
-        if current_prompt.strip() == DEFAULT_PROMPT.strip():
-            preset_idx = 0
         self._prompt_preset.setCurrentIndex(preset_idx)
         self._prompt_preset.currentIndexChanged.connect(self._on_prompt_preset_changed)
         preset_row.addWidget(self._prompt_preset, 1)
@@ -1337,6 +1441,170 @@ class ControlPanel(QWidget):
                 font.setBold(True)
                 item.setFont(font)
             self._model_list.addItem(item)
+        if hasattr(self, "_mlx_controls"):
+            self._model_list.setCurrentRow(active if 0 <= active < self._model_list.count() else -1)
+            self._update_mlx_controls()
+
+    def _selected_mlx_model(self):
+        row = self._model_list.currentRow()
+        models = self._current_settings.get("models", [])
+        if 0 <= row < len(models) and is_hy_mt_model(models[row]):
+            return models[row]
+        return None
+
+    def _update_mlx_controls(self, *_):
+        if not hasattr(self, "_mlx_controls"):
+            return
+        model = self._selected_mlx_model()
+        visible = model is not None
+        self._mlx_controls.setVisible(visible)
+        if not visible:
+            return
+        ready = self._mlx_manager.is_model_ready() and self._mlx_manager.is_environment_ready()
+        running = self._mlx_manager.is_running() if ready else False
+        busy = self._mlx_task is not None and self._mlx_task.isRunning()
+        self._mlx_prepare_btn.setEnabled(not busy and not ready)
+        self._mlx_prepare_btn.setVisible(not ready)
+        self._mlx_progress.setVisible(busy)
+        self._mlx_start_btn.setVisible(ready)
+        self._mlx_stop_btn.setVisible(ready)
+        if busy:
+            return
+        self._mlx_start_btn.setEnabled(ready and not running)
+        self._mlx_stop_btn.setEnabled(running)
+        if not ready:
+            self._mlx_status.setText(t("mlx_service_not_deployed"))
+        elif running:
+            self._mlx_status.setText(t("mlx_service_running"))
+        else:
+            self._mlx_status.setText(t("mlx_service_stopped"))
+
+    def _run_mlx_task(self, action, target_index=None, activate_on_success=True):
+        if self._mlx_task is not None and self._mlx_task.isRunning():
+            return
+        if target_index is None:
+            target_index = self._model_list.currentRow()
+        self._mlx_task_target_index = target_index
+        self._mlx_task_activate = activate_on_success
+        self._mlx_task = _MLXTaskThread(self._mlx_manager, action, self)
+        self._mlx_task.progress.connect(self._on_mlx_progress)
+        self._mlx_task.failed.connect(self._on_mlx_task_failed)
+        self._mlx_task.succeeded.connect(self._on_mlx_task_succeeded)
+        self._mlx_task.finished.connect(self._on_mlx_task_finished)
+        self._mlx_progress.setVisible(True)
+        self._mlx_status.setText(
+            t("mlx_service_preparing") if action == "prepare" else t("mlx_service_starting")
+        )
+        self._mlx_task.start()
+
+    def _on_mlx_progress(self, text):
+        self._mlx_status.setText(text)
+
+    def _on_mlx_task_failed(self, message):
+        log.error("HY-MT task failed: %s", message)
+        QMessageBox.warning(self, t("error_title"), message)
+
+    def _on_mlx_task_succeeded(self):
+        row = self._mlx_task_target_index
+        models = self._current_settings.get("models", [])
+        if isinstance(row, int) and 0 <= row < len(models) and self._mlx_manager.is_running():
+            model = models[row]
+            if getattr(self, "_mlx_task_activate", True):
+                self._current_settings["active_model"] = row
+            else:
+                active = self._current_settings.get("active_model", 0)
+                if isinstance(active, int) and 0 <= active < len(models):
+                    model = models[active]
+            _save_settings(self._current_settings)
+            self._refresh_model_list()
+            self._emit_models_list_changed()
+            self.model_changed.emit(model)
+            self.mlx_service_state_changed.emit(True)
+
+    def _prepare_mlx_model(self):
+        if self._selected_mlx_model() is None:
+            return
+        self._run_mlx_task("prepare", activate_on_success=True)
+
+    def _start_mlx_service(self):
+        if self._selected_mlx_model() is None:
+            return
+        self._run_mlx_task("start", activate_on_success=True)
+
+    def auto_start_mlx_service(self) -> bool:
+        """Start a prepared local model during deferred application startup."""
+        active_index = self._current_settings.get("active_model", 0)
+        models = self._current_settings.get("models", [])
+        if not (isinstance(active_index, int) and 0 <= active_index < len(models)):
+            return False
+        if not is_hy_mt_model(models[active_index]):
+            return False
+        if not self._mlx_manager.is_supported_platform():
+            return False
+        ready = self._mlx_manager.is_model_ready() and self._mlx_manager.is_environment_ready()
+        if ready and not self._mlx_manager.is_running():
+            self._run_mlx_task("start", target_index=active_index, activate_on_success=False)
+            return True
+        return False
+
+    def _stop_mlx_service(self):
+        self._mlx_manager.stop()
+        self.mlx_service_state_changed.emit(False)
+        if self._selected_mlx_model() is not None:
+            self._current_settings["active_model"] = self._model_list.currentRow()
+            _save_settings(self._current_settings)
+            self.models_list_changed.emit(
+                self._current_settings.get("models", []),
+                self._current_settings.get("active_model", 0),
+            )
+        self._update_mlx_controls()
+
+    def closeEvent(self, event):
+        task = self._mlx_task
+        health_task = self._mlx_health_task
+        if (task is not None and task.isRunning()) or (health_task is not None and health_task.isRunning()):
+            if task is not None and task.isRunning():
+                task.cancel_event.set()
+            self.setEnabled(False)
+            self._close_after_mlx_task = True
+            event.ignore()
+            return
+        super().closeEvent(event)
+
+    def _on_mlx_task_finished(self):
+        task = self._mlx_task
+        self._mlx_task = None
+        if task is not None:
+            task.deleteLater()
+        self._update_mlx_controls()
+        self._maybe_close_after_mlx_tasks()
+
+    def request_mlx_health_check(self):
+        if self._mlx_health_task is not None and self._mlx_health_task.isRunning():
+            return
+        task = _MLXHealthThread(self._mlx_manager, self)
+        self._mlx_health_task = task
+        task.checked.connect(self.mlx_health_checked.emit)
+        task.finished.connect(self._on_mlx_health_finished)
+        task.start()
+
+    def _on_mlx_health_finished(self):
+        task = self._mlx_health_task
+        self._mlx_health_task = None
+        if task is not None:
+            task.deleteLater()
+        self._maybe_close_after_mlx_tasks()
+
+    def _maybe_close_after_mlx_tasks(self):
+        if not getattr(self, "_close_after_mlx_task", False):
+            return
+        if self._mlx_task is not None and self._mlx_task.isRunning():
+            return
+        if self._mlx_health_task is not None and self._mlx_health_task.isRunning():
+            return
+        self._close_after_mlx_task = False
+        self.setEnabled(True)
+        QTimer.singleShot(0, self.close)
 
     def _emit_models_list_changed(self):
         models = self._current_settings.get("models", [])
@@ -1517,8 +1785,8 @@ class ControlPanel(QWidget):
             # Update preset combo to reflect current state
             from translator import PROMPT_PRESETS
             self._prompt_preset.blockSignals(True)
-            matched = 4  # custom
-            for i, key in enumerate(["daily", "esports", "anime", "webid"]):
+            matched = 5  # custom
+            for i, key in enumerate(["classroom", "daily", "esports", "anime", "webid"]):
                 if text.strip() == PROMPT_PRESETS[key].strip():
                     matched = i
                     break
@@ -1543,7 +1811,7 @@ class ControlPanel(QWidget):
         if hasattr(self, "_remote_url_edit"):
             url = self._remote_url_edit.text().strip()
             if url:
-                self._current_settings["remote_asr_url"] = url
+                self._current_settings["remote_asr_url"] = normalize_remote_asr_url(url)
         self._current_settings["whisper_model_size"] = (
             self._selected_whisper_model()
         )

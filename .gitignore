@@ -3,6 +3,7 @@ __pycache__/
 *.pyc
 *.pyo
 .venv/
+.mlx-venv/
 .pip-cache/
 .uv-cache/
 .tmp/

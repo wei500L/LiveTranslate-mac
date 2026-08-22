@@ -33,6 +33,18 @@ Windows/macOS 实时音频翻译工具。Windows 使用 WASAPI loopback，macOS 
 - **模型自动管理**：首次启动向导，支持 ModelScope / HuggingFace 双源
 - **内置基准测试**：对比翻译模型速度和质量
 
+### Apple Silicon 本地 HY-MT1.5-7B
+
+M5 Pro 等 Apple Silicon 设备可以使用 HY-MT1.5-7B 的 MLX 4-bit 版本进行本地实时翻译。应用会从 ModelScope 临时下载官方 BF16 权重并转换为 MLX 4-bit，转换完成后自动删除 BF16 源文件：
+
+```bash
+./start.sh
+```
+
+应用会在“翻译”设置中新增 **HY-MT1.5-7B (MLX 4-bit)**。首次使用时点击“准备本地模型”，应用会在隔离环境中安装 MLX、临时下载并转换 BF16 权重，完成后自动删除 BF16 源文件。之后可手动点击“启动本地服务”或“停止本地服务”；切换模型不会自动启动服务，也不会在失败后静默回退到其他模型。应用退出时会释放本程序启动的 MLX 服务。若 8080 端口被其他程序占用，不会强制结束该程序。
+
+首次准备过程会临时下载约 16GB BF16 权重，转换后的 4-bit 模型约占 4GB；转换完成后 BF16 源权重不会保留。M5 Pro 48GB 统一内存适合这一配置。
+
 ### GigaAM-v3（俄语 ASR）
 
 LiveTranslate 通过 Transformers 加载官方 [`ai-sage/GigaAM-v3`](https://huggingface.co/ai-sage/GigaAM-v3)
@@ -68,13 +80,24 @@ git clone https://github.com/TheDeathDragon/LiveTranslate.git
 cd LiveTranslate
 ```
 
-双击 **`install.bat`** 一键安装——脚本会自动：
+双击 **`start.bat`** 即可一键安装并启动——首次运行会自动：
 1. 检测 Python 3.10–3.12（未安装则通过 winget 自动安装）
 2. 创建虚拟环境
 3. 检测 NVIDIA 显卡，选择 CUDA / CPU 版 PyTorch
 4. 安装全部依赖
 
-安装完成后双击 **`start.bat`** 启动。
+之后再次双击 **`start.bat`** 直接启动。macOS 使用 `./start.sh`，行为相同。
+
+翻译服务地址和密钥可通过环境变量一次配置，应用会自动补齐 OpenAI 兼容接口的 `/v1`：
+
+```bash
+export LIVETRANSLATE_API_BASE=http://127.0.0.1:1234
+export LIVETRANSLATE_API_KEY=你的密钥
+export LIVETRANSLATE_MODEL=hunyuan-mt-chimera-7b
+# 可选：修改本地 HY-MT 服务端口（默认 8080）
+export LIVETRANSLATE_MLX_PORT=8080
+./start.sh
+```
 
 更新时双击 **`update.bat`**——自动拉取最新代码并更新依赖（未安装 Git 会通过 winget 自动安装）。
 

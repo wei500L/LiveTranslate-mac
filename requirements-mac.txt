@@ -42,5 +42,8 @@ torchcodec>=0.7
 silero-vad>=5.0
 modelscope>=1.20.0
 huggingface_hub>=0.20.0
+
+# The optional HY-MT MLX runtime is prepared from the Translation settings UI.
+# It remains isolated in .mlx-venv to avoid changing the app's PyTorch stack.
 PyQt6>=6.5.0
 pyqtdarktheme>=2.1.0

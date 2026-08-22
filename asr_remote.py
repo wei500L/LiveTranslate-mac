@@ -3,6 +3,7 @@ import struct
 
 import httpx
 import numpy as np
+from connection_config import normalize_remote_asr_url
 
 log = logging.getLogger("LiveTranslate.ASR.Remote")
 
@@ -15,8 +16,9 @@ class RemoteASREngine:
     """
 
     def __init__(self, server_url="http://127.0.0.1:8765", timeout=30.0):
-        self._url = server_url.rstrip("/") + "/transcribe"
-        self._health_url = server_url.rstrip("/") + "/health"
+        server_url = normalize_remote_asr_url(server_url)
+        self._url = server_url + "/transcribe"
+        self._health_url = server_url + "/health"
         # trust_env=False bypasses the system / HTTP(S)_PROXY: the URL points
         # straight at a LAN/localhost server, and routing localhost through a proxy
         # returns a non-JSON error page instead of connecting. Bound the connect

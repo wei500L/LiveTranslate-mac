@@ -4,6 +4,7 @@ import time
 
 import httpx
 from openai import OpenAI
+from connection_config import normalize_api_base
 
 log = logging.getLogger("LiveTranslate.TL")
 
@@ -40,17 +41,21 @@ LANGUAGE_DISPLAY = {
 }
 
 DEFAULT_PROMPT = (
-    "You are a real-time subtitle translator. Translate {source_lang} into {target_lang}.\n"
-    "Rules:\n"
-    "- Output ONLY one single best translation, nothing else.\n"
-    "- Never include alternatives, parenthetical options, annotations, or explanations.\n"
-    "- Keep proper nouns, names, and brand names untranslated.\n"
-    "- Translate repeated expressions concisely, not mechanically word-for-word.\n"
-    "- Keep subtitles fluent and natural; avoid overly literal or stiff phrasing.\n"
-    "- Auto-correct likely ASR errors based on context and common sense."
+    "你是俄语课堂的实时翻译助手。请将课堂中的{source_lang}内容翻译成{target_lang}。\n"
+    "场景：学校或大学课堂，内容可能包括教师讲解、学生提问、课堂讨论、例句、术语、板书和作业要求。\n"
+    "规则：\n"
+    "- 只输出一条准确、自然的{target_lang}译文，不要解释、分析、前缀、引号或多个候选。\n"
+    "- 保持教师讲解或学生发言的逻辑、语气、否定、条件、因果、时间和指代关系，不擅自补充未说内容。\n"
+    "- 课程术语、人名、地名、书名、课程名、缩写、数字、公式和符号使用目标语言通行表达；没有把握时保留原文，不要臆造。\n"
+    "- 结合课堂语境和近期上下文纠正俄语 ASR 的错词、同音词和断句；无法确定时忠实翻译，不要编造。\n"
+    "- 可适度压缩口语重复和填充词，但不要省略定义、例子、数字、公式、作业要求或关键限定。\n"
+    "- 保持适合实时字幕的简洁长度；原句未完时翻译当前可确定的内容，不添加说明。\n"
+    "近期课堂上下文：\n"
+    "{context}"
 )
 
 PROMPT_PRESETS = {
+    "classroom": DEFAULT_PROMPT,
     "daily": (
         "You are a real-time subtitle translator for casual conversation. "
         "Translate {source_lang} into {target_lang}.\n"
@@ -102,7 +107,7 @@ PROMPT_PRESETS = {
 def make_openai_client(
     api_base: str, api_key: str, proxy: str = "none", timeout=None
 ) -> OpenAI:
-    kwargs = {"base_url": api_base, "api_key": api_key}
+    kwargs = {"base_url": normalize_api_base(api_base), "api_key": api_key}
     if timeout is not None:
         kwargs["timeout"] = httpx.Timeout(timeout, connect=5.0)
     if proxy == "system":

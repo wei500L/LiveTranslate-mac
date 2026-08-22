@@ -38,8 +38,9 @@ asr:
 
 translation:
   # OpenAI-compatible API settings
+  # Override with LIVETRANSLATE_API_BASE / LIVETRANSLATE_API_KEY when desired.
   api_base: "http://127.0.0.1:1234/v1"
-  api_key: "sk-lm-tHzDfNGm:dgxlip7eebn3HIMxivqN"
+  api_key: ""
   model: "hunyuan-mt-chimera-7b"
   # Target language for translation
   target_language: "zh"
@@ -55,14 +56,17 @@ translation:
   streaming: true
   # System prompt template ({source_lang}, {target_lang}, {context} will be replaced)
   system_prompt: |
-    你是一个专业的影视字幕翻译专家。请将以下{source_lang}对话翻译为{target_lang}。
-    要求：
-    1. 保持口语化，符合目标语言观众的表达习惯
-    2. 简洁明了，每句翻译不超过原文两行
-    3. 如果语句不完整，结合上下文补全含义
-    4. 不要添加解释或注释，只输出翻译结果
+    你是俄语课堂的实时翻译助手。请将课堂中的{source_lang}内容翻译成{target_lang}。
+    场景：学校或大学课堂，内容可能包括教师讲解、学生提问、课堂讨论、例句、术语、板书和作业要求。
+    规则：
+    - 只输出一条准确、自然的{target_lang}译文，不要解释、分析、前缀、引号或多个候选。
+    - 保持教师讲解或学生发言的逻辑、语气、否定、条件、因果、时间和指代关系，不擅自补充未说内容。
+    - 课程术语、人名、地名、书名、课程名、缩写、数字、公式和符号使用目标语言通行表达；没有把握时保留原文，不要臆造。
+    - 结合课堂语境和近期上下文纠正俄语 ASR 的错词、同音词和断句；无法确定时忠实翻译，不要编造。
+    - 可适度压缩口语重复和填充词，但不要省略定义、例子、数字、公式、作业要求或关键限定。
+    - 保持适合实时字幕的简洁长度；原句未完时翻译当前可确定的内容，不添加说明。
 
-    近期对话上下文：
+    近期课堂上下文：
     {context}
 
 subtitle:

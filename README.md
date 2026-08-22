@@ -33,6 +33,16 @@ Works with any system audio — videos, livestreams, voice chat. No player modif
 - **Auto model management**: Setup wizard, ModelScope / HuggingFace dual sources
 - **Built-in benchmark**: Compare translation model speed and quality
 
+### Local HY-MT1.5-7B on Apple Silicon
+
+Apple Silicon Macs can prepare the official ModelScope weights as an MLX 4-bit local translation model:
+
+```bash
+./start.sh
+```
+
+The app adds **HY-MT1.5-7B (MLX 4-bit)** to the Translation settings. Click **Prepare Local Model** once to install the isolated MLX runtime and convert the temporary BF16 weights; the BF16 source is removed automatically. Then use **Start Local Service** or **Stop Local Service**. Selecting a model never starts a service or silently falls back to another model. The app stops its own MLX service on exit.
+
 ### GigaAM-v3 (Russian ASR)
 
 LiveTranslate loads the official [`ai-sage/GigaAM-v3`](https://huggingface.co/ai-sage/GigaAM-v3)
@@ -76,13 +86,24 @@ git clone https://github.com/TheDeathDragon/LiveTranslate.git
 cd LiveTranslate
 ```
 
-Double-click **`install.bat`** — the installer will:
+Double-click **`start.bat`** to install and launch in one step. On the first run it will:
 1. Detect Python 3.10–3.12 (auto-install via winget if missing)
 2. Create a virtual environment
 3. Auto-detect NVIDIA GPU and let you choose CUDA / CPU PyTorch
 4. Install all dependencies
 
-Then double-click **`start.bat`** to launch.
+After that, double-click **`start.bat`** to launch directly. On macOS, use `./start.sh`.
+
+You can configure an OpenAI-compatible translation endpoint without editing YAML:
+
+```bash
+export LIVETRANSLATE_API_BASE=http://127.0.0.1:1234
+export LIVETRANSLATE_API_KEY=your-key
+export LIVETRANSLATE_MODEL=hunyuan-mt-chimera-7b
+# Optional: change the local HY-MT service port (default 8080)
+export LIVETRANSLATE_MLX_PORT=8080
+./start.sh
+```
 
 To update, double-click **`update.bat`** — it will pull the latest code and update dependencies (auto-installs Git via winget if missing).
 

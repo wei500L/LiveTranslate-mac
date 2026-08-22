@@ -5,7 +5,7 @@ import sys
 import threading
 from pathlib import Path
 
-from PyQt6.QtCore import QSize, Qt, QTimer, pyqtSignal
+from PyQt6.QtCore import QThread, QSize, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
     QApplication,
@@ -32,6 +32,7 @@ from PyQt6.QtWidgets import (
 from model_manager import download_asr, download_silero
 from i18n import t, get_lang
 from platform_fonts import default_mono_font_family
+from mlx_service import MLXServiceManager, hy_mt_model_config, is_hy_mt_model
 
 log = logging.getLogger("LiveTranslate.Dialogs")
 
@@ -118,6 +119,35 @@ class _StderrCapture:
 
     def isatty(self):
         return False
+
+
+class _ConnectionTestThread(QThread):
+    finished_result = pyqtSignal(bool, str, object)
+
+    def __init__(self, api_base, api_key, model, proxy, parent=None):
+        super().__init__(parent)
+        self.args = (api_base, api_key, model, proxy)
+
+    def run(self):
+        client = None
+        try:
+            from translator import make_openai_client
+            from connection_config import evaluate_model_list
+            api_base, api_key, model, proxy = self.args
+            client = make_openai_client(api_base, api_key, proxy, timeout=8)
+            response = client.models.list()
+            ids = {str(item.id) for item in getattr(response, "data", [])}
+            self.finished_result.emit(*evaluate_model_list(model, ids))
+        except Exception as exc:
+            from connection_config import classify_connection_error
+            code, context = classify_connection_error(exc)
+            self.finished_result.emit(False, code, context)
+        finally:
+            if client is not None:
+                try:
+                    client.close()
+                except Exception:
+                    pass
 
 
 class _ModelLoadDialog(QDialog):
@@ -472,6 +502,7 @@ class ModelEditDialog(QDialog):
 
     def __init__(self, parent=None, model_data=None):
         super().__init__(parent)
+        self._model_data = dict(model_data or {})
         self.setWindowTitle(
             t("dialog_edit_model") if model_data else t("dialog_add_model")
         )
@@ -492,6 +523,16 @@ class ModelEditDialog(QDialog):
         self._api_key = QLineEdit()
         self._api_key.setEchoMode(QLineEdit.EchoMode.Password)
         self._model = QLineEdit()
+
+        self._model_preset = QComboBox()
+        self._model_preset.addItem(t("model_preset_custom"), "custom")
+        self._model_preset.addItem(t("model_preset_local_hy_mt"), "hy_mt")
+        if not MLXServiceManager().is_supported_platform():
+            self._model_preset.model().item(1).setEnabled(False)
+        self._model_preset.currentIndexChanged.connect(self._on_model_preset_changed)
+        self._test_connection_btn = QPushButton(t("btn_test_connection"))
+        self._test_connection_btn.clicked.connect(self._test_connection)
+        self._connection_status = QLabel()
 
         self._proxy_mode = QComboBox()
         self._proxy_mode.addItems(
@@ -536,10 +577,15 @@ class ModelEditDialog(QDialog):
         price_row.addWidget(QLabel(t("label_output_price")))
         price_row.addWidget(self._output_price)
 
+        layout.addRow(t("label_model_preset"), self._model_preset)
         layout.addRow(t("label_display_name"), self._name)
         layout.addRow(t("label_api_base"), self._api_base)
         layout.addRow(t("label_api_key"), self._api_key)
         layout.addRow(t("label_model"), self._model)
+        test_row = QHBoxLayout()
+        test_row.addWidget(self._test_connection_btn)
+        test_row.addWidget(self._connection_status, 1)
+        layout.addRow("", test_row)
         layout.addRow(t("label_proxy"), self._proxy_mode)
         layout.addRow(t("label_proxy_url"), self._proxy_url)
         layout.addRow(t("label_pricing"), price_row)
@@ -643,6 +689,11 @@ class ModelEditDialog(QDialog):
             self._input_price.setValue(model_data.get("input_price", 0))
             self._output_price.setValue(model_data.get("output_price", 0))
 
+            preset = "hy_mt" if is_hy_mt_model(model_data) else "custom"
+            preset_idx = self._model_preset.findData(preset)
+            if preset_idx >= 0:
+                self._model_preset.setCurrentIndex(preset_idx)
+
             overrides = model_data.get("overrides") or {}
             for key, (cb, _row, widget) in self._adv_rows.items():
                 if key in overrides and overrides[key] is not None:
@@ -684,6 +735,73 @@ class ModelEditDialog(QDialog):
     def _on_proxy_mode_changed(self, index):
         self._proxy_url.setEnabled(index == 2)
 
+    def _on_model_preset_changed(self, _index):
+        """Populate all connection fields from a known local model preset."""
+        if self._model_preset.currentData() != "hy_mt":
+            self._model_data.pop("managed_service", None)
+            self._model_data.pop("system_prompt", None)
+            return
+        preset = hy_mt_model_config()
+        self._name.setText(preset["name"])
+        self._api_base.setText(preset["api_base"])
+        self._api_key.setText(preset["api_key"])
+        self._model.setText(preset["model"])
+        self._proxy_mode.setCurrentIndex(0)
+        self._streaming.setChecked(True)
+        self._no_system_role.setChecked(True)
+        style_idx = self._thinking_style.findData("off")
+        if style_idx >= 0:
+            self._thinking_style.setCurrentIndex(style_idx)
+        self._context_turns.setValue(int(preset.get("context_turns", 0)))
+        overrides = preset.get("overrides") or {}
+        for key, (cb, _row, widget) in self._adv_rows.items():
+            if key in overrides:
+                cb.setChecked(True)
+                widget.setValue(overrides[key])
+        self._adv_extra_body.setPlainText(
+            json.dumps(preset.get("extra_body", {}), ensure_ascii=False, indent=2)
+        )
+        self._model_data["managed_service"] = dict(preset["managed_service"])
+        self._model_data["system_prompt"] = preset.get("system_prompt")
+
+    def _test_connection(self):
+        if getattr(self, "_connection_thread", None) is not None:
+            return
+        idx = self._proxy_mode.currentIndex()
+        proxy = "none" if idx == 0 else ("system" if idx == 1 else self._proxy_url.text().strip())
+        self._test_connection_btn.setEnabled(False)
+        self._connection_status.setText(t("connection_testing"))
+        self._connection_thread = _ConnectionTestThread(
+            self._api_base.text().strip(), self._api_key.text().strip(),
+            self._model.text().strip(), proxy, self,
+        )
+        self._connection_thread.finished_result.connect(self._on_connection_result)
+        self._connection_thread.finished.connect(self._on_connection_finished)
+        self._connection_thread.start()
+
+    def _on_connection_result(self, ok, code, context):
+        message = t(code).format(**context)
+        self._connection_status.setText(message)
+        self._connection_status.setStyleSheet("color: #4a4;" if ok else "color: #d66;")
+
+    def _on_connection_finished(self):
+        thread = self._connection_thread
+        self._connection_thread = None
+        self._test_connection_btn.setEnabled(True)
+        if thread is not None:
+            thread.deleteLater()
+        if getattr(self, "_close_after_connection_test", False):
+            QTimer.singleShot(0, self.reject)
+
+    def closeEvent(self, event):
+        thread = getattr(self, "_connection_thread", None)
+        if thread is not None and thread.isRunning():
+            self._close_after_connection_test = True
+            self._test_connection_btn.setEnabled(False)
+            event.ignore()
+            return
+        super().closeEvent(event)
+
     def _parse_extra_body(self):
         """Return (ok, data_or_error_msg). Empty text → (True, None)."""
         text = self._adv_extra_body.toPlainText().strip()
@@ -721,6 +839,14 @@ class ModelEditDialog(QDialog):
             "model": self._model.text().strip(),
             "proxy": proxy,
         }
+        if self._model_preset.currentData() == "hy_mt":
+            preset = hy_mt_model_config()
+            result["managed_service"] = dict(preset["managed_service"])
+            result["system_prompt"] = preset.get("system_prompt")
+        if self._model_data.get("managed_service"):
+            result["managed_service"] = dict(self._model_data["managed_service"])
+        if self._model_data.get("system_prompt"):
+            result["system_prompt"] = self._model_data["system_prompt"]
         if self._no_system_role.isChecked():
             result["no_system_role"] = True
         thinking_style = self._thinking_style.currentData()
