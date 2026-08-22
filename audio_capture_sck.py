@@ -26,7 +26,10 @@ log = logging.getLogger("LiveTranslate.Audio.ScreenCaptureKit")
 
 try:  # NSObject is required by Objective-C delegate dispatch on real macOS.
     from Foundation import NSObject as _NSObject
+    import objc as _objc
 except ImportError:  # pragma: no cover - exercised on non-macOS CI
+    _objc = None
+
     class _NSObject:  # type: ignore[no-redef]
         pass
 
@@ -256,12 +259,14 @@ def sample_buffer_to_float32(sample_buffer):
 class _SCKStreamDelegate(_NSObject):
     """Objective-C delegate kept separate so fake streams can use the same API."""
 
-    def __init__(self, owner):
-        try:
-            super().__init__()
-        except TypeError:
-            pass
-        self.owner = owner
+    def initWithOwner_(self, owner):
+        if _objc is not None:
+            self = _objc.super(_SCKStreamDelegate, self).init()
+        else:  # pragma: no cover - only used by non-macOS fallback tests
+            object.__init__(self)
+        if self is not None:
+            self.owner = owner
+        return self
 
     def stream_didOutputSampleBuffer_ofType_(self, stream, sample_buffer, output_type):
         self.owner._sample_callback(sample_buffer, output_type)
@@ -456,7 +461,10 @@ class SCKAudioCapture(AudioCaptureBase):
             except Exception:
                 self._mic_capture = None
                 raise
-        self._delegate = _SCKStreamDelegate(self)
+        if hasattr(_SCKStreamDelegate, "alloc"):
+            self._delegate = _SCKStreamDelegate.alloc().initWithOwner_(self)
+        else:
+            self._delegate = _SCKStreamDelegate(self)
         self._stream_error_value = None
         try:
             self._stream = self._build_stream()

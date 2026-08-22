@@ -1,4 +1,9 @@
-"""GigaAM v3 Russian speech recognizer."""
+"""GigaAM-v3 e2e_rnnt Russian speech recognizer.
+
+The integration follows the official Hugging Face Transformers loading path.
+Long-form ``transcribe_longform`` is intentionally not part of this backend yet;
+the ASR worker supplies VAD-sized short segments.
+"""
 
 from __future__ import annotations
 
@@ -20,7 +25,7 @@ SAMPLE_RATE = 16_000
 
 
 class GigaAMEngine:
-    """Russian-only GigaAM v3 model with MPS -> CPU load fallback."""
+    """Russian GigaAM-v3 e2e_rnnt model with MPS -> CPU fallback."""
 
     def __init__(self, device="mps", hub="hf", model_id: str | None = None):
         import torch
@@ -83,6 +88,7 @@ class GigaAMEngine:
             MODEL_REVISION,
             self._device,
         )
+        self._audio_loader_installed = self._install_audio_loader()
 
     def _load_model(self, auto_model, model_source: str, device: str):
         model = auto_model.from_pretrained(
@@ -91,6 +97,12 @@ class GigaAMEngine:
             trust_remote_code=True,
         )
         try:
+            # Disable training-only paths and dropout for lower latency and
+            # deterministic inference. Remote-code models may not expose
+            # ``eval`` in test doubles, so keep this capability-checked.
+            eval_model = getattr(model, "eval", None)
+            if eval_model is not None:
+                eval_model()
             moved = model.to(device)
             return model if moved is None else moved
         except Exception:
@@ -112,6 +124,78 @@ class GigaAMEngine:
                 pass
         self._pipe = None
         gc.collect()
+
+    @staticmethod
+    def _load_wav_without_ffmpeg(audio_path: str, sample_rate: int = SAMPLE_RATE):
+        """Decode the WAV files produced by ``_write_wav`` without ffmpeg.
+
+        GigaAM's Hugging Face remote code shells out to ffmpeg even for a
+        standard PCM WAV.  LiveTranslate already normalizes every segment to
+        mono 16 kHz PCM, so using the stdlib decoder here removes that brittle
+        external-process dependency while preserving the model's expected
+        float tensor input.
+        """
+        import torch
+
+        with wave.open(audio_path, "rb") as wav:
+            channels = wav.getnchannels()
+            source_rate = wav.getframerate()
+            sample_width = wav.getsampwidth()
+            frames = wav.readframes(wav.getnframes())
+
+        if sample_width == 2:
+            samples = np.frombuffer(frames, dtype="<i2").astype(np.float32) / 32768.0
+        elif sample_width == 1:
+            samples = (np.frombuffer(frames, dtype=np.uint8).astype(np.float32) - 128.0) / 128.0
+        elif sample_width == 4:
+            samples = np.frombuffer(frames, dtype="<i4").astype(np.float32) / 2147483648.0
+        else:
+            raise ValueError(f"Unsupported WAV sample width: {sample_width} bytes")
+
+        if channels > 1:
+            samples = samples.reshape(-1, channels).mean(axis=1)
+        if source_rate != sample_rate and samples.size:
+            duration = samples.size / float(source_rate)
+            target_size = max(1, round(duration * sample_rate))
+            source_x = np.linspace(0.0, 1.0, samples.size, endpoint=False)
+            target_x = np.linspace(0.0, 1.0, target_size, endpoint=False)
+            samples = np.interp(target_x, source_x, samples).astype(np.float32)
+
+        return torch.from_numpy(np.ascontiguousarray(samples, dtype=np.float32))
+
+    @staticmethod
+    def _load_audio_input(audio, sample_rate: int = SAMPLE_RATE):
+        """Accept LiveTranslate's normalized in-memory PCM or a WAV path."""
+        import torch
+
+        if isinstance(audio, (str, os.PathLike)):
+            return GigaAMEngine._load_wav_without_ffmpeg(str(audio), sample_rate)
+        if isinstance(audio, torch.Tensor):
+            return audio.detach().to(dtype=torch.float32, device="cpu").reshape(-1)
+        samples = np.asarray(audio, dtype=np.float32).reshape(-1)
+        samples = np.nan_to_num(samples, nan=0.0, posinf=1.0, neginf=-1.0)
+        return torch.from_numpy(np.ascontiguousarray(samples, dtype=np.float32))
+
+    def _install_audio_loader(self):
+        """Patch the loaded remote-code model to use the local WAV decoder."""
+        root = getattr(self, "_model", None)
+        candidates = [root, getattr(root, "model", None)]
+        patched = False
+        for model in candidates:
+            if model is None:
+                continue
+            for method_name in ("transcribe", "prepare_wav"):
+                method = getattr(model, method_name, None)
+                function = getattr(method, "__func__", method)
+                globals_dict = getattr(function, "__globals__", None)
+                if not globals_dict or "load_audio" not in globals_dict:
+                    continue
+                if globals_dict.get("load_audio") is not self._load_audio_input:
+                    globals_dict["load_audio"] = self._load_audio_input
+                    patched = True
+        if patched:
+            log.info("GigaAM audio loader: using in-memory PCM input (WAV fallback enabled)")
+        return patched
 
     def set_language(self, language: str):
         if language not in (None, "auto", "ru"):
@@ -190,6 +274,21 @@ class GigaAMEngine:
                 if text
                 else None
             )
+        if getattr(self, "_audio_loader_installed", False):
+            try:
+                with self._torch.inference_mode():
+                    text = self._model.transcribe(
+                        np.ascontiguousarray(audio, dtype=np.float32).reshape(-1)
+                    )
+            except Exception:
+                log.debug("GigaAM in-memory input rejected; using WAV fallback", exc_info=True)
+                text = None
+            else:
+                text = str(text or "").strip()
+                if not text:
+                    return None
+                return {"text": text, "language": "ru", "language_name": "ru"}
+
         wav_path = self._write_wav(audio)
         try:
             with self._torch.inference_mode():

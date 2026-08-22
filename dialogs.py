@@ -146,9 +146,7 @@ class _ModelLoadDialog(QDialog):
         self._log_view = QTextEdit()
         self._log_view.setReadOnly(True)
         self._log_view.setFont(QFont(default_mono_font_family(), 8))
-        self._log_view.setStyleSheet(
-            "background: #1e1e2e; color: #cdd6f4; border: 1px solid #444;"
-        )
+        self._log_view.setObjectName("logView")
         layout.addWidget(self._log_view)
 
         self._log_signal.connect(self._append_log)
@@ -229,9 +227,7 @@ class SetupWizardDialog(QDialog):
         self._log_view = QTextEdit()
         self._log_view.setReadOnly(True)
         self._log_view.setFont(QFont(default_mono_font_family(), 8))
-        self._log_view.setStyleSheet(
-            "background: #1e1e2e; color: #cdd6f4; border: 1px solid #444;"
-        )
+        self._log_view.setObjectName("logView")
         self._log_view.hide()
         layout.addWidget(self._log_view)
 
@@ -386,9 +382,7 @@ class ModelDownloadDialog(QDialog):
         self._log_view = QTextEdit()
         self._log_view.setReadOnly(True)
         self._log_view.setFont(QFont(default_mono_font_family(), 8))
-        self._log_view.setStyleSheet(
-            "background: #1e1e2e; color: #cdd6f4; border: 1px solid #444;"
-        )
+        self._log_view.setObjectName("logView")
         layout.addWidget(self._log_view)
 
         self._close_btn = QPushButton(t("btn_close"))
@@ -576,7 +570,7 @@ class ModelEditDialog(QDialog):
 
         self._adv_max_tokens = QSpinBox()
         self._adv_max_tokens.setRange(1, 32768)
-        self._adv_max_tokens.setValue(256)
+        self._adv_max_tokens.setValue(512)
 
         self._adv_freq_penalty = QDoubleSpinBox()
         self._adv_freq_penalty.setRange(-2.0, 2.0)

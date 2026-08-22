@@ -5,6 +5,7 @@
 - 新增 macOS arm64 源码包产物（`LiveTranslate-macos-arm64-*.tar.gz`）；签名和公证仍属于后续发布工作。
 - 音频诊断默认执行无需设备的格式归一化 smoke test；Windows WASAPI 探测改为显式使用 `--live-windows`。
 - 补充 ScreenCaptureKit/麦克风权限、CTranslate2 仅 CPU、MPS 预期和未签名 app 的 TCC 限制说明。
+- 明确 GigaAM-v3 集成方式：官方 Hugging Face `e2e_rnnt` revision、俄语 ASR 范围、约 25 秒短音频限制，以及尚未接入应用的官方长音频支持。
 
 ## 2026-08-17
 - 增量 ASR 的分句库从 PySBD 切换到 yasbd-lib (#37): API 兼容无行为变化, 新增韩语等 17 种语言的原生分句规则 (此前韩语回退英语规则), 长文本分割速度大幅提升

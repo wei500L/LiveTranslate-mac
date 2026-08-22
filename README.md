@@ -33,6 +33,25 @@ Works with any system audio — videos, livestreams, voice chat. No player modif
 - **Auto model management**: Setup wizard, ModelScope / HuggingFace dual sources
 - **Built-in benchmark**: Compare translation model speed and quality
 
+### GigaAM-v3 (Russian ASR)
+
+LiveTranslate loads the official [`ai-sage/GigaAM-v3`](https://huggingface.co/ai-sage/GigaAM-v3)
+checkpoint through Transformers with the `e2e_rnnt` revision. This is the official
+end-to-end GigaAM-v3 ASR variant: it returns punctuated, normalized text and is
+intended for Russian speech. The integration keeps the existing ASR worker contract,
+accepts 16 kHz audio, and falls back from MPS to CPU if model loading or an operator
+fails on Apple Silicon.
+
+The current in-app path calls the model's short-audio `transcribe` API for each VAD
+segment. Per the official project documentation, that API is intended for audio up to
+25 seconds; long-form `transcribe_longform` with pyannote segmentation is not wired
+into LiveTranslate yet. The model is downloaded from Hugging Face by the normal model
+manager, so cloning the upstream repository is not required for the app.
+
+Official resources: [GigaAM-v3 model](https://huggingface.co/ai-sage/GigaAM-v3) ·
+[GigaAM project](https://github.com/salute-developers/GigaAM) ·
+[upstream usage guide](https://github.com/salute-developers/GigaAM#model-inference)
+
 ## Changelog
 
 See [English Changelog](i18n/CHANGELOG_en.md) | [中文更新日志](i18n/CHANGELOG_zh.md)
@@ -137,7 +156,7 @@ main.py                 Entry point & pipeline
 ├── asr_sensevoice.py   SenseVoice backend
 ├── asr_funasr_nano.py  FunASR Nano backend
 ├── asr_anime_whisper.py Anime-Whisper backend (ja anime/galgame)
-├── asr_gigaam.py        GigaAM backend (Russian-only, MPS/CPU)
+├── asr_gigaam.py        GigaAM-v3 e2e_rnnt backend (Russian, MPS/CPU)
 ├── asr_remote.py        Remote Whisper client (→ asr_server.py, see REMOTE_ASR.md)
 ├── translator.py       OpenAI-compatible client (streaming, JSON schema, context)
 ├── model_manager.py    Model download & cache

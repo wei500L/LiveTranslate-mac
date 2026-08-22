@@ -71,7 +71,19 @@ def test_mac_requirements_use_coreaudio_without_windows_patch():
     assert "pyobjc-framework-screencapturekit" in text
     assert "pyobjc-framework-coreaudio" in text
     assert "pyobjc-framework-libdispatch" in text
+    assert "pyobjc-framework-cocoa" in text
+    assert "pyobjc-framework-appkit" not in text
     assert "pyaudiowpatch" not in text
+
+
+def test_mac_requirements_pin_gigaam_compatible_stack():
+    text = Path("requirements-mac.txt").read_text(encoding="utf-8").lower()
+    assert "torch==2.8.0" in text
+    assert "torchaudio==2.8.0" in text
+    assert "transformers==4.57.1" in text
+    assert "pyannote-audio>=4.0,<5" in text
+    assert "torchcodec>=0.7" in text
+    assert "socksio>=1.0.0" in text
 
 
 def test_mac_launchers_require_the_verified_environment_marker():
@@ -97,7 +109,15 @@ def test_mac_requirements_contain_every_cross_platform_dependency():
         if line.split("#", 1)[0].strip()
     }
     common = {line for line in windows if not line.startswith("pyaudiowpatch")}
-    assert common <= mac
+
+    # macOS may pin a stricter compatible version of a shared dependency.
+    # Compare requirement names so `transformers==4.57.1` satisfies the
+    # cross-platform baseline `transformers>=4.40.0`.
+    def package_name(requirement: str) -> str:
+        return requirement.split("[", 1)[0].split("=", 1)[0].split(">", 1)[0].split("<", 1)[0].strip()
+
+    mac_names = {package_name(line) for line in mac}
+    assert {package_name(line) for line in common} <= mac_names
 
 
 def test_release_workflow_has_arm64_test_and_distinct_macos_artifact():

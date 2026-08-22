@@ -13,7 +13,8 @@ def offline_smoke() -> None:
     from audio_capture_base import AudioCaptureBase
 
     capture = AudioCaptureBase(queue_size=2)
-    capture.push_audio(np.ones((960, 2), dtype=np.float32), native_channels=2, native_rate=48000)
+    # 1536 native samples at 48 kHz become exactly 512 samples at 16 kHz.
+    capture.push_audio(np.ones((1536, 2), dtype=np.float32), native_channels=2, native_rate=48000)
     item = capture.get_audio(timeout=0)
     if item is None or item[0].shape != (512,) or item[0].dtype != np.float32:
         raise RuntimeError("offline audio normalization did not produce a 512-sample float32 block")

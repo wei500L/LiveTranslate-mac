@@ -5,6 +5,7 @@ from __future__ import annotations
 import logging
 import queue
 import threading
+from collections import deque
 from dataclasses import dataclass, asdict
 
 import numpy as np
@@ -26,6 +27,8 @@ class AudioCaptureBase:
     """Normalize arbitrary native callback buffers to 16k mono 512-sample blocks."""
 
     block_size = 512
+    _resample_index_cache = {}
+    _resample_cache_lock = threading.Lock()
 
     def __init__(self, sample_rate=16000, chunk_duration=0.032, queue_size=100):
         self.sample_rate = int(sample_rate)
@@ -35,8 +38,10 @@ class AudioCaptureBase:
         self.audio_queue = queue.Queue(maxsize=queue_size)
         self._stop_event = threading.Event()
         self._running = False
-        self._pending = np.empty(0, dtype=np.float32)
-        self._pending_mic = np.empty(0, dtype=np.float32)
+        self._pending = deque()
+        self._pending_samples = 0
+        self._pending_mic = deque()
+        self._pending_mic_samples = 0
         self._metrics = CaptureMetrics()
         self._lock = threading.RLock()
 
@@ -66,8 +71,42 @@ class AudioCaptureBase:
         if int(native_rate) == int(target_rate) or arr.size < 2:
             return arr
         n_out = max(1, int(round(arr.size * target_rate / native_rate)))
-        x = np.linspace(0, arr.size - 1, n_out, dtype=np.float32)
-        return np.interp(x, np.arange(arr.size, dtype=np.float32), arr).astype(np.float32)
+        cache_key = (arr.size, int(native_rate), int(target_rate), n_out)
+        with AudioCaptureBase._resample_cache_lock:
+            indices = AudioCaptureBase._resample_index_cache.get(cache_key)
+            if indices is None:
+                indices = (
+                    np.linspace(0, arr.size - 1, n_out, dtype=np.float32),
+                    np.arange(arr.size, dtype=np.float32),
+                )
+                if len(AudioCaptureBase._resample_index_cache) >= 32:
+                    AudioCaptureBase._resample_index_cache.pop(
+                        next(iter(AudioCaptureBase._resample_index_cache))
+                    )
+                AudioCaptureBase._resample_index_cache[cache_key] = indices
+        return np.interp(indices[0], indices[1], arr).astype(np.float32)
+
+    @staticmethod
+    def _append_pending(chunks, data):
+        chunk = np.asarray(data, dtype=np.float32).reshape(-1)
+        if chunk.size:
+            chunks.append(np.array(chunk, dtype=np.float32, copy=True))
+        return chunk.size
+
+    @staticmethod
+    def _take_pending(chunks, count):
+        output = np.empty(count, dtype=np.float32)
+        offset = 0
+        while offset < count and chunks:
+            chunk = chunks[0]
+            take = min(count - offset, chunk.size)
+            output[offset:offset + take] = chunk[:take]
+            offset += take
+            if take == chunk.size:
+                chunks.popleft()
+            else:
+                chunks[0] = chunk[take:]
+        return output, offset
 
     def _resample_to_mono(self, audio, native_channels=1, native_rate=16000):
         """Compatibility wrapper used by platform backends."""
@@ -113,22 +152,20 @@ class AudioCaptureBase:
                     mic_native_rate,
                     self.sample_rate,
                 )
-                self._pending_mic = np.concatenate(
-                    (
-                        self._pending_mic,
-                        mic_audio.reshape(-1),
-                    )
+                self._pending_mic_samples += self._append_pending(
+                    self._pending_mic, mic_audio
                 )
-            self._pending = np.concatenate((self._pending, main))
-            while self._pending.size >= self.block_size:
-                block = self._pending[: self.block_size]
-                self._pending = self._pending[self.block_size :]
+            self._pending_samples += self._append_pending(self._pending, main)
+            while self._pending_samples >= self.block_size:
+                block, _ = self._take_pending(self._pending, self.block_size)
+                self._pending_samples -= self.block_size
                 rms = mic_rms
-                if self._pending_mic.size:
+                if self._pending_mic_samples:
                     mic = np.zeros(self.block_size, dtype=np.float32)
-                    count = min(self.block_size, self._pending_mic.size)
-                    mic[:count] = self._pending_mic[:count]
-                    self._pending_mic = self._pending_mic[count:]
+                    count = min(self.block_size, self._pending_mic_samples)
+                    mic_part, consumed = self._take_pending(self._pending_mic, count)
+                    mic[:consumed] = mic_part[:consumed]
+                    self._pending_mic_samples -= consumed
                     rms = float(np.sqrt(np.mean(mic * mic)))
                     block = block + mic
                 self._enqueue(block, rms)
@@ -136,8 +173,10 @@ class AudioCaptureBase:
     def flush(self):
         """Drop an incomplete tail; VAD must never receive a short block."""
         with self._lock:
-            self._pending = np.empty(0, dtype=np.float32)
-            self._pending_mic = np.empty(0, dtype=np.float32)
+            self._pending.clear()
+            self._pending_samples = 0
+            self._pending_mic.clear()
+            self._pending_mic_samples = 0
 
     def metrics(self) -> dict:
         with self._lock:

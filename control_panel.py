@@ -25,7 +25,8 @@ from PyQt6.QtWidgets import (
     QPushButton,
     QSlider,
     QSpinBox,
-    QTabWidget,
+    QStackedWidget,
+    QAbstractItemView,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -59,6 +60,22 @@ from torch_backend import available_devices, mps_available, normalize_device
 log = logging.getLogger("LiveTranslate.Panel")
 
 SETTINGS_FILE = Path(__file__).parent / "user_settings.json"
+PERFORMANCE_PROFILE_VERSION = 1
+
+
+def migrate_performance_settings(settings: dict | None) -> dict | None:
+    if not isinstance(settings, dict):
+        return settings
+    if int(settings.get("performance_profile_version", 0) or 0) >= PERFORMANCE_PROFILE_VERSION:
+        settings.setdefault("translation_workers", 8)
+        return settings
+    for model in settings.get("models", []):
+        overrides = model.get("overrides")
+        if isinstance(overrides, dict) and overrides.get("max_tokens") == 4096:
+            overrides["max_tokens"] = 512
+    settings.setdefault("translation_workers", 8)
+    settings["performance_profile_version"] = PERFORMANCE_PROFILE_VERSION
+    return settings
 
 
 def _open_folder(path):
@@ -76,7 +93,11 @@ def _load_saved_settings() -> dict | None:
     try:
         if SETTINGS_FILE.exists():
             data = json.loads(SETTINGS_FILE.read_text(encoding="utf-8"))
+            old_version = int(data.get("performance_profile_version", 0) or 0)
             migrate_funasr_settings(data)
+            migrate_performance_settings(data)
+            if int(data.get("performance_profile_version", 0) or 0) != old_version:
+                _save_settings(data)
             log.info(f"Loaded saved settings from {SETTINGS_FILE}")
             return data
     except Exception as e:
@@ -111,10 +132,12 @@ class ControlPanel(QWidget):
         super().__init__()
         self._config = config
         self.setWindowTitle(t("window_control_panel"))
-        self.setMinimumSize(480, 420)
-        self.resize(520, min(650, available_screen_height(self)))
+        self.setMinimumSize(760, 520)
+        self.resize(900, min(760, available_screen_height(self)))
 
-        saved = migrate_funasr_settings(saved_settings) or _load_saved_settings()
+        saved = migrate_performance_settings(
+            migrate_funasr_settings(saved_settings)
+        ) or _load_saved_settings()
         if saved:
             self._current_settings = saved
         else:
@@ -180,22 +203,50 @@ class ControlPanel(QWidget):
         )
 
         layout = QVBoxLayout(self)
-        tabs = QTabWidget()
+        layout.setContentsMargins(18, 18, 18, 18)
+        layout.setSpacing(14)
 
-        tabs.addTab(make_scroll_area(self._create_vad_tab()), t("tab_vad_asr"))
-        tabs.addTab(
-            make_scroll_area(self._create_translation_tab()), t("tab_translation")
-        )
-        tabs.addTab(make_scroll_area(self._create_style_tab()), t("tab_style"))
-        tabs.addTab(make_scroll_area(self._create_subtitle_tab()), t("tab_subtitle"))
-        tabs.addTab(self._create_benchmark_tab(), t("tab_benchmark"))
-        self._cache_tab_index = tabs.addTab(
-            make_scroll_area(self._create_cache_tab()), t("tab_cache")
-        )
-        tabs.addTab(self._create_changelog_tab(), t("tab_changelog"))
-        tabs.currentChanged.connect(self._on_tab_changed)
+        header = QHBoxLayout()
+        title = QLabel("LiveTranslate")
+        title.setObjectName("pageTitle")
+        header.addWidget(title)
+        subtitle = QLabel(t("control_panel_subtitle"))
+        subtitle.setObjectName("pageSubtitle")
+        header.addWidget(subtitle)
+        header.addStretch()
+        self._save_status = QLabel(t("status_auto_saved"))
+        self._save_status.setObjectName("statusLabel")
+        header.addWidget(self._save_status)
+        layout.addLayout(header)
 
-        layout.addWidget(tabs)
+        body = QHBoxLayout()
+        body.setSpacing(16)
+        self._nav = QListWidget()
+        self._nav.setObjectName("settingsNavigation")
+        self._nav.setFixedWidth(170)
+        self._nav.setSelectionMode(QAbstractItemView.SelectionMode.SingleSelection)
+        self._nav.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        body.addWidget(self._nav)
+
+        self._pages = QStackedWidget()
+        page_specs = [
+            (t("tab_vad_asr"), make_scroll_area(self._create_vad_tab())),
+            (t("tab_translation"), make_scroll_area(self._create_translation_tab())),
+            (t("tab_style"), make_scroll_area(self._create_style_tab())),
+            (t("tab_subtitle"), make_scroll_area(self._create_subtitle_tab())),
+            (t("tab_benchmark"), self._create_benchmark_tab()),
+            (t("tab_cache"), make_scroll_area(self._create_cache_tab())),
+            (t("tab_changelog"), self._create_changelog_tab()),
+        ]
+        for label, page in page_specs:
+            self._nav.addItem(label)
+            self._pages.addWidget(page)
+        self._cache_tab_index = 5
+        self._nav.currentRowChanged.connect(self._pages.setCurrentIndex)
+        self._pages.currentChanged.connect(self._on_tab_changed)
+        self._nav.setCurrentRow(0)
+        body.addWidget(self._pages, 1)
+        layout.addLayout(body, 1)
 
         self._bench_result.connect(self._on_bench_result)
         self._cache_result.connect(self._on_cache_result)
@@ -633,6 +684,16 @@ class ControlPanel(QWidget):
         )
         self._timeout_spin.valueChanged.connect(self._auto_save)
         net_layout.addWidget(self._timeout_spin, 0, 1)
+        net_layout.addWidget(QLabel(t("label_translation_workers")), 1, 0)
+        self._translation_workers = QSpinBox()
+        self._translation_workers.setRange(4, 16)
+        self._translation_workers.setValue(int(s.get("translation_workers", 8)))
+        self._translation_workers.setToolTip(t("translation_workers_hint"))
+        self._translation_workers.valueChanged.connect(
+            lambda v: self._current_settings.update({"translation_workers": v})
+        )
+        self._translation_workers.valueChanged.connect(self._auto_save)
+        net_layout.addWidget(self._translation_workers, 1, 1)
         layout.addWidget(net_group)
 
         layout.addStretch()
@@ -1432,6 +1493,8 @@ class ControlPanel(QWidget):
     def _do_auto_save(self):
         self._apply_settings()
         _save_settings(self._current_settings)
+        if hasattr(self, "_save_status"):
+            self._save_status.setText(t("status_saved"))
 
     def _on_prompt_preset_changed(self, index):
         from translator import DEFAULT_PROMPT, PROMPT_PRESETS
@@ -1513,6 +1576,9 @@ class ControlPanel(QWidget):
         if prompt_text:
             self._current_settings["system_prompt"] = prompt_text
         self._current_settings["timeout"] = self._timeout_spin.value()
+        self._current_settings["translation_workers"] = (
+            self._translation_workers.value()
+        )
         if hasattr(self, "_incremental_asr_cb"):
             self._on_timing_changed()
         if hasattr(self, "_auto_save_transcript_cb"):

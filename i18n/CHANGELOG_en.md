@@ -5,6 +5,7 @@
 - Added a macOS arm64 source bundle artifact (`LiveTranslate-macos-arm64-*.tar.gz`); signing and notarization remain release follow-ups.
 - The audio diagnostic now runs a device-free normalization smoke test by default; Windows WASAPI probing is opt-in with `--live-windows`.
 - Documented ScreenCaptureKit and microphone permissions, CPU-only CTranslate2 behavior, MPS expectations, and known unsigned-app TCC limitations.
+- Clarified the GigaAM-v3 integration: official Hugging Face `e2e_rnnt` revision, Russian ASR scope, 25-second short-audio limit, and upstream long-form support not yet wired into the app.
 
 ## 2026-08-17
 - Incremental ASR sentence segmentation switched from PySBD to yasbd-lib (#37): API-compatible with no behavior change, adds native rules for Korean and 16 more languages (Korean previously fell back to English rules), and is much faster on long text

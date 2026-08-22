@@ -6,6 +6,7 @@ import logging
 import threading
 import queue
 import gc
+from collections import deque
 from concurrent.futures import ThreadPoolExecutor
 import yaml
 import time
@@ -87,6 +88,7 @@ from dialogs import (
     _ModelLoadDialog,
 )
 from i18n import t, set_lang, LANGUAGES, COMMON_LANG_CODES
+from ui_theme import apply_theme
 
 
 def _audio_start_error(exc):
@@ -242,7 +244,8 @@ class LiveTranslateApp:
         # post-load baseline, to bound native-side (FunASR/CTranslate2) leaks that
         # accumulate in the long-lived worker process.
         self._asr_worker_baseline_mb = None
-        self._asr_recycle_delta_mb = 2048
+        self._asr_recycle_delta_mb = 768
+        self._last_speech_activity = time.monotonic()
         self._target_language = config["translation"]["target_language"]
         self._translator = Translator(
             api_base=config["translation"]["api_base"],
@@ -263,7 +266,19 @@ class LiveTranslateApp:
         self._capture_thread = None
         self._asr_thread = None
         self._asr_queue = queue.Queue(maxsize=16)
-        self._tl_executor = ThreadPoolExecutor(max_workers=8)
+        self._translation_workers = 8
+        self._tl_executor = None
+        self._extra_tl_executor = None
+        self._translation_lock = threading.RLock()
+        self._translation_history = []
+        self._translation_order = deque()
+        self._translation_results = {}
+        self._translator_generation = 0
+        self._translation_stats_lock = threading.Lock()
+        self._translation_latencies = deque(maxlen=100)
+        self._asr_latencies = deque(maxlen=100)
+        self._latency_counts = {"asr": 0, "translation": 0}
+        self._translation_pending = 0
 
         self._transcript = TranscriptWriter(Path(__file__).parent / "transcripts")
 
@@ -372,6 +387,8 @@ class LiveTranslateApp:
                 self._overlay.set_target_language(self._target_language)
         if "timeout" in settings and self._translator:
             self._translator.set_timeout(settings["timeout"])
+        if "translation_workers" in settings:
+            self._set_translation_workers(settings["translation_workers"])
         if "auto_save_transcript" in settings:
             self._transcript.set_enabled(settings["auto_save_transcript"])
 
@@ -528,7 +545,7 @@ class LiveTranslateApp:
         timeout = 10
         if self._panel:
             timeout = self._panel.get_settings().get("timeout", 10)
-        self._translator = Translator(
+        new_translator = Translator(
             api_base=model_config["api_base"],
             api_key=model_config["api_key"],
             model=model_config["model"],
@@ -549,9 +566,102 @@ class LiveTranslateApp:
         context_turns = model_config.get(
             "context_turns", self._config["translation"].get("context_window", 0)
         )
-        self._translator.set_context_turns(context_turns)
+        new_translator.set_context_turns(context_turns)
+        with self._translation_lock:
+            self._translator = new_translator
+            self._translator_generation += 1
+            self._translation_history.clear()
+            self._translation_order.clear()
+            self._translation_results.clear()
+            self._translation_pending = 0
+        if self._panel:
+            self._translation_workers = int(
+                self._panel.get_settings().get(
+                    "translation_workers", self._translation_workers
+                )
+            )
+        self._set_translation_workers(self._translation_workers)
         self._input_price = model_config.get("input_price", 0)
         self._output_price = model_config.get("output_price", 0)
+
+    def _set_translation_workers(self, workers):
+        workers = max(4, min(16, int(workers or 8)))
+        if workers == getattr(self, "_translation_workers", None):
+            return
+        self._translation_workers = workers
+        if not self._running:
+            return
+        new_executor = ThreadPoolExecutor(
+            max_workers=workers, thread_name_prefix="translate"
+        )
+        old_executor = getattr(self, "_tl_executor", None)
+        self._tl_executor = new_executor
+        if old_executor is not None:
+            old_executor.shutdown(wait=False, cancel_futures=False)
+        log.info("Translation pool configured: workers=%d", workers)
+
+    def _snapshot_translation_request(self, msg_id, text, target_language=None):
+        with self._translation_lock:
+            base = self._translator
+            generation = self._translator_generation
+            request = base.fork_for_request(
+                target_language=target_language or self._target_language,
+                history_snapshot=list(self._translation_history),
+            )
+            if msg_id not in self._translation_order:
+                insert_at = len(self._translation_order)
+                for index, queued_id in enumerate(self._translation_order):
+                    if msg_id < queued_id:
+                        insert_at = index
+                        break
+                self._translation_order.insert(insert_at, msg_id)
+            self._translation_pending += 1
+            return request, generation
+
+    def _commit_translation_result(self, msg_id, text, translated, generation):
+        with self._translation_lock:
+            if generation != self._translator_generation:
+                self._translation_results.pop(msg_id, None)
+                try:
+                    self._translation_order.remove(msg_id)
+                except ValueError:
+                    pass
+                self._translation_pending = max(0, self._translation_pending - 1)
+                return False
+            self._translation_results[msg_id] = (text, translated)
+            while self._translation_order:
+                head = self._translation_order[0]
+                item = self._translation_results.get(head)
+                if item is None:
+                    break
+                self._translation_order.popleft()
+                self._translation_results.pop(head, None)
+                src, result = item
+                if result and self._translator._context_turns > 0:
+                    self._translation_history.append((src, result))
+                    keep = self._translator._context_turns + 2
+                    if len(self._translation_history) > keep:
+                        self._translation_history = self._translation_history[-self._translator._context_turns:]
+                self._translation_pending = max(0, self._translation_pending - 1)
+            return True
+
+    def _submit_translation(self, msg_id, text, source_lang, extra_langs=None):
+        request_translator, generation = self._snapshot_translation_request(
+            msg_id, text
+        )
+        try:
+            return self._tl_executor.submit(
+                self._translate_async,
+                msg_id,
+                text,
+                source_lang,
+                extra_langs,
+                request_translator,
+                generation,
+            )
+        except RuntimeError:
+            self._commit_translation_result(msg_id, text, None, generation)
+            raise
 
     def _switch_asr_engine(self, engine_type: str):
         settings = self._panel.get_settings() if self._panel else {}
@@ -935,6 +1045,20 @@ class LiveTranslateApp:
                 self._asr_error_count = 0
                 self._asr_restart_count = 0
         asr_ms = (time.perf_counter() - asr_start) * 1000
+        if self._asr_worker_baseline_mb is None and client.pid is not None:
+            try:
+                import psutil
+
+                self._asr_worker_baseline_mb = (
+                    psutil.Process(client.pid).memory_info().rss / 1024 / 1024
+                )
+                log.info(
+                    "ASR worker post-first-call baseline: %.0fMB",
+                    self._asr_worker_baseline_mb,
+                )
+            except Exception:
+                pass
+        self._record_latency("asr", asr_ms)
         self._log_mem_after_asr(kind, audio_seconds, asr_ms)
         return result, asr_ms
 
@@ -1038,6 +1162,13 @@ class LiveTranslateApp:
         beyond what arrives during it."""
         if not self._running:
             return
+        if not self._asr_queue.empty():
+            return
+        with self._vad_lock:
+            if self._vad._is_speaking:
+                return
+        if time.monotonic() - self._last_speech_activity < 15.0:
+            return
         with self._asr_lock:
             client = self._asr
             if not self._asr_ready or client is None or self._asr_recycling:
@@ -1052,7 +1183,6 @@ class LiveTranslateApp:
         except Exception:
             return
         if self._asr_worker_baseline_mb is None:
-            self._asr_worker_baseline_mb = rss
             return
         if rss < self._asr_worker_baseline_mb + self._asr_recycle_delta_mb:
             return
@@ -1134,21 +1264,65 @@ class LiveTranslateApp:
                     self._total_completion_tokens * self._output_price) / 1_000_000
         return 0.0
 
-    def _translate_async(self, msg_id, text, source_lang, extra_langs=None):
+    def _record_latency(self, kind: str, elapsed_ms: float):
+        with self._translation_stats_lock:
+            values = self._asr_latencies if kind == "asr" else self._translation_latencies
+            values.append(float(elapsed_ms))
+            self._latency_counts[kind] += 1
+            total_count = self._latency_counts[kind]
+            if total_count % 20:
+                return
+            count = len(values)
+            p50, p95 = np.percentile(np.asarray(values), [50, 95])
+            audio_metrics = self._audio.metrics() if hasattr(self._audio, "metrics") else {}
+            worker_rss = self._mem_snapshot().get("worker_rss", 0.0)
+            log.info(
+                "PERF[%s] samples=%d p50=%.0fms p95=%.0fms asr_queue=%d "
+                "audio_dropped=%d worker_rss=%.0fMB translation_pending=%d",
+                kind,
+                count,
+                p50,
+                p95,
+                self._asr_queue.qsize(),
+                audio_metrics.get("dropped_blocks", 0),
+                worker_rss,
+                self._translation_pending,
+            )
+
+    def _translate_async(
+        self,
+        msg_id,
+        text,
+        source_lang,
+        extra_langs=None,
+        request_translator=None,
+        generation=None,
+    ):
         """Translate text and update UI with streaming display."""
+        if request_translator is None:
+            request_translator, generation = self._snapshot_translation_request(
+                msg_id, text
+            )
+        translated = None
         try:
             tl_start = time.perf_counter()
-            translated = None
-            for partial in self._translator.translate_iter(text, source_lang):
+            for partial in request_translator.translate_iter(text, source_lang):
                 translated = partial
-                if self._overlay:
+                if self._overlay and generation == self._translator_generation:
                     self._overlay.update_streaming(msg_id, partial)
             tl_ms = (time.perf_counter() - tl_start) * 1000
-            self._translate_count += 1
-            pt, ct = self._translator.last_usage
-            self._total_prompt_tokens += pt
-            self._total_completion_tokens += ct
-            cost = self._compute_cost()
+            if not self._commit_translation_result(
+                msg_id, text, translated, generation
+            ):
+                log.info("Discarding translation from superseded model: msg=%s", msg_id)
+                return
+            pt, ct = request_translator.last_usage
+            with self._translation_stats_lock:
+                self._translate_count += 1
+                self._total_prompt_tokens += pt
+                self._total_completion_tokens += ct
+                cost = self._compute_cost()
+            self._record_latency("translation", tl_ms)
             log.info(f"Translate ({tl_ms:.0f}ms): {translated}")
             if translated:
                 self._transcript.write_translation(msg_id, translated)
@@ -1169,6 +1343,7 @@ class LiveTranslateApp:
                     self._translate_extra_langs(text, source_lang, extra_langs, tl_dict)
                 self._subwin.update_text(text, tl_dict)
         except RepetitionError:
+            self._commit_translation_result(msg_id, text, None, generation)
             log.warning("Repetition loop detected, model may not support structured output well")
             self._transcript.finalize_no_translation(msg_id)
             if self._overlay:
@@ -1176,6 +1351,7 @@ class LiveTranslateApp:
                     msg_id, f"[{t('error_repetition')}]", 0
                 )
         except Exception as e:
+            current = self._commit_translation_result(msg_id, text, None, generation)
             import openai
             if isinstance(e, (openai.APIConnectionError, openai.APITimeoutError,
                               openai.AuthenticationError, openai.APIStatusError,
@@ -1183,6 +1359,8 @@ class LiveTranslateApp:
                 log.warning(f"Translate error: {e}")
             else:
                 log.error(f"Translate error: {e}", exc_info=True)
+            if not current:
+                return
             self._transcript.finalize_no_translation(msg_id)
             if self._overlay:
                 self._overlay.update_translation(msg_id, f"[error: {e}]", 0)
@@ -1192,12 +1370,16 @@ class LiveTranslateApp:
         from concurrent.futures import as_completed
 
         def _do_translate(lang):
-            translator = self._translator.with_target_language(lang)
+            with self._translation_lock:
+                translator = self._translator.fork_for_request(
+                    target_language=lang,
+                    history_snapshot=list(self._translation_history),
+                )
             return lang, translator.translate(text, source_lang)
 
         futures = []
         for lang in extra_langs:
-            futures.append(self._tl_executor.submit(_do_translate, lang))
+            futures.append(self._extra_tl_executor.submit(_do_translate, lang))
 
         for future in as_completed(futures):
             try:
@@ -1223,8 +1405,12 @@ class LiveTranslateApp:
     def start(self):
         if self._running:
             return
-        n = len(self._subwin.get_target_languages()) if self._subwin else 1
-        self._tl_executor = ThreadPoolExecutor(max_workers=max(8, n + 1))
+        self._tl_executor = ThreadPoolExecutor(
+            max_workers=self._translation_workers, thread_name_prefix="translate"
+        )
+        self._extra_tl_executor = ThreadPoolExecutor(
+            max_workers=4, thread_name_prefix="translate-extra"
+        )
         self._asr_queue = queue.Queue(maxsize=16)
         self._running = True
         self._paused = False
@@ -1233,6 +1419,9 @@ class LiveTranslateApp:
         except Exception:
             self._running = False
             self._tl_executor.shutdown(wait=False, cancel_futures=True)
+            self._extra_tl_executor.shutdown(wait=False, cancel_futures=True)
+            self._tl_executor = None
+            self._extra_tl_executor = None
             raise
         self._capture_thread = threading.Thread(
             target=self._capture_loop, daemon=True
@@ -1281,7 +1470,12 @@ class LiveTranslateApp:
         self._last_interim_samples = 0
         self._last_interim_check_time = 0.0
         self._interim_committed_tail = ""
-        self._tl_executor.shutdown(wait=True)
+        if self._tl_executor is not None:
+            self._tl_executor.shutdown(wait=True)
+        if self._extra_tl_executor is not None:
+            self._extra_tl_executor.shutdown(wait=True)
+        self._tl_executor = None
+        self._extra_tl_executor = None
         self._transcript.close()
         if self._mem_periodic_timer is not None:
             try:
@@ -1397,7 +1591,7 @@ class LiveTranslateApp:
                 # Primary is same language; still need to translate extra langs
                 if extra_langs:
                     try:
-                        self._tl_executor.submit(
+                        self._extra_tl_executor.submit(
                             self._translate_subwin_only, original_text, source_lang, extra_langs
                         )
                     except RuntimeError:
@@ -1406,9 +1600,8 @@ class LiveTranslateApp:
                     self._subwin.update_text(original_text, {target_lang: original_text})
         else:
             try:
-                self._tl_executor.submit(
-                    self._translate_async, msg_id, original_text, source_lang,
-                    extra_langs or None,
+                self._submit_translation(
+                    msg_id, original_text, source_lang, extra_langs or None
                 )
             except RuntimeError:
                 log.warning("Translation executor shut down, skipping")
@@ -1627,14 +1820,16 @@ class LiveTranslateApp:
             if self._subwin and self._subwin.isVisible():
                 if extra_langs:
                     try:
-                        self._tl_executor.submit(self._translate_subwin_only, original_text, source_lang, extra_langs)
+                        self._extra_tl_executor.submit(self._translate_subwin_only, original_text, source_lang, extra_langs)
                     except RuntimeError:
                         pass
                 else:
                     self._subwin.update_text(original_text, {target_lang: original_text})
         else:
             try:
-                self._tl_executor.submit(self._translate_async, msg_id, original_text, source_lang, extra_langs or None)
+                self._submit_translation(
+                    msg_id, original_text, source_lang, extra_langs or None
+                )
             except RuntimeError:
                 log.warning("Translation executor shut down, skipping")
     def _process_interim_final(self, speech_segment):
@@ -1717,13 +1912,19 @@ class LiveTranslateApp:
             if self._paused:
                 continue
 
-            rms = float(np.sqrt(np.mean(chunk**2)))
+            # np.dot avoids allocating a temporary squared array for every
+            # 32 ms audio block on the real-time capture thread.
+            rms = float(np.sqrt(np.dot(chunk, chunk) / max(chunk.size, 1)))
 
             if self._overlay:
                 self._overlay.update_monitor(rms, self._vad.last_confidence, mic_rms)
 
             with self._vad_lock:
                 speech_segment = self._vad.process_chunk(chunk)
+                speaking = self._vad._is_speaking
+
+            if speaking or speech_segment is not None:
+                self._last_speech_activity = time.monotonic()
 
             if speech_segment is None:
                 # Still accumulating — check for interim ASR
@@ -1843,6 +2044,7 @@ def main():
         "qt.text.font.db=false;qt.qpa.fonts.warning=false"
     )
     app = QApplication(sys.argv)
+    apply_theme(app)
     dock_visible = bool((saved or {}).get("dock_visible", True))
     configure_application(app, dock_visible=dock_visible)
     # Pin the platform UI family when Qt has it available; this also avoids

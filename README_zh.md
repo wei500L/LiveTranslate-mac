@@ -33,6 +33,17 @@ Windows/macOS 实时音频翻译工具。Windows 使用 WASAPI loopback，macOS 
 - **模型自动管理**：首次启动向导，支持 ModelScope / HuggingFace 双源
 - **内置基准测试**：对比翻译模型速度和质量
 
+### GigaAM-v3（俄语 ASR）
+
+LiveTranslate 通过 Transformers 加载官方 [`ai-sage/GigaAM-v3`](https://huggingface.co/ai-sage/GigaAM-v3)
+仓库中的 `e2e_rnnt` revision。这是官方 GigaAM-v3 端到端 ASR 变体，会直接输出带标点和规范化的文本，定位为俄语语音识别。当前集成保持既有 ASR worker 协议，接收 16 kHz 音频；在 Apple Silicon 上如果 MPS 加载或算子失败，会回退到 CPU。
+
+当前应用对每个 VAD 分段调用短音频 `transcribe` 接口。根据官方项目说明，该接口适用于最长约 25 秒的音频；需要 pyannote 分段的长音频 `transcribe_longform` 尚未接入 LiveTranslate。模型由应用现有的模型管理器从 Hugging Face 下载，不需要单独 clone 官方项目。
+
+官方资料：[GigaAM-v3 模型](https://huggingface.co/ai-sage/GigaAM-v3) ·
+[GigaAM 项目主页](https://github.com/salute-developers/GigaAM) ·
+[官方推理说明](https://github.com/salute-developers/GigaAM#model-inference)
+
 ## 更新日志
 
 查看 [中文更新日志](i18n/CHANGELOG_zh.md) | [English Changelog](i18n/CHANGELOG_en.md)
@@ -132,7 +143,7 @@ main.py                 主入口，管线编排
 ├── asr_sensevoice.py   SenseVoice 后端
 ├── asr_funasr_nano.py  FunASR Nano 后端
 ├── asr_anime_whisper.py Anime-Whisper 后端 (日语动画/Galgame)
-├── asr_gigaam.py        GigaAM 后端（仅俄语，MPS/CPU）
+├── asr_gigaam.py        GigaAM-v3 e2e_rnnt 后端（俄语，MPS/CPU）
 ├── asr_remote.py        远程 Whisper 客户端 (→ asr_server.py, 见 REMOTE_ASR.md)
 ├── translator.py       OpenAI 兼容翻译客户端 (流式/JSON/上下文)
 ├── model_manager.py    模型下载与缓存管理

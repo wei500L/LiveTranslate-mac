@@ -32,6 +32,9 @@ source_label: "来源:"
 
 # 控制面板
 window_control_panel: "LiveTranslate - 控制面板"
+control_panel_subtitle: "实时翻译工作台"
+status_auto_saved: "自动保存"
+status_saved: "已保存"
 tab_vad_asr: "VAD / ASR"
 tab_translation: "翻译"
 tab_benchmark: "基准测试"
@@ -136,6 +139,8 @@ btn_apply_prompt: "应用提示词"
 group_timeout: "模型连接超时"
 group_network: "网络配置"
 label_timeout: "模型连接超时"
+label_translation_workers: "翻译并发数:"
+translation_workers_hint: "同时处理的翻译请求数，范围 4-16。"
 
 # 基准测试标签页
 label_source: "源语言:"

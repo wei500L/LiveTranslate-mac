@@ -48,7 +48,7 @@ translation:
   # Context window size (number of recent translations to include)
   context_window: 10
   # Max tokens for translation response
-  max_tokens: 256
+  max_tokens: 512
   # Temperature
   temperature: 0.3
   # Enable streaming output

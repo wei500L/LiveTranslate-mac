@@ -17,6 +17,7 @@ from torch_backend import normalize_device
 import platform_clickthrough
 import torch_backend
 import platform_permissions
+import asr_worker
 from platform_permissions import MicrophonePermissionDeniedError, PlatformUnavailableError
 
 

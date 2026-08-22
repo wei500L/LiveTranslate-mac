@@ -4,6 +4,7 @@ numpy>=1.24.0,<2.3
 numba>=0.59.0
 PyYAML>=6.0
 httpx>=0.28.0
+socksio>=1.0.0
 openai>=1.0.0
 psutil>=5.9.0
 
@@ -12,14 +13,15 @@ pyobjc-framework-ScreenCaptureKit>=9.2
 pyobjc-framework-CoreMedia>=9.2
 pyobjc-framework-CoreAudio>=9.2
 pyobjc-framework-AVFoundation>=9.2
-pyobjc-framework-AppKit>=9.2
+# AppKit is distributed through the PyObjC Cocoa umbrella package.
+pyobjc-framework-Cocoa>=9.2
 pyobjc-framework-Quartz>=9.2
 pyobjc-framework-libdispatch>=9.2
 
-# Install native arm64 torch/torchaudio wheels for the active Python version.
+# GigaAM-v3 upstream recommends this matched native arm64 pair.
 # Do not run this environment under Rosetta (platform.machine() must be arm64).
-torch>=2.2.0
-torchaudio>=2.2.0
+torch==2.8.0
+torchaudio==2.8.0
 
 faster-whisper>=1.0.0
 funasr>=1.3.28
@@ -34,8 +36,11 @@ hydra-core>=1.3.2
 six>=1.16.0
 sentencepiece>=0.2.0
 tiktoken>=0.7.0
-transformers>=4.40.0
+transformers==4.57.1
+pyannote-audio>=4.0,<5
+torchcodec>=0.7
 silero-vad>=5.0
 modelscope>=1.20.0
 huggingface_hub>=0.20.0
 PyQt6>=6.5.0
+pyqtdarktheme>=2.1.0

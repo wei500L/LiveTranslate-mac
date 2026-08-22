@@ -1,4 +1,5 @@
 import os
+import threading
 
 import psutil
 from i18n import t, LANGUAGES
@@ -212,6 +213,7 @@ class ChatMessage(QWidget):
         self._source_lang = source_lang
         self._asr_ms = asr_ms
         self._translate_ms = 0.0
+        self.setObjectName("chatMessage")
         self._layout = QVBoxLayout(self)
         self._layout.setContentsMargins(8, 4, 8, 4)
         self._layout.setSpacing(2)
@@ -240,12 +242,12 @@ class ChatMessage(QWidget):
     def _build_header_html(self, s):
         if self._compact_mode:
             return (
-                f'<span style="color:#6cf;">[{self._source_lang}]</span> '
+                f'<span style="color:#e7b96f;">[{self._source_lang}]</span> '
                 f'<span style="color:{s["original_color"]};">{_escape(self._original)}</span>'
             )
         return (
             f'<span style="color:{s["timestamp_color"]};">[{self._timestamp}]</span> '
-            f'<span style="color:#6cf;">[{self._source_lang}]</span> '
+            f'<span style="color:#e7b96f;">[{self._source_lang}]</span> '
             f'<span style="color:{s["original_color"]};">{_escape(self._original)}</span> '
             f'<span style="color:#8b8; font-size:9pt;">ASR {self._asr_ms:.0f}ms</span>'
         )
@@ -355,18 +357,24 @@ def _escape(text: str) -> str:
 
 _BTN_CSS = """
     QPushButton {
-        background: rgba(255,255,255,20);
-        border: 1px solid rgba(255,255,255,40);
-        border-radius: 3px;
-        color: #aaa;
+        background: rgba(42, 39, 34, 230);
+        border: 1px solid rgba(174, 143, 91, 100);
+        border-radius: 6px;
+        color: #e8dfd2;
         font-size: 11px;
-        padding: 0 6px;
+        padding: 2px 10px;
     }
     QPushButton:hover {
-        background: rgba(255,255,255,40);
-        color: #ddd;
+        background: rgba(83, 64, 39, 240);
+        border-color: #e7b96f;
+        color: #fff;
     }
+    QPushButton:pressed { background: rgba(32, 28, 24, 240); }
 """
+
+_DANGER_BTN_CSS = _BTN_CSS.replace(
+    "rgba(42, 39, 34, 230)", "rgba(83, 43, 42, 225)"
+).replace("rgba(174, 143, 91, 100)", "rgba(205, 112, 104, 135)")
 
 _BAR_CSS_TPL = """
     QProgressBar {{
@@ -402,7 +410,7 @@ class MonitorBar(QWidget):
         self._mic_lbl = QLabel("MIC")
         self._mic_lbl.setFixedWidth(26)
         self._mic_lbl.setFont(QFont(default_mono_font_family(), 8))
-        self._mic_lbl.setStyleSheet("color: #888; background: transparent;")
+        self._mic_lbl.setStyleSheet("color: #a59c8e; background: transparent;")
         self._mic_lbl.setVisible(False)
         row1.addWidget(self._mic_lbl)
 
@@ -418,7 +426,7 @@ class MonitorBar(QWidget):
         rms_lbl = QLabel("RMS:")
         rms_lbl.setFixedWidth(26)
         rms_lbl.setFont(QFont(default_mono_font_family(), 8))
-        rms_lbl.setStyleSheet("color: #888; background: transparent;")
+        rms_lbl.setStyleSheet("color: #a59c8e; background: transparent;")
         row1.addWidget(rms_lbl)
 
         self._rms_bar = QProgressBar()
@@ -426,13 +434,13 @@ class MonitorBar(QWidget):
         self._rms_bar.setFixedHeight(14)
         self._rms_bar.setTextVisible(True)
         self._rms_bar.setFormat("%v%")
-        self._rms_bar.setStyleSheet(_BAR_CSS_TPL.format(color="#4ec9b0"))
+        self._rms_bar.setStyleSheet(_BAR_CSS_TPL.format(color="#9caf91"))
         row1.addWidget(self._rms_bar)
 
         vad_lbl = QLabel("VAD:")
         vad_lbl.setFixedWidth(26)
         vad_lbl.setFont(QFont(default_mono_font_family(), 8))
-        vad_lbl.setStyleSheet("color: #888; background: transparent;")
+        vad_lbl.setStyleSheet("color: #a59c8e; background: transparent;")
         row1.addWidget(vad_lbl)
 
         self._vad_bar = QProgressBar()
@@ -447,7 +455,7 @@ class MonitorBar(QWidget):
 
         self._stats_label = QLabel()
         self._stats_label.setFont(QFont(default_mono_font_family(), 8))
-        self._stats_label.setStyleSheet("color: #888; background: transparent;")
+        self._stats_label.setStyleSheet("color: #aaa197; background: transparent;")
         self._stats_label.setTextFormat(Qt.TextFormat.RichText)
         self._stats_label.setWordWrap(True)
         layout.addWidget(self._stats_label)
@@ -513,7 +521,7 @@ class MonitorBar(QWidget):
         tokens_str = f"{total / 1000:.1f}k" if total >= 1000 else str(total)
         dev_str = ""
         if self._asr_device:
-            dev_color = "#4ec9b0" if "cuda" in self._asr_device.lower() else "#dcdcaa"
+            dev_color = "#9caf91" if "cuda" in self._asr_device.lower() else "#e7b96f"
             dev_str = (
                 f'<span style="color:{dev_color};">{self._asr_device}</span> '
                 f'<span style="color:#555;">|</span> '
@@ -525,13 +533,13 @@ class MonitorBar(QWidget):
             cost_str = f' <span style="color:#fa5;">{symbol}{self._cost:.4f}</span>'
         self._stats_label.setText(
             f"{dev_str}"
-            f'<span style="color:#6cf;">CPU</span> {self._cpu}% '
-            f'<span style="color:#6cf;">RAM</span> {self._ram_mb:.0f}MB '
-            f'<span style="color:#6cf;">GPU</span> {self._gpu_text} '
+            f'<span style="color:#e7b96f;">CPU</span> {self._cpu}% '
+            f'<span style="color:#e7b96f;">RAM</span> {self._ram_mb:.0f}MB '
+            f'<span style="color:#e7b96f;">GPU</span> {self._gpu_text} '
             f'<span style="color:#555;">|</span> '
-            f'<span style="color:#8b8;">ASR</span> {self._asr_count} '
-            f'<span style="color:#db8;">TL</span> {self._tl_count} '
-            f'<span style="color:#c9c;">Tok</span> {tokens_str} '
+            f'<span style="color:#9caf91;">ASR</span> {self._asr_count} '
+            f'<span style="color:#e7b96f;">TL</span> {self._tl_count} '
+            f'<span style="color:#c8a982;">Tok</span> {tokens_str} '
             f'<span style="color:#666;">({self._prompt_tokens}\u2191{self._completion_tokens}\u2193)</span>'
             f'{cost_str}'
         )
@@ -566,24 +574,26 @@ class _DragArea(QWidget):
 
 _COMBO_CSS = """
     QComboBox {
-        background: rgba(255,255,255,20);
-        border: 1px solid rgba(255,255,255,40);
-        border-radius: 3px;
-        color: #aaa;
+        background: rgba(40, 38, 34, 225);
+        border: 1px solid rgba(174, 143, 91, 90);
+        border-radius: 5px;
+        color: #d8d0c2;
         font-size: 11px;
-        padding: 0 4px;
+        padding: 1px 6px;
     }
-    QComboBox:hover { background: rgba(255,255,255,40); color: #ddd; }
+    QComboBox:hover { background: rgba(76, 60, 40, 230); color: #fff; }
     QComboBox::drop-down { border: none; width: 14px; }
     QComboBox::down-arrow { image: none; border: none; }
     QComboBox QAbstractItemView {
-        background: #2a2a3a; color: #ccc; selection-background-color: #444;
+        background: #242321; color: #ddd4c5; selection-background-color: #5a452d;
     }
 """
 
 _CHECK_CSS = (
-    "QCheckBox { color: #888; background: transparent; spacing: 3px; }"
-    "QCheckBox::indicator { width: 12px; height: 12px; }"
+    "QCheckBox { color: #a59c8e; background: transparent; spacing: 5px; }"
+    "QCheckBox:hover { color: #eee6d8; }"
+    "QCheckBox::indicator { width: 13px; height: 13px; border: 1px solid #756a59; border-radius: 3px; background: rgba(20,20,20,120); }"
+    "QCheckBox::indicator:checked { background: #c98b42; border-color: #e7b96f; }"
 )
 
 
@@ -610,8 +620,8 @@ class DragHandle(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._mode = "full"
-        self.setFixedHeight(62)
-        self.setStyleSheet("background: rgba(60, 60, 80, 200); border-radius: 4px;")
+        self.setFixedHeight(64)
+        self.setStyleSheet("background: rgba(28, 27, 25, 238); border: 1px solid rgba(231, 185, 111, 105); border-radius: 9px;")
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(8, 2, 8, 2)
@@ -631,14 +641,14 @@ class DragHandle(QWidget):
 
         title = QLabel("\u2630 LiveTranslate")
         title.setFont(QFont(default_mono_font_family(), 9, QFont.Weight.Bold))
-        title.setStyleSheet("color: #aaa; background: transparent;")
+        title.setStyleSheet("color: #e2d6c3; background: transparent;")
         drag_layout.addWidget(title)
         drag_layout.addStretch()
         row1.addWidget(drag, 1)
 
         def _btn(text, tip=None):
             b = QPushButton(text)
-            b.setFixedHeight(20)
+            b.setFixedHeight(22)
             b.setCursor(QCursor(Qt.CursorShape.PointingHandCursor))
             b.setFont(QFont(default_mono_font_family(), 8))
             b.setStyleSheet(_BTN_CSS)
@@ -673,11 +683,7 @@ class DragHandle(QWidget):
         row1.addWidget(settings_btn)
 
         quit_btn = _btn(t("quit"))
-        quit_btn.setStyleSheet(
-            _BTN_CSS.replace("rgba(255,255,255,20)", "rgba(200,60,60,40)").replace(
-                "rgba(255,255,255,40)", "rgba(200,60,60,80)"
-            )
-        )
+        quit_btn.setStyleSheet(_DANGER_BTN_CSS)
         quit_btn.clicked.connect(self.quit_clicked.emit)
         row1.addWidget(quit_btn)
 
@@ -734,7 +740,7 @@ class DragHandle(QWidget):
         row2b.setContentsMargins(0, 0, 0, 0)
         row2b.setSpacing(4)
 
-        _lbl_css = "color: #888; background: transparent;"
+        _lbl_css = "color: #a59c8e; background: transparent;"
         _lbl_font = QFont(default_mono_font_family(), 8)
         _combo_font = QFont(default_mono_font_family(), 8)
 
@@ -914,6 +920,17 @@ class SubtitleOverlay(QWidget):
         self._pos_save_timer.setInterval(500)
         self._pos_save_timer.timeout.connect(lambda: self.position_changed.emit())
         self._last_saved_geo = None
+        self._update_lock = threading.Lock()
+        self._latest_monitor = None
+        self._monitor_timer = QTimer(self)
+        self._monitor_timer.setInterval(80)
+        self._monitor_timer.timeout.connect(self._flush_monitor)
+        self._monitor_timer.start()
+        self._streaming_updates = {}
+        self._streaming_timer = QTimer(self)
+        self._streaming_timer.setInterval(50)
+        self._streaming_timer.timeout.connect(self._flush_streaming)
+        self._streaming_timer.start()
         self._setup_ui()
 
         self.add_message_signal.connect(self._on_add_message)
@@ -949,7 +966,7 @@ class SubtitleOverlay(QWidget):
 
         self._container = QWidget()
         self._container.setStyleSheet(
-            "background-color: rgba(15, 15, 25, 200); border-radius: 8px;"
+            "background-color: rgba(14, 15, 16, 235); border: 1px solid rgba(231, 185, 111, 110); border-radius: 12px;"
         )
 
         container_layout = QVBoxLayout(self._container)
@@ -1128,7 +1145,22 @@ class SubtitleOverlay(QWidget):
 
     @pyqtSlot(float, float, object)
     def _on_update_monitor(self, rms: float, vad_conf: float, mic_rms):
-        self._monitor.update_audio(rms, vad_conf, mic_rms)
+        with self._update_lock:
+            self._latest_monitor = (rms, vad_conf, mic_rms)
+
+    def _flush_monitor(self):
+        with self._update_lock:
+            latest = self._latest_monitor
+            self._latest_monitor = None
+        if latest is not None:
+            self._monitor.update_audio(*latest)
+
+    def _flush_streaming(self):
+        with self._update_lock:
+            updates = self._streaming_updates
+            self._streaming_updates = {}
+        for msg_id, partial_text in updates.items():
+            self._on_update_streaming(msg_id, partial_text)
 
     @pyqtSlot(int, int, int, int, float)
     def _on_update_stats(self, asr_count, tl_count, prompt_tokens, completion_tokens, cost):
@@ -1156,6 +1188,8 @@ class SubtitleOverlay(QWidget):
 
     @pyqtSlot(int, str, float)
     def _on_update_translation(self, msg_id, translated, translate_ms):
+        with self._update_lock:
+            self._streaming_updates.pop(msg_id, None)
         msg = self._messages.get(msg_id)
         if msg:
             msg.set_translation(translated, translate_ms)
@@ -1253,13 +1287,17 @@ class SubtitleOverlay(QWidget):
         self.add_message_signal.emit(msg_id, timestamp, original, source_lang, asr_ms)
 
     def update_translation(self, msg_id, translated, translate_ms):
+        with self._update_lock:
+            self._streaming_updates.pop(msg_id, None)
         self.update_translation_signal.emit(msg_id, translated, translate_ms)
 
     def update_streaming(self, msg_id, partial_text):
-        self.update_streaming_signal.emit(msg_id, partial_text)
+        with self._update_lock:
+            self._streaming_updates[msg_id] = partial_text
 
     def update_monitor(self, rms, vad_conf, mic_rms=None):
-        self.update_monitor_signal.emit(rms, vad_conf, mic_rms)
+        with self._update_lock:
+            self._latest_monitor = (rms, vad_conf, mic_rms)
 
     def update_stats(self, asr_count, tl_count, prompt_tokens, completion_tokens, cost=0.0):
         self.update_stats_signal.emit(

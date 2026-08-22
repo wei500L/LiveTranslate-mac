@@ -37,7 +37,8 @@ class LogWindow(QWidget):
         self.resize(900, 500)
 
         layout = QVBoxLayout(self)
-        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setContentsMargins(16, 16, 16, 16)
+        layout.setSpacing(12)
 
         # Log display
         self._text = QTextEdit()
@@ -45,7 +46,7 @@ class LogWindow(QWidget):
         self._text.setUndoRedoEnabled(False)
         self._text.document().setMaximumBlockCount(2000)
         self._text.setFont(QFont(default_mono_font_family(), 9))
-        self._text.setStyleSheet("background-color: #1e1e1e; color: #d4d4d4;")
+        self._text.setStyleSheet("background-color: #111820; color: #edf4f7; border: 1px solid #30404e; border-radius: 9px; padding: 8px;")
         layout.addWidget(self._text)
 
         # Controls
@@ -61,6 +62,7 @@ class LogWindow(QWidget):
         ctrl.addStretch()
 
         clear_btn = QPushButton(t("clear"))
+        clear_btn.setObjectName("dangerButton")
         clear_btn.clicked.connect(self._text.clear)
         ctrl.addWidget(clear_btn)
 
@@ -93,7 +95,7 @@ class LogWindow(QWidget):
 
         # Highlight ASR and Translate lines
         if "ASR [" in msg:
-            color = "#4ec9b0"
+            color = "#9caf91"
         elif "Translate:" in msg:
             color = "#9cdcfe"
         elif "Speech segment" in msg:

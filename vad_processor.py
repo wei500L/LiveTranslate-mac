@@ -123,7 +123,7 @@ class VADProcessor:
 
     def _silero_confidence(self, audio_chunk: np.ndarray) -> float:
         window_size = 512 if self.sample_rate == 16000 else 256
-        chunk = audio_chunk[:window_size]
+        chunk = np.asarray(audio_chunk[:window_size], dtype=np.float32)
         if len(chunk) < window_size:
             chunk = np.pad(chunk, (0, window_size - len(chunk)))
         with torch.inference_mode():
@@ -131,7 +131,8 @@ class VADProcessor:
             return float(self._model(tensor, self.sample_rate).item())
 
     def _energy_confidence(self, audio_chunk: np.ndarray) -> float:
-        rms = float(np.sqrt(np.mean(audio_chunk**2)))
+        samples = np.asarray(audio_chunk, dtype=np.float32).reshape(-1)
+        rms = float(np.sqrt(np.dot(samples, samples) / max(samples.size, 1)))
         return min(1.0, rms / (self.energy_threshold * 2))
 
     def _get_confidence(self, audio_chunk: np.ndarray) -> float:

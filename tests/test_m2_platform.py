@@ -128,7 +128,7 @@ def test_gigaam_cache_is_hf_snapshot_only(monkeypatch, tmp_path):
         tmp_path
         / "huggingface"
         / "hub"
-        / "models--salute-ai--GigaAM-v3-RNNT"
+        / "models--ai-sage--GigaAM-v3"
         / "snapshots"
         / "abc"
     )
@@ -136,4 +136,4 @@ def test_gigaam_cache_is_hf_snapshot_only(monkeypatch, tmp_path):
     (snap / "config.json").write_text("{}")
     (snap / "model.safetensors").write_bytes(b"weights")
     assert model_manager.is_asr_cached("gigaam", "", "hf")
-    assert model_manager.get_missing_models("gigaam", "", "hf")
+    assert model_manager.get_missing_models("gigaam", "", "hf") == []

@@ -32,6 +32,9 @@ source_label: "Source:"
 
 # Control Panel
 window_control_panel: "LiveTranslate - Control Panel"
+control_panel_subtitle: "Live translation workspace"
+status_auto_saved: "Auto-save"
+status_saved: "Saved"
 tab_vad_asr: "VAD / ASR"
 tab_translation: "Translation"
 tab_benchmark: "Benchmark"
@@ -136,6 +139,8 @@ btn_apply_prompt: "Apply Prompt"
 group_timeout: "Model Connect Timeout"
 group_network: "Network"
 label_timeout: "Model Connect Timeout"
+label_translation_workers: "Translation workers:"
+translation_workers_hint: "Concurrent translation requests, from 4 to 16."
 
 # Benchmark tab
 label_source: "Source:"

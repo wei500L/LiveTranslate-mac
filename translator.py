@@ -286,6 +286,15 @@ class Translator:
         t._last_completion_tokens = 0
         return t
 
+    def fork_for_request(self, target_language=None, history_snapshot=None) -> "Translator":
+        """Create isolated mutable state for a concurrent translation request."""
+        t = self.with_target_language(target_language or self._target_language)
+        t._context_turns = self._context_turns
+        t._history = list(
+            history_snapshot if history_snapshot is not None else self._history
+        )
+        return t
+
     def _build_system_prompt(self, source_lang):
         src = LANGUAGE_DISPLAY.get(source_lang, source_lang)
         tgt = LANGUAGE_DISPLAY.get(self._target_language, self._target_language)
