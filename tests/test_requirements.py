@@ -1,3 +1,4 @@
+import re
 from pathlib import Path
 
 import pytest
@@ -126,3 +127,46 @@ def test_release_workflow_has_arm64_test_and_distinct_macos_artifact():
     assert "runs-on: macos-14" in workflow
     assert "livetranslate-macos-arm64" in workflow
     assert "pytest -q" in workflow
+
+
+def test_every_release_producing_job_gates_on_the_test_job():
+    """A job that publishes an artifact must not run when the tests are red.
+
+    The Windows `build` job used to omit `needs:` while the macOS package job
+    declared it, so a tagged push published a Windows zip from a failing tree.
+    """
+    workflow = Path(".github/workflows/release.yml").read_text(encoding="utf-8")
+
+    jobs = re.split(r"^  (?=\S)", workflow.split("jobs:", 1)[1], flags=re.M)
+    producing = {}
+    for block in jobs:
+        name = block.split(":", 1)[0].strip()
+        if not name or name == "test-macos-arm64":
+            continue
+        if "upload-artifact" in block or "action-gh-release" in block:
+            producing[name] = "needs: test-macos-arm64" in block
+
+    assert producing, "no release-producing job found; update this test"
+    ungated = sorted(name for name, gated in producing.items() if not gated)
+    assert not ungated, f"release-producing jobs without `needs`: {ungated}"
+
+
+def test_translation_layer_imports_without_the_network_stack():
+    """translator must stay importable without openai/httpx so the offline
+    test job can collect its pure-logic tests."""
+    source = Path("translator.py").read_text(encoding="utf-8")
+    header = source.split("def make_openai_client", 1)[0]
+
+    assert "\nimport httpx" not in header
+    assert "\nfrom openai import" not in header
+
+
+def test_i18n_locales_define_the_same_keys():
+    import yaml
+
+    zh = yaml.safe_load(Path("i18n/zh.yaml").read_text(encoding="utf-8"))
+    en = yaml.safe_load(Path("i18n/en.yaml").read_text(encoding="utf-8"))
+
+    assert set(zh) == set(en), (
+        f"only zh: {sorted(set(zh) - set(en))}; only en: {sorted(set(en) - set(zh))}"
+    )

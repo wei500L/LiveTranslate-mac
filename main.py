@@ -65,6 +65,7 @@ from connection_config import (
 )
 from vad_processor import VADProcessor
 from asr_client import ASRClient, ASRWorkerError, ASRWorkerExited, ASRWorkerTimeout
+from asr_remote import RemoteASRError
 from translator import Translator, RepetitionError
 from mlx_service import MLXServiceManager, is_hy_mt_model
 from transcript_writer import TranscriptWriter
@@ -167,6 +168,49 @@ def setup_logging():
 
 
 log = logging.getLogger("LiveTranslate")
+
+
+class ASRProtocolError(RuntimeError):
+    """An ASR backend returned something outside the agreed result contract."""
+
+
+class TranslationUnavailable(RuntimeError):
+    """No translation service is configured or running.
+
+    Distinct from the RuntimeError a shut-down executor raises: that one means
+    "we are exiting", this one means "the user needs to know translation is off".
+    """
+
+
+def validate_asr_result(result, kind: str):
+    """Normalize one ASR backend result into the shared contract.
+
+    Both the local worker and RemoteASREngine must satisfy this; neither may
+    return a half-valid structure of its own shape.
+
+    Returns ``None`` for a legitimately empty result (silence), or a
+    ``(text, language)`` tuple. Raises ASRProtocolError when the backend broke
+    the contract, so a bad result is visible instead of crashing the consumer
+    on a missing key.
+    """
+    if result is None:
+        return None
+    if not isinstance(result, dict):
+        raise ASRProtocolError(
+            f"{kind}: expected dict result, got {type(result).__name__}"
+        )
+    text = result.get("text")
+    if not isinstance(text, str):
+        raise ASRProtocolError(
+            f"{kind}: 'text' must be a string, got {type(text).__name__}"
+        )
+    language = result.get("language")
+    if not isinstance(language, str) or not language:
+        raise ASRProtocolError(f"{kind}: 'language' must be a non-empty string")
+    text = text.strip()
+    if not text:
+        return None
+    return text, language
 
 
 def create_app_icon() -> QIcon:
@@ -381,7 +425,8 @@ class LiveTranslateApp:
             self._overlay.set_models(models, active_idx)
 
     def _on_settings_changed(self, settings):
-        self._vad.update_settings(settings)
+        with self._vad_lock:
+            self._vad.update_settings(settings)
         if "style" in settings and self._overlay:
             self._overlay.apply_style(settings["style"])
         if "asr_language" in settings:
@@ -408,14 +453,29 @@ class LiveTranslateApp:
                     self._asr_type or self._config["asr"].get("asr_engine", "funasr"),
                 )
             )
+        # `settings` is the full settings dict on every auto-save, so a key being
+        # present says nothing about the user having changed it. Compare values.
         if "audio_device" in settings:
             old_device = self._audio._device_name
-            self._audio.set_device(settings["audio_device"])
-            if old_device != settings.get("audio_device"):
-                self._vad.flush()
-                self._vad._reset()
-                if self._overlay:
-                    self._overlay.update_monitor(0.0, 0.0)
+            new_device = settings["audio_device"]
+            if old_device != new_device:
+                switched = self._audio.set_device(new_device)
+                if switched is False:
+                    log.warning(
+                        "Audio device switch to %r failed; keeping the previous device",
+                        new_device,
+                    )
+                    # set_device restores the old stream when it can. If that
+                    # recovery also failed the backend is stopped, so stop the
+                    # pipeline instead of reporting a running state with no audio.
+                    if self._running and not getattr(self._audio, "_running", True):
+                        self.stop()
+                else:
+                    # Discard whatever was buffered for the previous device.
+                    with self._vad_lock:
+                        self._vad._reset()
+                    if self._overlay:
+                        self._overlay.update_monitor(0.0, 0.0)
         if "mic_device" in settings:
             mic_changed = self._audio.set_mic_device(settings["mic_device"])
             if mic_changed is False:
@@ -684,7 +744,7 @@ class LiveTranslateApp:
         with self._translation_lock:
             base = self._translator
             if base is None:
-                raise RuntimeError("No translation service is running")
+                raise TranslationUnavailable("No translation service is running")
             generation = self._translator_generation
             request = base.fork_for_request(
                 target_language=target_language or self._target_language,
@@ -726,6 +786,20 @@ class LiveTranslateApp:
                         self._translation_history = self._translation_history[-self._translator._context_turns:]
                 self._translation_pending = max(0, self._translation_pending - 1)
             return True
+
+    def _finalize_untranslated(self, msg_id, reason: str, user_visible: bool):
+        """Close out a message that will never receive a translation.
+
+        Every path that called overlay.add_message()/transcript.write_original()
+        must reach here or the overlay entry stays stuck on "translating" and the
+        TranscriptWriter._pending entry leaks for the rest of the session.
+        """
+        log.warning("Message %s left untranslated: %s", msg_id, reason)
+        self._transcript.finalize_no_translation(msg_id)
+        if self._overlay and user_visible:
+            self._overlay.update_translation(
+                msg_id, f"[{t('error_translation_unavailable')}]", 0
+            )
 
     def _submit_translation(self, msg_id, text, source_lang, extra_langs=None):
         request_translator, generation = self._snapshot_translation_request(
@@ -808,8 +882,10 @@ class LiveTranslateApp:
         self._last_interim_samples = 0
         self._last_interim_check_time = 0.0
         self._interim_committed_tail = ""
-        self._vad.flush()
-        self._vad._reset()
+        # Engine boundary: drop the in-flight buffer rather than emitting it
+        # through a worker that is about to be torn down.
+        with self._vad_lock:
+            self._vad._reset()
 
         cached = is_asr_cached(engine_type, cache_model_key, hub)
         display_name = ASR_DISPLAY_NAMES.get(engine_type, engine_type)
@@ -1102,7 +1178,11 @@ class LiveTranslateApp:
         try:
             self._apply_pending_asr_settings(client, asr_type, funasr_key)
             result = client.transcribe(audio, **kwargs)
-        except (ASRWorkerExited, ASRWorkerTimeout) as exc:
+        except (ASRWorkerExited, ASRWorkerTimeout, RemoteASRError) as exc:
+            # RemoteASRError joins the worker-death path on purpose: from the
+            # pipeline's point of view an unreachable ASR server and a dead
+            # local worker need the same bounded recovery and the same visible
+            # "ASR unavailable" state.
             asr_ms = (time.perf_counter() - asr_start) * 1000
             self._log_mem_after_asr(f"{kind}:error", audio_seconds, asr_ms)
             self._recover_asr_worker(client, str(exc))
@@ -1608,15 +1688,14 @@ class LiveTranslateApp:
             return
         if asr_ms > 10000:
             log.warning(f"ASR took {asr_ms:.0f}ms, possible hang")
-        if result is None:
+        validated = validate_asr_result(result, "segment")
+        if validated is None:
             return
+        original_text, source_lang = validated
 
-        original_text = result["text"].strip()
-        # Skip empty or punctuation-only ASR results
-        if not original_text or not any(c.isalnum() for c in original_text):
-            log.debug(
-                f"ASR returned empty/punctuation-only, skipping: '{result['text']}'"
-            )
+        # Skip punctuation-only ASR results
+        if not any(c.isalnum() for c in original_text):
+            log.debug(f"ASR returned punctuation-only, skipping: '{original_text}'")
             return
 
         # Skip suspiciously short text from long segments (likely noise)
@@ -1627,7 +1706,6 @@ class LiveTranslateApp:
             )
             return
 
-        source_lang = result["language"]
         asr_lang_setting = self._get_asr_language_setting()
         if asr_lang_setting != "auto" and source_lang != asr_lang_setting:
             log.info(
@@ -1689,8 +1767,14 @@ class LiveTranslateApp:
                 self._submit_translation(
                     msg_id, original_text, source_lang, extra_langs or None
                 )
+            except TranslationUnavailable as exc:
+                self._finalize_untranslated(msg_id, str(exc), user_visible=True)
             except RuntimeError:
-                log.warning("Translation executor shut down, skipping")
+                # Executor already shut down (we are exiting) — not worth a
+                # user-facing error, but still has to be closed out.
+                self._finalize_untranslated(
+                    msg_id, "translation executor shut down", user_visible=False
+                )
 
     # ── Incremental ASR ──
 
@@ -1698,7 +1782,20 @@ class LiveTranslateApp:
 
     @staticmethod
     def _get_segmenter(lang: str):
-        from yasbd import get_supported_langs, pysbd_adapter
+        # This import sits on the interim-ASR path, which has no try/except of
+        # its own — an ImportError here used to kill the ASR thread outright.
+        # yasbd-lib is declared in requirements*.txt and installed by every
+        # entrypoint, so a failure means a broken environment: degrade to
+        # no-splitting instead of taking the pipeline down.
+        try:
+            from yasbd import get_supported_langs, pysbd_adapter
+        except ImportError:
+            log.error(
+                "yasbd-lib is unavailable; incremental ASR sentence splitting is "
+                "disabled. Reinstall dependencies to restore it.", exc_info=True,
+            )
+            LiveTranslateApp._segmenter_cache[lang] = None
+            return None
         if lang not in LiveTranslateApp._segmenter_cache:
             seg_lang = lang if lang in get_supported_langs() else "en"
             LiveTranslateApp._segmenter_cache[lang] = pysbd_adapter.Segmenter(
@@ -1709,6 +1806,8 @@ class LiveTranslateApp:
     def _split_sentences(self, text: str, lang: str = "en") -> list[str]:
         """Split text into sentences using yasbd, with comma fallback for long text."""
         seg = self._get_segmenter(lang)
+        if seg is None:
+            return [text]
         parts = [p for p in seg.segment(text) if p.strip()]
         if len(parts) > 1:
             return parts
@@ -1777,11 +1876,11 @@ class LiveTranslateApp:
         if asr_ms == 0:
             return False
 
-        if result is None:
+        validated = validate_asr_result(result, "interim")
+        if validated is None:
             return False
-
-        full_text = result["text"].strip()
-        if not full_text or not any(c.isalnum() for c in full_text):
+        full_text, result_lang = validated
+        if not any(c.isalnum() for c in full_text):
             return False
 
         # Strip echo from previous commit's overlap
@@ -1790,11 +1889,11 @@ class LiveTranslateApp:
             return False
 
         split_start = time.perf_counter()
-        sentences = self._split_sentences(full_text, result["language"])
+        sentences = self._split_sentences(full_text, result_lang)
         split_ms = (time.perf_counter() - split_start) * 1000
         if len(sentences) <= 1:
             return False
-        log.debug(f"Interim split [{result['language']}] ({split_ms:.1f}ms): {len(sentences)} parts -> {sentences}")
+        log.debug(f"Interim split [{result_lang}] ({split_ms:.1f}ms): {len(sentences)} parts -> {sentences}")
 
         # All but last are complete; last is still being spoken
         complete = sentences[:-1]
@@ -1850,7 +1949,7 @@ class LiveTranslateApp:
                 text = self._interim_pending + text
                 self._interim_pending = ""
 
-            self._process_segment_text(text, result["language"], asr_ms)
+            self._process_segment_text(text, result_lang, asr_ms)
             actually_committed = True
 
         if not actually_committed:
@@ -1916,8 +2015,14 @@ class LiveTranslateApp:
                 self._submit_translation(
                     msg_id, original_text, source_lang, extra_langs or None
                 )
+            except TranslationUnavailable as exc:
+                self._finalize_untranslated(msg_id, str(exc), user_visible=True)
             except RuntimeError:
-                log.warning("Translation executor shut down, skipping")
+                # Executor already shut down (we are exiting) — not worth a
+                # user-facing error, but still has to be closed out.
+                self._finalize_untranslated(
+                    msg_id, "translation executor shut down", user_visible=False
+                )
     def _process_interim_final(self, speech_segment):
         """Handle VAD flush after interim outputs were already made."""
         seg_len = len(speech_segment) / 16000
@@ -1942,7 +2047,11 @@ class LiveTranslateApp:
                 self._process_segment_text(text, lang)
             return
 
-        original_text = result["text"].strip()
+        validated = validate_asr_result(result, "interim_final")
+        if validated is None:
+            original_text, result_lang = "", ""
+        else:
+            original_text, result_lang = validated
 
         # Strip echo from previous commit's overlap
         original_text = self._strip_committed_overlap(original_text)
@@ -1961,7 +2070,11 @@ class LiveTranslateApp:
             log.debug(f"Noise filter: {seg_len:.1f}s segment produced only '{original_text}', skipping")
             return
 
-        self._process_segment_text(original_text, result["language"], asr_ms)
+        if not result_lang:
+            result_lang = self._get_asr_language_setting()
+            if result_lang == "auto":
+                result_lang = "unknown"
+        self._process_segment_text(original_text, result_lang, asr_ms)
 
     def _capture_loop(self):
         silence_chunk = np.zeros(
@@ -2014,6 +2127,10 @@ class LiveTranslateApp:
 
             if speech_segment is None:
                 # Still accumulating — check for interim ASR
+                # Unlocked reads by design: these only throttle *whether* to
+                # consider an interim pass. _do_interim_asr re-reads the buffer
+                # under _vad_lock, so a torn read here costs at most one extra
+                # or skipped poll (see VADProcessor's class docstring).
                 if (self._incremental_enabled and self._asr_ready
                         and self._vad._is_speaking):
                     buf_samples = self._vad._speech_samples
@@ -2065,21 +2182,35 @@ class LiveTranslateApp:
 
             seg_type, segment = item
 
-            if seg_type == "vad_flush":
-                if self._interim_active:
-                    self._process_interim_final(segment)
-                else:
-                    self._process_segment(segment)
-                self._interim_active = False
-                self._interim_pending = ""
-                self._last_interim_samples = 0
-                self._last_interim_check_time = 0.0
-                self._interim_committed_tail = ""
-            elif seg_type == "interim":
-                self._drain_interim_duplicates()
-                self._do_interim_asr()
-                with self._vad_lock:
-                    self._last_interim_samples = self._vad._speech_samples
+            # One bad result must not take the ASR thread down with it: without
+            # this the pipeline goes permanently silent while capture keeps
+            # filling a queue nobody drains, and no worker-restart path fires.
+            try:
+                if seg_type == "vad_flush":
+                    try:
+                        if self._interim_active:
+                            self._process_interim_final(segment)
+                        else:
+                            self._process_segment(segment)
+                    finally:
+                        self._interim_active = False
+                        self._interim_pending = ""
+                        self._last_interim_samples = 0
+                        self._last_interim_check_time = 0.0
+                        self._interim_committed_tail = ""
+                elif seg_type == "interim":
+                    self._drain_interim_duplicates()
+                    self._do_interim_asr()
+                    with self._vad_lock:
+                        self._last_interim_samples = self._vad._speech_samples
+            except ASRProtocolError as exc:
+                log.error("ASR contract violation (%s): %s", seg_type, exc)
+            except Exception:
+                seg_len = len(segment) / 16000 if segment is not None else 0.0
+                log.error(
+                    "Unhandled error processing %s segment (%.1fs); dropping it "
+                    "and continuing", seg_type, seg_len, exc_info=True,
+                )
 
     def _drain_interim_duplicates(self):
         while True:

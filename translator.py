@@ -1,9 +1,9 @@
+from __future__ import annotations
+
 import json
 import logging
 import time
 
-import httpx
-from openai import OpenAI
 from connection_config import normalize_api_base
 
 log = logging.getLogger("LiveTranslate.TL")
@@ -106,7 +106,13 @@ PROMPT_PRESETS = {
 
 def make_openai_client(
     api_base: str, api_key: str, proxy: str = "none", timeout=None
-) -> OpenAI:
+) -> "OpenAI":
+    # Imported lazily so the pure-logic parts of this module (thinking style
+    # resolution, prompt/request assembly) stay importable without the httpx
+    # and openai wheels — that is what lets the offline test job collect them.
+    import httpx
+    from openai import OpenAI
+
     kwargs = {"base_url": normalize_api_base(api_base), "api_key": api_key}
     if timeout is not None:
         kwargs["timeout"] = httpx.Timeout(timeout, connect=5.0)

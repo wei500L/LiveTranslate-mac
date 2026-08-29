@@ -124,6 +124,11 @@ def test_worker_selects_gigaam_without_ct2(monkeypatch):
 
 def test_gigaam_cache_is_hf_snapshot_only(monkeypatch, tmp_path):
     monkeypatch.setattr(model_manager, "MODELS_DIR", tmp_path)
+    # This test is about GigaAM cache detection; whether the silero-vad wheel
+    # happens to be installed in the running environment is unrelated noise.
+    # Without this the assertion below passes locally and fails in CI, where
+    # silero-vad is not installed and get_missing_models() reports Silero VAD.
+    monkeypatch.setattr(model_manager, "_has_silero_pkg", lambda: True)
     snap = (
         tmp_path
         / "huggingface"

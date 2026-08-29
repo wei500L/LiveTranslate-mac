@@ -525,16 +525,43 @@ class SCKAudioCapture(AudioCaptureBase):
         return super().get_audio(timeout)
 
     def set_device(self, device_name):
-        self._device_name = device_name
+        # Idempotent: the control panel emits the *whole* settings dict on every
+        # auto-save, so this is called after any unrelated slider or checkbox
+        # change.  Without this short-circuit each of those tore down and
+        # rebuilt the SCK stream (a multi-second stall plus an audio gap) for a
+        # device that never changed.  set_mic_device below has always done this.
+        if self._device_name == device_name:
+            return True
+
         # SCK captures the selected main display.  Device names are not WASAPI
         # identifiers; changing one requires a stream restart/content rebuild.
-        if self._running:
-            self.stop()
-            try:
-                self.start()
-            except Exception:
-                return False
-        return True
+        previous = self._device_name
+        if not self._running:
+            self._device_name = device_name
+            return True
+
+        # Only advance _device_name once the old stream is down, so the field
+        # never advertises a device the backend is not actually capturing.
+        self.stop()
+        self._device_name = device_name
+        try:
+            self.start()
+            return True
+        except Exception as exc:
+            self._metrics.last_error = str(exc)
+            log.error("SCK device switch to %r failed: %s", device_name, exc)
+
+        # Target failed — put the previous device back so capture keeps running
+        # instead of leaving the backend stopped while the app still thinks it
+        # is capturing.
+        self._device_name = previous
+        try:
+            self.start()
+            log.warning("Restored previous audio device %r", previous)
+        except Exception as exc:
+            self._metrics.last_error = f"restore failed: {exc}"
+            log.error("Restoring previous audio device %r also failed: %s", previous, exc)
+        return False
 
     def set_mic_device(self, device_name):
         if self._mic_device_name == device_name:

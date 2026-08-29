@@ -37,9 +37,13 @@ six>=1.16.0
 sentencepiece>=0.2.0
 tiktoken>=0.7.0
 transformers==4.57.1
+# Not imported directly by this project; pinned as part of the GigaAM-v3
+# native stack above. Re-verify before removing.
 pyannote-audio>=4.0,<5
 torchcodec>=0.7
 silero-vad>=5.0
+# Sentence splitting for incremental ASR (main.py::_get_segmenter).
+yasbd-lib>=0.15,<1.0
 modelscope>=1.20.0
 huggingface_hub>=0.20.0
 

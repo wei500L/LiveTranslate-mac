@@ -186,3 +186,55 @@ def test_sck_missing_frameworks_is_explicit(monkeypatch):
     monkeypatch.setattr(audio_capture_sck, "_load_frameworks", lambda: (_ for _ in ()).throw(PlatformUnavailableError("missing")))
     with pytest.raises(PlatformUnavailableError):
         audio_capture_sck._load_frameworks()
+
+
+def _stub_capture(monkeypatch, *, device="A", fail_on=()):
+    """SCKAudioCapture whose start/stop are recorded instead of touching SCK."""
+    cap = SCKAudioCapture.__new__(SCKAudioCapture)
+    cap._device_name = device
+    cap._running = True
+    cap._metrics = SimpleNamespace(last_error=None)
+    calls = []
+
+    def fake_stop():
+        calls.append(("stop", cap._device_name))
+        cap._running = False
+
+    def fake_start():
+        calls.append(("start", cap._device_name))
+        if cap._device_name in fail_on:
+            raise RuntimeError(f"cannot open {cap._device_name}")
+        cap._running = True
+
+    monkeypatch.setattr(cap, "stop", fake_stop)
+    monkeypatch.setattr(cap, "start", fake_start)
+    return cap, calls
+
+
+def test_set_device_with_the_same_name_does_not_restart_the_stream(monkeypatch):
+    """The panel re-emits the whole settings dict on every auto-save, so an
+    unchanged device name must not tear down and rebuild the SCK stream."""
+    cap, calls = _stub_capture(monkeypatch, device="A")
+
+    assert cap.set_device("A") is True
+    assert calls == []
+    assert cap._running is True
+
+
+def test_set_device_failure_restores_the_previous_device(monkeypatch):
+    cap, calls = _stub_capture(monkeypatch, device="A", fail_on={"B"})
+
+    assert cap.set_device("B") is False
+    # stopped A, failed to start B, then came back to A.
+    assert calls == [("stop", "A"), ("start", "B"), ("start", "A")]
+    assert cap._device_name == "A"
+    assert cap._running is True
+    assert cap._metrics.last_error
+
+
+def test_set_device_reports_stopped_when_recovery_also_fails(monkeypatch):
+    cap, calls = _stub_capture(monkeypatch, device="A", fail_on={"A", "B"})
+
+    assert cap.set_device("B") is False
+    assert cap._running is False
+    assert "restore failed" in cap._metrics.last_error

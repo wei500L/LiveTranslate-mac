@@ -8,6 +8,16 @@ from connection_config import normalize_remote_asr_url
 log = logging.getLogger("LiveTranslate.ASR.Remote")
 
 
+class RemoteASRError(RuntimeError):
+    """Remote ASR transport or protocol failure.
+
+    Deliberately distinct from a None result, which means "valid response, no
+    speech". Callers treat this like a dead local worker and go through the
+    existing recovery path.
+    """
+
+
+
 class RemoteASREngine:
     """Speech-to-text via remote faster-whisper server.
 
@@ -90,22 +100,43 @@ class RemoteASREngine:
         header = struct.pack("<I", len(lang_str)) + lang_str
         payload = header + audio.tobytes()
 
+        # A transport/protocol failure is NOT an empty speech result. Collapsing
+        # both into None made the pipeline treat an unreachable server as
+        # silence: no error, no reconnect, no worker-state change — just
+        # permanently missing subtitles.
         try:
             r = self._client.post(self._url, content=payload)
-            r.raise_for_status()
+        except Exception as e:
+            raise RemoteASRError(f"request to {self._url} failed: {e}") from e
+
+        if r.status_code != 200:
+            raise RemoteASRError(f"server returned HTTP {r.status_code}")
+
+        try:
             data = r.json()
         except Exception as e:
-            log.error(f"Remote ASR request failed: {e}")
-            return None
+            raise RemoteASRError(f"response was not valid JSON: {e}") from e
+
+        if not isinstance(data, dict):
+            raise RemoteASRError(
+                f"response must be a JSON object, got {type(data).__name__}"
+            )
 
         text = data.get("text")
-        if not text:
+        if text is None or text == "":
+            # A well-formed response with no speech: the one legitimate None.
             return None
+        if not isinstance(text, str):
+            raise RemoteASRError(f"'text' must be a string, got {type(text).__name__}")
+
+        detected_lang = data.get("language") or "unknown"
+        if not isinstance(detected_lang, str):
+            raise RemoteASRError("'language' must be a string")
 
         elapsed = data.get("elapsed", 0)
-        log.debug(f"Remote ASR: {elapsed:.2f}s -> {text[:60]}")
+        if isinstance(elapsed, (int, float)):
+            log.debug(f"Remote ASR: {elapsed:.2f}s -> {text[:60]}")
 
-        detected_lang = data.get("language", "unknown")
         return {
             "text": text,
             "language": detected_lang,

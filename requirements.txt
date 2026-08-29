@@ -5,6 +5,9 @@ numpy>=1.24.0,<2.3
 numba>=0.59.0
 PyYAML>=6.0
 httpx>=0.28.0
+# Required by httpx for socks5:// proxy URLs, which the per-model proxy field
+# accepts. Without it httpx raises ImportError at request time.
+socksio>=1.0.0
 openai>=1.0.0
 psutil>=5.9.0
 
@@ -25,10 +28,16 @@ hydra-core>=1.3.2
 six>=1.16.0
 sentencepiece>=0.2.0
 tiktoken>=0.7.0
-transformers>=4.40.0
+# mlx_service asserts transformers<5; keep the bound in sync with it.
+transformers>=4.40.0,<5
 
 # VAD (bundles the Silero v5 model in the wheel — no GitHub/torch.hub download)
 silero-vad>=5.0
+
+# Sentence splitting for incremental ASR (main.py::_get_segmenter). The install
+# scripts also install this explicitly; declaring it here keeps a plain
+# `pip install -r requirements.txt` sufficient to run the app.
+yasbd-lib>=0.15,<1.0
 
 # Model hubs
 modelscope>=1.20.0

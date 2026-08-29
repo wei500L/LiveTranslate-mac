@@ -9,7 +9,7 @@ if not exist ".venv\Scripts\python.exe" (
 )
 
 if not exist ".venv\.livetranslate-ready" (
-    echo Environment is incomplete; running the installer first...
+    echo Setup is incomplete; running the installer first...
     call "%~dp0install.bat"
     if errorlevel 1 exit /b 1
 )

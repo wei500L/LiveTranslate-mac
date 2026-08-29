@@ -10,6 +10,29 @@ log = logging.getLogger("LiveTranslate.VAD")
 
 
 class VADProcessor:
+    """Voice activity detection over 32 ms / 512-sample chunks.
+
+    NOT THREAD-SAFE. Every attribute and method — public and private, reads
+    included — must be accessed while holding ``LiveTranslateApp._vad_lock``.
+    The capture thread calls ``process_chunk`` while the ASR thread calls
+    ``peek_buffer``/``trim_front`` and the Qt thread calls ``update_settings``/
+    ``flush``/``_reset``; ``_speech_buffer`` and ``_confidence_history`` are
+    parallel sequences whose lengths must stay equal, and an unlocked writer
+    can break that invariant.
+
+    Narrow, deliberate exceptions — all of them single-attribute reads whose
+    result never feeds a segmentation decision, so a torn read costs at most
+    one skipped or extra poll:
+
+    * ``last_confidence`` — monitor UI display value.
+    * ``_speech_buffer`` length — memory diagnostics only.
+    * ``_is_speaking`` / ``_speech_samples`` in the capture loop — gate whether
+      to *consider* an interim ASR pass; the pass itself re-reads under lock.
+
+    Anything that decides where to cut a segment, or that mutates state, takes
+    the lock. When in doubt, take the lock.
+    """
+
     """Voice Activity Detection with multiple modes."""
 
     def __init__(
@@ -338,8 +361,12 @@ class VADProcessor:
         return segment
 
     def _reset(self):
-        self._speech_buffer = []
-        self._confidence_history = []
+        # Rebind the two parallel sequences in one statement so no concurrent
+        # reader can observe a buffer/history length mismatch between them.
+        # Every caller must hold LiveTranslateApp._vad_lock (see class docstring),
+        # but keeping the invariant atomic here makes the class safe to reason
+        # about on its own.
+        self._speech_buffer, self._confidence_history = [], []
         self._speech_samples = 0
         self._is_speaking = False
         self._silence_counter = 0

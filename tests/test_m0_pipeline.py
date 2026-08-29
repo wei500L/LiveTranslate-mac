@@ -113,3 +113,32 @@ def test_worker_command_lifecycle_can_stop_and_start_again(monkeypatch):
 
     assert len(created) == 2
     assert all(engine.unloaded for engine in created)
+
+
+def test_vad_reset_keeps_buffer_and_confidence_lengths_equal():
+    """_speech_buffer and _confidence_history are parallel sequences; a reset
+    that rebound them in two statements let a concurrent append land in one
+    list but not the other."""
+    import pytest
+
+    pytest.importorskip("torch")
+    pytest.importorskip("silero_vad")
+    import vad_processor
+
+    vad = vad_processor.VADProcessor.__new__(vad_processor.VADProcessor)
+    vad._speech_buffer = [object(), object()]
+    vad._confidence_history = [0.9, 0.8]
+    vad._speech_samples = 1024
+    vad._is_speaking = True
+    vad._silence_counter = 3
+    vad._was_trimmed = True
+
+    vad._reset()
+
+    assert vad._speech_buffer == []
+    assert vad._confidence_history == []
+    assert len(vad._speech_buffer) == len(vad._confidence_history)
+    assert vad._speech_samples == 0
+    assert vad._is_speaking is False
+    assert vad._silence_counter == 0
+    assert vad._was_trimmed is False
