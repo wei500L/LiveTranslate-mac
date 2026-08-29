@@ -230,7 +230,7 @@ Continuous speech is processed incrementally to reduce latency (enabled by `incr
 - `translate_iter()` is a generator that yields accumulated partial text for streaming UI; `translate()` is the blocking equivalent
 - Streaming UI: `update_streaming_signal` → `ChatMessage.update_streaming()` with 50ms QTimer throttle; `set_translation()` finalizes
 - `RepetitionError` raised when model output contains repetition loops (pattern length 8+); caught in `_translate_async`, shows user-facing warning
-- Changelog: `i18n/CHANGELOG_{lang}.md` files rendered as HTML in Settings → Changelog tab via `_load_latest_changelog()`
+- Changelog: `i18n/CHANGELOG_{lang}.md` files rendered as HTML in Settings → Changelog tab via `_load_latest_changelog()`. **Any user-visible change updates both `CHANGELOG_zh.md` and `CHANGELOG_en.md`** under a `## YYYY-MM-DD` heading — this is the project's established habit and every recent commit follows it. Write what changed for the user and why it mattered, not the diff; reference an issue number when there is one. Engineering-only changes (CI, packaging, dependencies) belong there too when they affect how the app is built or installed.
 
 ## Language & Style
 

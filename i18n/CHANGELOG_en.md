@@ -1,5 +1,15 @@
 # Changelog
 
+## 2026-08-29
+- Fixed subtitles being stuck on "translating" forever when the local HY-MT model is selected but its service is not running: that failure shared one exception type with "the app is exiting" and was silently skipped, so the message never settled, never reached the combined transcript, and the internal pending table grew for the rest of the session; it now shows an explicit error and closes out properly
+- Fixed recognition stopping permanently when an ASR backend returned a malformed result: a missing or wrongly typed field killed the ASR thread while the capture thread kept filling a queue nobody drained, so no new subtitles appeared and no restart logic fired; results are now validated against one shared contract, and a single bad result is dropped and logged while later audio keeps being recognized
+- Fixed an unreachable remote ASR server being treated as silence: server outages, connection timeouts, HTTP 5xx and non-JSON responses now go through the same recovery path as a dead local worker and surface as ASR unavailable, instead of discarding audio quietly; a legitimately empty recognition result is still skipped silently
+- Fixed audio dropping out for about 8 seconds on macOS whenever any setting changed: the control panel re-emits the full settings dict on every auto-save and the system audio backend had no device equality check, so it tore down and rebuilt the stream for a device that never changed; it now switches only on a real change, restores the previous device when a switch fails, and stops explicitly when recovery is impossible
+- Fixed possible corruption of the speech buffer when settings were changed or the ASR engine was switched while speaking: the UI thread reset VAD state without the lock, which could leave the buffer and confidence sequences at different lengths and skew split-point selection and silence detection
+- Fixed the recognition thread exiting outright when the incremental-ASR segmentation library is missing: it now degrades to no splitting and logs an explicit error instead of taking the pipeline down
+- `requirements.txt` / `requirements-mac.txt` are now sufficient on their own: added yasbd-lib (previously installed only by the install scripts), socksio on Windows (needed for socks5 proxies), and a transformers <5 upper bound matching what the local MLX service asserts
+- Fixed the test and release pipeline: a launcher message regression broke the test suite, incomplete CI dependencies stopped some tests from being collected, and the Windows release job did not depend on the test job (so a red test run still published); both platforms are now gated on tests, with a new assertion preventing that gate from going missing again
+
 ## 2026-08-22
 - Added macOS 13+ Apple Silicon support documentation and a native arm64 CI job with offline platform/audio tests.
 - Added a macOS arm64 source bundle artifact (`LiveTranslate-macos-arm64-*.tar.gz`); signing and notarization remain release follow-ups.

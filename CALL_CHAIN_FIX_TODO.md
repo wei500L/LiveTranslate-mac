@@ -4,7 +4,11 @@
 
 本文是纯实施方案。执行重点是：明确修改位置、复用现有入口、规定异常和状态如何流转，并通过代码审查、日志和实际操作确认结果。
 
-**覆盖范围**：两轮审查共 **72 项**问题（第一轮 13 项全部未修，第二轮新增 59 项），归并为 **27 个任务**（D1 + A1~A10 + B1~B9 + C1~C7）。
+**覆盖范围**：两轮审查共 **72 项**问题（第一轮 13 项全部未修，第二轮新增 59 项），实施阶段又新发现
+**1 项**（N-P1-14），合计 **73 项**，归并为 **27 个任务**（D1 + A1~A10 + B1~B9 + C1~C7）。
+
+**当前进度**：6 个任务完整完成（D1、A1、A2、A5、A6、B5），2 个部分完成（C5、C7），19 个未开始。
+详见 §10 执行记录。实施分支 `fix/static-audit-2026-08`，测试 81 → 104 全绿，尚未提交。
 
 **归并原则**：多项问题落在同一函数上时合并为一个任务，避免同一处代码被两次修改且意图冲突。受影响的合并点：
 
@@ -23,7 +27,7 @@
 | `subtitle_window` 渲染与重建 | N-P2-17、N-P3-16、N-P3-17 | B8 |
 | `asr_server` 配置与暴露面 | P2-4、N-P2-14、N-P3-13 | C2 |
 | 用户可见文案与 i18n 健壮性 | N-P2-4、N-P2-16、N-P3-4、N-P3-8、N-P3-15、N-P3-18 | C5 |
-| CI 与测试基线 | N-P1-10、N-P1-11、N-P1-12、N-P3-23 | D1 |
+| CI 与测试基线 | N-P1-10、N-P1-11、N-P1-12、N-P1-14、N-P3-23 | D1 |
 | 依赖声明与平台对称性 | N-P2-22、N-P2-23、N-P3-21、N-P3-22 | C7 |
 
 ## 1. 目标和不变项
@@ -194,22 +198,23 @@ _running=False
 
 阶段内的任务编号不代表优先级。**实际动手顺序按下表**：
 
-| 顺位 | 任务 | 理由 |
-|---:|---|---|
-| **0** | **D1** | **前置条件**。当前 `pytest -q` 就是失败的（`start.bat` 文案回归），CI 又装不全依赖、且发布不受测试门禁约束。没有可信的绿色基线，后面 26 个任务的「运行检查点」全都无法证伪——任何回归都会被既有的红色掩盖。D1 改动量最小、风险最低，必须第一个做。 |
-| 1 | **A6、A5** | 两者都由 `_on_settings_changed` 触发，是日常使用中最高频的故障路径，改动局部、风险低。 |
-| 2 | **A1、A2、B5** | 统一 ASR/翻译的结果契约与失败可见性，消除「静默无输出」这一最难排查的故障类别。 |
-| 3 | **A7、A3** | 一并重做停止/切换协议：锁分离 + 有界等待 + 单一退出入口。 |
-| 4 | **A8** | MLX 生命周期与状态查询。它同时消除一个 5 秒轮询的资源消耗、一个 UI 冻结、一处对运行中目录的 `rmtree`，以及设置面板卡死不可关闭的连锁反应。 |
-| 5 | **A4、A9、A10** | 采集读循环、下载对话框、后端错误契约——三处都属于「失败后静默降级」。 |
-| 6 | **B6** | 增量 ASR 短句去重，直接影响字幕正确性。 |
-| 7 | **C7** | 依赖声明。它是 A1 的一个具体触发器（缺 `yasbd-lib` 会杀 ASR 线程），也让 D1 的绿色基线可复现。 |
-| 8 | **B1 ~ B4、B7 ~ B9** | 翻译请求语义、计数、启动状态与字幕渲染。 |
-| 9 | **C1 ~ C7** | 配置边界、服务暴露面、文案与可维护性收尾。 |
+| 顺位 | 任务 | 状态 | 理由 |
+|---:|---|---|---|
+| **0** | **D1** | ✅ | **前置条件**。当时 `pytest -q` 就是失败的（`start.bat` 文案回归），CI 又装不全依赖、且发布不受测试门禁约束。没有可信的绿色基线，后面 26 个任务的「运行检查点」全都无法证伪。实施中还暴露出第 4 个 CI 缺陷（N-P1-14）。 |
+| 1 | **A6、A5** | ✅ | 两者都由 `_on_settings_changed` 触发，是日常使用中最高频的故障路径，改动局部、风险低。 |
+| 2 | **A1、A2、B5** | ✅ | 统一 ASR/翻译的结果契约与失败可见性，消除「静默无输出」这一最难排查的故障类别。 |
+| — | **C7** | 🔶 | 提前做了主体：它是 A1 的具体触发器（缺 `yasbd-lib` 会杀 ASR 线程）。`pyannote` 归属与双向对称断言仍待办。 |
+| — | **C5** | 🔶 | 提前做了 i18n 健壮性（`set_lang` 异常保护、废弃 API、缺键日志）。硬编码文案与导出提示仍待办。 |
+| **3** | **A7、A3** | ⬜ **下一步** | 一并重做停止/切换协议：锁分离 + 有界等待 + 单一退出入口。**A7 必须先于 A3**。 |
+| 4 | **A8** | ⬜ | MLX 生命周期与状态查询。同时消除 5 秒轮询的资源消耗、约 2 秒 UI 冻结、一处对运行中目录的 `rmtree`，以及设置面板卡死不可关闭的连锁反应。 |
+| 5 | **A4、A9、A10** | ⬜ | 采集读循环、下载对话框、后端错误契约——三处都属于「失败后静默降级」。 |
+| 6 | **B6** | ⬜ | 增量 ASR 短句去重，直接影响字幕正确性。 |
+| 7 | **B1 ~ B4、B7 ~ B9** | ⬜ | 翻译请求语义、计数、启动状态与字幕渲染。 |
+| 8 | **C1 ~ C4、C6**，及 C5/C7 余项 | ⬜ | 配置边界、服务暴露面、文案与可维护性收尾。 |
 
 依赖约束：
 
-- **D1 先于一切**：其余任务的验收都依赖一个可通过的测试基线（见 2.12）。
+- ~~**D1 先于一切**~~：已完成，基线已绿（104 项测试通过）。但其「CI 能收集并运行全部测试」一条**尚未在真实 CI 上证实**——沙箱无网络，建不了干净虚拟环境，需推分支跑一次。
 - A1 先建立统一结果契约，A2 的错误分类依赖它。
 - **A7 必须先于 A3 完成**：A3 要求 `stop()` 有界，而当前无界等待正来自 `ASRClient` 的单锁设计。
 - **A8 的取消修复先于 N-P2-19 的验证**：设置面板卡死是取消无效的直接后果，不是独立缺陷。
@@ -219,7 +224,10 @@ _running=False
 
 ## 3.5 阶段 D：测试与发布基线
 
-### D1｜恢复绿色测试基线与发布门禁（N-P1-10、N-P1-11、N-P1-12、N-P3-23）
+### D1｜恢复绿色测试基线与发布门禁（N-P1-10、N-P1-11、N-P1-12、N-P3-23、N-P1-14）
+
+**状态**：✅ 已完成
+
 
 **涉及文件**：`start.bat`、`.github/workflows/release.yml`、`tests/test_requirements.py`；可能涉及 `translator.py`（惰性导入方案）。
 
@@ -229,22 +237,34 @@ _running=False
 
 *测试回归（N-P1-10）*
 
-- [ ] 统一两个启动器的提示文案。`start.sh:8` 为 `"Setup is incomplete; running the installer first..."`，`start.bat:12` 在 `cbd3a53` 中被改成 `"Environment is incomplete; ..."`。二选一并同步另一侧；若刻意保留分歧，`tests/test_startup_environment.py:15` 的断言必须同时接受两种措辞，并在测试中注明原因。
-- [ ] 确认 `python -m pytest -q` 返回 0。
+- [x] 统一两个启动器的提示文案。`start.sh:8` 为 `"Setup is incomplete; running the installer first..."`，`start.bat:12` 在 `cbd3a53` 中被改成 `"Environment is incomplete; ..."`。二选一并同步另一侧；若刻意保留分歧，`tests/test_startup_environment.py:15` 的断言必须同时接受两种措辞，并在测试中注明原因。
+- [x] 确认 `python -m pytest -q` 返回 0。
 
 *CI 依赖（N-P1-11）*
 
-- [ ] 二选一并记录理由：
+- [x] 二选一并记录理由：
   - **方案 A**：CI 的「Install test dependencies」补上 `httpx`、`openai`。简单，但 CI 依赖清单会与 `requirements.txt` 二次漂移。
   - **方案 B（推荐）**：把 `translator.py` 的 `import httpx` / `from openai import OpenAI` 改为函数内惰性导入，使 thinking style 解析、prompt 组装、请求 kwargs 这些纯逻辑测试无需第三方包即可运行。附带收益是启动更快。
-- [ ] 无论选哪个方案，都必须确保**不存在收集失败**：刻意不安装的依赖，对应测试要显式 `pytest.importorskip` 而不是报错。
+- [x] 无论选哪个方案，都必须确保**不存在收集失败**：刻意不安装的依赖，对应测试要显式 `pytest.importorskip` 而不是报错。
 - [ ] 用一个只装 CI 声明依赖的干净虚拟环境本地验证 `pytest -q` 通过。
 
 *发布门禁（N-P1-12、N-P3-23）*
 
-- [ ] 给 `build` 作业加 `needs: test-macos-arm64`，与 `package-macos-arm64` 保持一致。
-- [ ] 在 `tests/test_requirements.py::test_release_workflow_has_arm64_test_and_distinct_macos_artifact` 中补断言：**每个产出发布物的作业都声明了 `needs`**。这条断言的缺失正是本问题未被捕获的原因。
-- [ ] 不改变现有的产物命名和 tag 触发条件。
+- [x] 给 `build` 作业加 `needs: test-macos-arm64`，与 `package-macos-arm64` 保持一致。
+- [x] 在 `tests/test_requirements.py::test_release_workflow_has_arm64_test_and_distinct_macos_artifact` 中补断言：**每个产出发布物的作业都声明了 `needs`**。这条断言的缺失正是本问题未被捕获的原因。
+- [x] 不改变现有的产物命名和 tag 触发条件。
+
+*环境依赖型测试（N-P1-14，实施阶段新发现）*
+
+审查阶段未捕获，实施 D1 时才暴露：`tests/test_m2_platform.py::test_gigaam_cache_is_hf_snapshot_only`
+断言 `get_missing_models("gigaam", "", "hf") == []`，但 `get_missing_models` 会先检查 Silero VAD，
+而 `is_silero_cached()` 走 `_has_silero_pkg()` → `importlib.util.find_spec("silero_vad")`。
+CI 不安装 silero-vad，因此该调用返回 `['Silero VAD']`，断言必然失败。
+**这意味着即使修完 N-P1-10/11/12，CI 仍然是红的。**
+
+- [x] 让该测试不依赖「silero-vad 恰好已安装」——monkeypatch `_has_silero_pkg`，因为测试意图是
+  GigaAM 缓存检测，Silero 的安装状态是无关噪声。
+- [ ] 排查是否还有其他测试隐含依赖某个包恰好安装。本轮只处理了这一处，未做系统性扫描。
 
 **运行检查点**：干净环境下 `pytest -q` 返回 0；在一个测试故意失败的分支上打 tag 或 workflow_dispatch，确认 `build` 作业被跳过而非产出发布包。
 
@@ -254,17 +274,20 @@ _running=False
 
 ### A1｜ASR 单项异常隔离与结果校验（P1-1）
 
+**状态**：✅ 已完成
+
+
 **涉及文件**：`main.py`。
 
 **根因**：`_asr_loop` 只处理 `queue.Empty`；结果消费位置直接访问 `result["text"]`/`result["language"]`，坏结果或分句异常会退出 ASR 线程。
 
 **实施步骤**
 
-- [ ] 增加统一结果校验函数，返回空结果、规范化结果或协议错误三种明确结果。
-- [ ] `_process_segment`、`_process_interim_final`、`_do_interim_asr` 在 `.strip()`、语言过滤和分句前调用该函数。
-- [ ] `_asr_loop` 对单个队列 item 建立外围 `try/except Exception`，日志包含 `seg_type`、异常类型和 segment 长度，不记录音频原文。
-- [ ] 协议错误只丢当前 item；worker 退出/超时继续由 `_run_asr` 的既有恢复路径处理。
-- [ ] 不捕获并吞掉 `SystemExit`/`KeyboardInterrupt`，不在该层重启应用。
+- [x] 增加统一结果校验函数，返回空结果、规范化结果或协议错误三种明确结果。
+- [x] `_process_segment`、`_process_interim_final`、`_do_interim_asr` 在 `.strip()`、语言过滤和分句前调用该函数。
+- [x] `_asr_loop` 对单个队列 item 建立外围 `try/except Exception`，日志包含 `seg_type`、异常类型和 segment 长度，不记录音频原文。
+- [x] 协议错误只丢当前 item；worker 退出/超时继续由 `_run_asr` 的既有恢复路径处理。
+- [x] 不捕获并吞掉 `SystemExit`/`KeyboardInterrupt`，不在该层重启应用。
 
 **运行检查点**：日志中能区分空结果、协议错误和 worker 错误；坏结果之后 ASR loop 仍处于运行状态。
 
@@ -272,14 +295,17 @@ _running=False
 
 ### A2｜远程 ASR 领域异常和恢复（P1-2）
 
+**状态**：✅ 已完成
+
+
 **涉及文件**：`asr_remote.py`、`main.py`；必要时更新 `REMOTE_ASR.md`。
 
 **实施步骤**
 
-- [ ] 定义 `RemoteASRError`，保留原始异常作为 cause；消息包含请求阶段、主机或 HTTP 状态，不泄露凭据。
-- [ ] 分开处理 post、HTTP 状态、JSON 解析、响应类型和字段校验，移除宽泛的 `return None`。
-- [ ] 空文本只在合法响应和合法语言字段下返回 `None`；非字典 JSON、缺字段、类型错误全部抛异常。
-- [ ] `_run_asr` 捕获 `RemoteASRError`，沿用 `_recover_asr_worker()` 的重建次数和状态显示，不新增第二个重试循环。
+- [x] 定义 `RemoteASRError`，保留原始异常作为 cause；消息包含请求阶段、主机或 HTTP 状态，不泄露凭据。
+- [x] 分开处理 post、HTTP 状态、JSON 解析、响应类型和字段校验，移除宽泛的 `return None`。
+- [x] 空文本只在合法响应和合法语言字段下返回 `None`；非字典 JSON、缺字段、类型错误全部抛异常。
+- [x] `_run_asr` 捕获 `RemoteASRError`，沿用 `_recover_asr_worker()` 的重建次数和状态显示，不新增第二个重试循环。
 - [ ] 特别确认 remote client 的 `pid=None`、`shutdown()`、旧 client 替换和 `_load_engine_client()` 重建顺序，避免旧请求覆盖新连接。
 - [ ] 恢复失败显示 `ASR unavailable`；恢复成功更新 Overlay 引擎状态；合法空文本不触发恢复。
 
@@ -288,6 +314,9 @@ _running=False
 **完成标准**：网络故障不再静默吞掉，空语音仍保持静默。
 
 ### A3｜有界停止与统一退出入口（P1-5、P1-6、N-P1-6、N-P2-3、N-P3-5）
+
+**状态**：⬜ 未开始
+
 
 **涉及文件**：`main.py`、`control_panel.py`。
 
@@ -327,6 +356,9 @@ _running=False
 
 ### A4｜Windows 采集读循环：队列背压、重启失败与持锁阻塞（P1-4、N-P2-21、N-P3-20）
 
+**状态**：⬜ 未开始
+
+
 **涉及文件**：`audio_capture.py`；必要时只在 `audio_capture_base.py` 增加最小共享 helper。
 
 **根因**：三处缺陷都在同一个 `_read_loop` 函数内，必须一次改完，否则会互相干扰。
@@ -356,6 +388,9 @@ _running=False
 
 ### A5｜macOS 设备切换：幂等 + 失败恢复（P1-3、N-P1-2）
 
+**状态**：✅ 已完成
+
+
 **涉及文件**：`audio_capture_sck.py`、`main.py`；必要时使用已有平台错误文案。
 
 **根因**：`set_device()` 既缺相等性短路（同名设备也整流重启），失败时又不恢复旧流；调用方 `main.py` 用 `key in settings` 判断且忽略返回值。两个缺陷叠加在同一函数上，必须一次改完。
@@ -364,17 +399,17 @@ _running=False
 
 *幂等（N-P1-2）*
 
-- [ ] `SCKAudioCapture.set_device()` 开头补相等性短路：`if self._device_name == device_name: return True`，与同文件 `set_mic_device()` 的既有写法保持一致。
-- [ ] `main.py::_on_settings_changed` 改为比较值再调用：仅当 `old_device != settings["audio_device"]` 时才调 `set_device`，遵循 2.8 契约。
-- [ ] 同一函数内其余分支（ASR 引擎、翻译器、VAD）一并核对是否存在同类「键存在即执行」的判据；`_switch_asr_engine` 已有 signature 短路，确认无需改动即可，不要重复加判。
+- [x] `SCKAudioCapture.set_device()` 开头补相等性短路：`if self._device_name == device_name: return True`，与同文件 `set_mic_device()` 的既有写法保持一致。
+- [x] `main.py::_on_settings_changed` 改为比较值再调用：仅当 `old_device != settings["audio_device"]` 时才调 `set_device`，遵循 2.8 契约。
+- [x] 同一函数内其余分支（ASR 引擎、翻译器、VAD）一并核对是否存在同类「键存在即执行」的判据；`_switch_asr_engine` 已有 signature 短路，确认无需改动即可，不要重复加判。
 
 *失败恢复（P1-3）*
 
-- [ ] `set_device()` 保存旧设备和运行状态；停止旧 stream 后尝试新 stream。
-- [ ] 新 stream 失败时恢复旧设备名并尝试启动旧 stream；恢复成功返回 `False`，保留错误但继续旧设备采集。
-- [ ] 旧 stream 也失败时设置 stopped 和 `last_error`，返回 `False`，不得报告成功。
-- [ ] `main.py` 检查返回值；成功才 flush VAD，失败时恢复设置/控件并提示；backend 已停止则统一 stop。
-- [ ] 不新增 BlackHole/CATap 回退，不改变 SCK 内容重建模型。
+- [x] `set_device()` 保存旧设备和运行状态；停止旧 stream 后尝试新 stream。
+- [x] 新 stream 失败时恢复旧设备名并尝试启动旧 stream；恢复成功返回 `False`，保留错误但继续旧设备采集。
+- [x] 旧 stream 也失败时设置 stopped 和 `last_error`，返回 `False`，不得报告成功。
+- [x] `main.py` 检查返回值；成功才 flush VAD，失败时恢复设置/控件并提示；backend 已停止则统一 stop。
+- [x] 不新增 BlackHole/CATap 回退，不改变 SCK 内容重建模型。
 
 **运行检查点**：macOS 上连续改动多项无关设置，日志中不再出现 SCK 停流/重建；切换失败时 UI 显示旧设备或 stopped 状态，不显示假运行。
 
@@ -382,24 +417,30 @@ _running=False
 
 ### A6｜VAD 跨线程访问统一加锁（N-P1-1）
 
+**状态**：✅ 已完成
+
+
 **涉及文件**：`main.py`、`vad_processor.py`。
 
 **根因**：`main.py` 中 7 处 VAD 访问持 `_vad_lock`，但 `_on_settings_changed`（384、415-416）与 `_switch_asr_engine`（811-812）这 3 处没有。`_reset()` 分两条语句重新绑定 `_speech_buffer` 与 `_confidence_history`，采集线程可能在中间向旧列表追加而向新列表追加，破坏两者的长度不变式。
 
 **实施步骤**
 
-- [ ] `main.py:384`（`update_settings`）、`main.py:415-416`、`main.py:811-812` 三处补 `with self._vad_lock:`。
-- [ ] 删除 `flush()` 之后冗余的 `_reset()` 调用——`flush()`/`_flush_segment()` 内部已经 reset。若原意是「丢弃缓冲而不产出片段」，改为只调用 `_reset()`，并在注释中写明意图。
-- [ ] `VADProcessor._reset()` 改为原子替换全部状态，使 `len(_speech_buffer) == len(_confidence_history)` 在任何可观察时刻都成立。
-- [ ] 按 2.7 契约在 `VADProcessor` 类 docstring 写明「非线程安全，调用方必须持 `_vad_lock`」。
-- [ ] 复核 `_capture_loop` 中 `_is_speaking` / `_speech_samples` 的无锁读（1986、2010、2018-2019）：这些只作节流判据，保持无锁但**不得**用于切分决策；如已用于决策则一并纳入锁内。
-- [ ] 不调整 VAD 阈值、分层静音、backtrack 逻辑（见 1.2 不变项）。
+- [x] `main.py:384`（`update_settings`）、`main.py:415-416`、`main.py:811-812` 三处补 `with self._vad_lock:`。
+- [x] 删除 `flush()` 之后冗余的 `_reset()` 调用——`flush()`/`_flush_segment()` 内部已经 reset。若原意是「丢弃缓冲而不产出片段」，改为只调用 `_reset()`，并在注释中写明意图。
+- [x] `VADProcessor._reset()` 改为原子替换全部状态，使 `len(_speech_buffer) == len(_confidence_history)` 在任何可观察时刻都成立。
+- [x] 按 2.7 契约在 `VADProcessor` 类 docstring 写明「非线程安全，调用方必须持 `_vad_lock`」。
+- [x] 复核 `_capture_loop` 中 `_is_speaking` / `_speech_samples` 的无锁读（1986、2010、2018-2019）：这些只作节流判据，保持无锁但**不得**用于切分决策；如已用于决策则一并纳入锁内。
+- [x] 不调整 VAD 阈值、分层静音、backtrack 逻辑（见 1.2 不变项）。
 
 **运行检查点**：说话过程中反复改动设置和切换 ASR 引擎，日志无异常，字幕不出现截断或错位；针对 `_reset()` 的不变式补一条断言或单测。
 
 **完成标准**：VAD 的所有状态变更都在同一把锁下发生，两个列表的长度不变式不会被并发破坏。
 
 ### A7｜ASRClient 锁分离与状态保真（N-P1-4、N-P2-5）
+
+**状态**：⬜ 未开始
+
 
 **涉及文件**：`asr_client.py`；调用侧核对 `main.py`。
 
@@ -427,6 +468,9 @@ _running=False
 **完成标准**：退出与切换的等待时间与 `request_timeout`/`ready_timeout` 解耦；`status` 永远不描述一个不存在的进程。
 
 ### A8｜MLX 服务生命周期与状态查询（N-P1-7、N-P1-8、N-P1-13、N-P2-6、N-P2-7、N-P2-8、N-P2-9、N-P2-19、N-P3-9）
+
+**状态**：⬜ 未开始
+
 
 **涉及文件**：`mlx_service.py`、`control_panel.py`、`main.py`。
 
@@ -466,6 +510,9 @@ _running=False
 
 ### A9｜下载对话框：线程化、可取消与全局状态恢复（N-P1-9、N-P2-10、N-P3-10、N-P3-11、N-P3-12）
 
+**状态**：⬜ 未开始
+
+
 **涉及文件**：`dialogs.py`。
 
 **根因**：`SetupWizardDialog` 与 `ModelDownloadDialog` 使用「裸线程 + 200ms 轮询 `is_alive()`」模式（N-P3-10），而同文件的 `_ConnectionTestThread` 和 `control_panel.py` 的 `_MLXTaskThread` 都用 `QThread` + 信号。轮询模式正是无法取消、也无法在关闭时恢复全局状态的结构性原因。
@@ -486,6 +533,9 @@ _running=False
 
 ### A10｜采集后端错误契约统一（N-P2-15、N-P3-14）
 
+**状态**：⬜ 未开始
+
+
 **涉及文件**：`audio_capture_pyaudio.py`；对照 `audio_capture_sck.py`、`audio_capture_base.py`。
 
 **根因**：两个 macOS 后端对同一个终止条件的处理方式相反。`SCKAudioCapture.get_audio`（`audio_capture_sck.py:519-525`）会抛 `CaptureRuntimeError`，`_capture_loop`（`main.py:1976-1984`）据此停止管线；而 `PyAudioCapture.get_audio`（`audio_capture_pyaudio.py:208-212`）用 `except Exception: return None` 吞掉一切，同样的终止条件在这个后端上永远静默。
@@ -504,6 +554,9 @@ _running=False
 ## 5. 阶段 B：翻译、启动和字幕一致性
 
 ### B1｜翻译结果收口统一（P2-1、N-P2-2、N-P3-2）
+
+**状态**：⬜ 未开始
+
 
 **涉及文件**：`translator.py`。
 
@@ -535,6 +588,9 @@ _running=False
 
 ### B2｜Benchmark 与运行时请求等价，并消除其崩溃路径（P2-3、N-P2-11、N-P2-12、N-P2-13）
 
+**状态**：⬜ 未开始
+
+
 **涉及文件**：`benchmark.py`；必要时 `translator.py`。
 
 - [ ] 优先直接复用 `Translator._build_request_kwargs()`，不复制 thinking、JSON 和 overrides 推断规则。
@@ -557,6 +613,9 @@ _running=False
 
 ### B3｜延迟启动与暂停竞态（P2-6）
 
+**状态**：⬜ 未开始
+
+
 **涉及文件**：`main.py`。
 
 - [ ] 延迟启动期间 `_is_running=False`，Overlay/tray 显示未启动或暂停。
@@ -569,6 +628,9 @@ _running=False
 **完成标准**：延迟回调不能覆盖用户最后一次暂停/退出操作。
 
 ### B4｜字幕最短显示时间 FIFO（P2-5）
+
+**状态**：⬜ 未开始
+
 
 **涉及文件**：`subtitle_window.py`。
 
@@ -583,19 +645,22 @@ _running=False
 
 ### B5｜翻译不可用的可见失败（N-P1-5）
 
+**状态**：✅ 已完成
+
+
 **涉及文件**：`main.py`；必要时 `i18n/*.yaml`。
 
 **根因**：`_snapshot_translation_request` 在 `_translator is None` 时抛 `RuntimeError`，与 executor 关闭抛出的 `RuntimeError` 无法区分，被同一个 `except RuntimeError` 吞掉。此前已写入的 overlay 消息和 `TranscriptWriter._pending` 条目因此永不落定。
 
 **实施步骤**
 
-- [ ] 定义独立异常（如 `TranslationUnavailable`），与 executor 关闭的 `RuntimeError` 区分开。
-- [ ] `_process_segment` 和 `_process_segment_text` 两处捕获点分别处理：
+- [x] 定义独立异常（如 `TranslationUnavailable`），与 executor 关闭的 `RuntimeError` 区分开。
+- [x] `_process_segment` 和 `_process_segment_text` 两处捕获点分别处理：
   - 翻译服务不可用 → `self._transcript.finalize_no_translation(msg_id)` + Overlay 显示明确错误文案（i18n 键）。
   - Executor 已关闭（退出中）→ 保持现有静默跳过，但同样调用 `finalize_no_translation` 以免 `_pending` 泄漏。
-- [ ] 两处捕获逻辑抽为一个私有方法，避免 `_process_segment` 与 `_process_segment_text` 再次分叉（这两个函数本就有大量重复，见 C 阶段备注）。
-- [ ] 修正日志文案：不可用时不再输出 "Translation executor shut down"。
-- [ ] 复核 `TranscriptWriter._pending`：确认所有写入 `write_original()` 的路径最终都有 `write_translation()` 或 `finalize_no_translation()` 与之配对。
+- [x] 两处捕获逻辑抽为一个私有方法，避免 `_process_segment` 与 `_process_segment_text` 再次分叉（这两个函数本就有大量重复，见 C 阶段备注）。
+- [x] 修正日志文案：不可用时不再输出 "Translation executor shut down"。
+- [x] 复核 `TranscriptWriter._pending`：确认所有写入 `write_original()` 的路径最终都有 `write_translation()` 或 `finalize_no_translation()` 与之配对。
 - [ ] 复核 `_translate_extra_langs` 中 `self._translator.fork_for_request(...)` 的 `None` 解引用，走同一异常路径。
 
 **运行检查点**：选中 HY-MT 但不启动 MLX 服务，说话后 Overlay 每条消息都落定为明确错误；`all` transcript 中该条目存在；长时间运行后 `_pending` 不增长。
@@ -603,6 +668,9 @@ _running=False
 **完成标准**：翻译服务不可用是一次可见、可落定、可解释的失败，不产生悬挂消息或内存泄漏。
 
 ### B6｜增量 ASR 短句缓冲去重（N-P1-3、N-P3-6）
+
+**状态**：⬜ 未开始
+
 
 **涉及文件**：`main.py`；关联 `vad_processor.py` 的密度丢弃路径。
 
@@ -627,6 +695,9 @@ _running=False
 
 ### B7｜翻译并发计数与线程数收口（N-P2-1、N-P3-1）
 
+**状态**：⬜ 未开始
+
+
 **涉及文件**：`main.py`。
 
 **实施步骤**
@@ -647,6 +718,9 @@ _running=False
 **完成标准**：并发计数不再被过期回调污染；线程数在所有入口上都受同一钳制。
 
 ### B8｜字幕窗口渲染与重建（N-P2-17、N-P3-16、N-P3-17）
+
+**状态**：⬜ 未开始
+
 
 **涉及文件**：`subtitle_window.py`。
 
@@ -674,6 +748,9 @@ _running=False
 
 ### B9｜字幕设置的状态隔离（N-P2-20、N-P3-19）
 
+**状态**：⬜ 未开始
+
+
 **涉及文件**：`subtitle_settings.py`。
 
 **实施步骤**
@@ -690,6 +767,9 @@ _running=False
 ## 6. 阶段 C：配置、服务边界与体验
 
 ### C1｜active_model 删除和运行时切换（P2-2、N-P3-7）
+
+**状态**：⬜ 未开始
+
 
 **涉及文件**：`control_panel.py`，联动检查 `main.py` 的 `model_changed` 接收路径。
 
@@ -710,6 +790,9 @@ _running=False
 **完成标准**：active 索引不会漂移，运行中的 Translator 不再持有已删除模型，列表修改总能写回。
 
 ### C2｜远程 ASR 服务：配置入口与暴露面（P2-4、N-P2-14、N-P3-13）
+
+**状态**：⬜ 未开始
+
 
 **涉及文件**：`asr_server.py`，必要时 `REMOTE_ASR.md`。
 
@@ -737,6 +820,9 @@ _running=False
 
 ### C3｜FunASR-Nano 原始错误保真（P3-1）
 
+**状态**：⬜ 未开始
+
+
 **涉及文件**：`funasr_nano/model.py`。
 
 - [ ] `load_audio_text_image_video()` 失败立即抛出带输入引用的异常，并使用 `raise ... from e`。
@@ -750,6 +836,9 @@ _running=False
 
 ### C4｜ASR worker 请求转发契约（N-P3-3）
 
+**状态**：⬜ 未开始
+
+
 **涉及文件**：`asr_worker.py`。
 
 - [ ] `_transcribe` 明确定义会转发哪些 payload 键；对无法转发的键要么显式忽略并记 debug 日志，要么按契约报错，不再静默丢弃。
@@ -761,6 +850,9 @@ _running=False
 **完成标准**：客户端传入的参数要么被转发，要么被明确记录，不存在无声丢弃。
 
 ### C5｜用户可见文案、i18n 健壮性与导出完整性（N-P2-4、N-P2-16、N-P3-4、N-P3-8、N-P3-15、N-P3-18）
+
+**状态**：🔶 部分完成（仅 i18n 健壮性；硬编码文案与导出提示未做）
+
 
 **涉及文件**：`main.py`、`mlx_service.py`、`control_panel.py`、`i18n.py`、`i18n/zh.yaml`、`i18n/en.yaml`、`subtitle_overlay.py`。
 
@@ -775,10 +867,10 @@ _running=False
 
 *i18n 健壮性（N-P2-16、N-P3-15）*
 
-- [ ] `i18n.set_lang()`（`i18n.py:21-27`）的 `yaml.safe_load(f.read_text())` 加异常保护。该函数在**模块导入期**执行（`i18n.py:38`），YAML 损坏会在任何 UI 出现之前终止进程且无提示；失败时应退回内置英文或空字典并记录错误。
-- [ ] `locale.getdefaultlocale()`（`i18n.py:13`）自 Python 3.11 废弃、计划 3.15 移除，改用 `locale.getlocale()` 或环境变量探测。
-- [ ] `t()`（`i18n.py:34`）在 key 缺失时静默返回 key 本身；改为同时记录一条 debug 日志，使拼写错误在开发期可见，UI 上仍返回 key 以免抛异常。
-- [ ] 补一个测试：`i18n/zh.yaml` 与 `i18n/en.yaml` 的键集合一致。
+- [x] `i18n.set_lang()`（`i18n.py:21-27`）的 `yaml.safe_load(f.read_text())` 加异常保护。该函数在**模块导入期**执行（`i18n.py:38`），YAML 损坏会在任何 UI 出现之前终止进程且无提示；失败时应退回内置英文或空字典并记录错误。
+- [x] `locale.getdefaultlocale()`（`i18n.py:13`）自 Python 3.11 废弃、计划 3.15 移除，改用 `locale.getlocale()` 或环境变量探测。
+- [x] `t()`（`i18n.py:34`）在 key 缺失时静默返回 key 本身；改为同时记录一条 debug 日志，使拼写错误在开发期可见，UI 上仍返回 key 以免抛异常。
+- [x] 补一个测试：`i18n/zh.yaml` 与 `i18n/en.yaml` 的键集合一致。
 
 *导出（N-P3-4）*
 
@@ -790,6 +882,9 @@ _running=False
 **完成标准**：不存在绕过 i18n 的用户可见文案；导出的不完整性对用户可见。
 
 ### C6｜控制面板后台任务去重（N-P2-18）
+
+**状态**：⬜ 未开始
+
 
 **涉及文件**：`control_panel.py`。
 
@@ -804,6 +899,9 @@ _running=False
 
 ### C7｜依赖声明与平台对称性（N-P2-22、N-P2-23、N-P3-21、N-P3-22）
 
+**状态**：🔶 部分完成（依赖声明已补；pyannote 归属未核实、双向对称断言未补）
+
+
 **涉及文件**：`requirements.txt`、`requirements-mac.txt`、`tests/test_requirements.py`；可能涉及安装脚本注释。
 
 **根因**：requirements 文件既不自足、也不对称，而现有测试只做单向校验（windows ⊆ mac），因此这类问题不会被发现。
@@ -812,16 +910,16 @@ _running=False
 
 *自足性（N-P2-22）*
 
-- [ ] `yasbd-lib` 被 5 个入口脚本安装（`install.ps1:283`、`install.sh:26`、`update.bat:73`、`update.sh:14`、`build_release.ps1:168`）且被 `tests/test_requirements.py` 逐个断言，但两个 requirements 文件对它只字未提。按 2.11，二选一：
+- [x] `yasbd-lib` 被 5 个入口脚本安装（`install.ps1:283`、`install.sh:26`、`update.bat:73`、`update.sh:14`、`build_release.ps1:168`）且被 `tests/test_requirements.py` 逐个断言，但两个 requirements 文件对它只字未提。按 2.11，二选一：
   - **方案 A（推荐）**：把 `yasbd-lib>=0.15,<1.0` 直接写入两个 requirements 文件，脚本中的独立安装步骤保留为幂等冗余或删除。
   - **方案 B**：保留现状，但在两个 requirements 文件中加注释说明它由安装脚本单独安装及原因（参照现有 torch 注释的写法）。
-- [ ] 无论哪个方案，都要在 `main.py` 的 `_get_segmenter` 处理 `ImportError`：该 import 位于 `_do_interim_asr` 中**没有 try/except 覆盖**的路径上，缺包会直接杀死 ASR 线程。这是 A1 的一个具体触发器，应与 A1 的结果契约一并验证。降级行为：记录一次明确错误并禁用增量 ASR，而不是让线程退出。
+- [x] 无论哪个方案，都要在 `main.py` 的 `_get_segmenter` 处理 `ImportError`：该 import 位于 `_do_interim_asr` 中**没有 try/except 覆盖**的路径上，缺包会直接杀死 ASR 线程。这是 A1 的一个具体触发器，应与 A1 的结果契约一并验证。降级行为：记录一次明确错误并禁用增量 ASR，而不是让线程退出。
 
 *平台对称性（N-P2-23、N-P3-21）*
 
-- [ ] `socksio>=1.0.0` 目前只在 `requirements-mac.txt`。模型配置的 `proxy` 字段可填任意 URL，Windows 用户填 `socks5://...` 时 httpx 抛 `ImportError`。补入 `requirements.txt`，或在代理设置 UI 上明确说明 Windows 不支持 SOCKS。
-- [ ] `transformers>=4.40.0`（Windows，无上界）vs `transformers==4.57.1`（macOS，钉死）。`mlx_service._versions_are_compatible`（`mlx_service.py:186`）断言 `transformers` 主版本 `< 5`，因此 Windows 侧至少应补 `<5` 上界。
-- [ ] 逐条核对两个文件的其余差异，确认每一处都是有意的平台差异并带注释（`PyAudioWPatch` 仅 Windows、pyobjc 系列仅 macOS 已符合要求）。
+- [x] `socksio>=1.0.0` 目前只在 `requirements-mac.txt`。模型配置的 `proxy` 字段可填任意 URL，Windows 用户填 `socks5://...` 时 httpx 抛 `ImportError`。补入 `requirements.txt`，或在代理设置 UI 上明确说明 Windows 不支持 SOCKS。
+- [x] `transformers>=4.40.0`（Windows，无上界）vs `transformers==4.57.1`（macOS，钉死）。`mlx_service._versions_are_compatible`（`mlx_service.py:186`）断言 `transformers` 主版本 `< 5`，因此 Windows 侧至少应补 `<5` 上界。
+- [x] 逐条核对两个文件的其余差异，确认每一处都是有意的平台差异并带注释（`PyAudioWPatch` 仅 Windows、pyobjc 系列仅 macOS 已符合要求）。
 
 *未使用依赖（N-P3-22）*
 
@@ -851,8 +949,8 @@ _running=False
 
 *基础（D1 是其余全部核对的前置条件）*
 
-- [ ] **`python -m pytest -q` 返回 0**。这是第一个要达成、也是每次改动后都要复查的条件；在它变绿之前，下面所有运行检查点都无法证伪。
-- [ ] `python -m compileall -q .`，确认没有语法错误。
+- [x] **`python -m pytest -q` 返回 0**。这是第一个要达成、也是每次改动后都要复查的条件；在它变绿之前，下面所有运行检查点都无法证伪。
+- [x] `python -m compileall -q .`，确认没有语法错误。
 - [ ] 若环境可用，安装并运行 `ruff check --select F,E,W --ignore E501,E402 *.py`；不可用时记录环境限制（本轮审查环境即缺少该工具）。
 - [ ] 为 A6 的 VAD 不变式、B6 的短句去重、C5 的 i18n 键一致性各补一条单测。
 - [ ] 在只装 CI 声明依赖的干净环境中确认 `pytest -q` 无收集失败。
@@ -937,7 +1035,7 @@ _running=False
 | C5 | N-P2-4, N-P2-16, N-P3-4, N-P3-8, N-P3-15, N-P3-18 | `main.py`, `mlx_service.py`, `control_panel.py`, `i18n.py`, `i18n/*.yaml`, `subtitle_overlay.py` | `tests/` | 不提高 `_max_messages`；不给 `mlx_service` 新增 UI 依赖 |
 | C6 | N-P2-18 | `control_panel.py` | 无 | 不改缓存条目计算与展示格式 |
 | C7 | N-P2-22, N-P2-23, N-P3-21, N-P3-22 | `requirements.txt`, `requirements-mac.txt`, `tests/test_requirements.py` | `main.py`（ImportError 降级）、安装脚本注释 | 不改安装脚本的执行顺序 |
-| D1 | N-P1-10, N-P1-11, N-P1-12, N-P3-23 | `start.bat`, `.github/workflows/release.yml`, `tests/test_requirements.py` | `translator.py`（惰性导入方案） | 不改产物命名与 tag 触发条件 |
+| D1 | N-P1-10, N-P1-11, N-P1-12, N-P1-14, N-P3-23 | `start.bat`, `.github/workflows/release.yml`, `tests/test_requirements.py` | `translator.py`（惰性导入方案） | 不改产物命名与 tag 触发条件 |
 
 ## 9. 回滚和失败处理
 
@@ -950,6 +1048,35 @@ _running=False
 
 ## 10. 执行记录
 
-| 任务 | 改动文件 | 复用入口/保持不变的契约 | 运行核对结果 | 未完成/环境限制 |
+实施分支：`fix/static-audit-2026-08`（基线 `cbd3a53`）。测试数 81 → 104，全部通过。
+
+### 已完成
+
+| 任务 | 覆盖问题 | 改动文件 | 复用入口 / 保持不变的契约 | 运行核对结果 |
 |---|---|---|---|---|
-| 待填写 | 待填写 | 待填写 | 待填写 | 待填写 |
+| D1 | N-P1-10, N-P1-11, N-P1-12, N-P1-14, N-P3-23 | `start.bat`, `translator.py`, `.github/workflows/release.yml`, `tests/test_requirements.py` | 采用方案 B（惰性导入）；产物命名与 tag 触发条件未变 | `pytest -q` 由 1 failed 转为全绿；临时移除 `needs` 后新断言确实失败、恢复后通过；屏蔽 openai/httpx 后 `translator`/`mlx_service` 仍可导入 |
+| A1 | P1-1 | `main.py` | 新增 `validate_asr_result` 实现 §2.1；Pipe 协议与 VAD 未动 | 契约测试 16 项通过；`result["text"]`/`result["language"]` 直接下标已全部消除 |
+| A2 | P1-2 | `asr_remote.py`, `main.py` | `RemoteASRError` 并入既有 `_recover_asr_worker` 路径；二进制协议未动 | HTTP 500 → 抛 `RemoteASRError`；合法空文本 → 仍返回 `None` |
+| A5 | P1-3, N-P1-2 | `audio_capture_sck.py`, `main.py` | 与同文件 `set_mic_device` 的相等性短路写法一致；未新增音频回退 | 3 项新测试：同名不重启、失败恢复旧设备、恢复也失败则明确 stopped |
+| A6 | N-P1-1 | `main.py`, `vad_processor.py` | 锁仍归 `LiveTranslateApp._vad_lock`；阈值与切分算法未动 | `_reset()` 不变式测试通过；`main.py` 中 VAD 写操作已全部在锁内 |
+| B5 | N-P1-5 | `main.py`, `i18n/*.yaml` | 新增 `TranslationUnavailable` 与 `_finalize_untranslated`；未合并 `_process_segment*` | 冒烟验证两条路径：可见失败写 transcript + overlay，退出中失败只写 transcript |
+| C5（部分） | N-P2-16, N-P3-15 | `i18n.py` | `t()` 缺键仍返回 key，不抛异常 | 中英键集合一致性测试通过；`getdefaultlocale` 废弃警告消失；四种 locale 环境下探测结果与旧实现一致 |
+| C7（主体） | N-P2-22, N-P2-23, N-P3-21 | `requirements.txt`, `requirements-mac.txt`, `main.py` | 安装脚本执行顺序未动（yasbd-lib 变为幂等冗余安装） | 分句器 ImportError 降级为不分句；全量测试通过 |
+| 计划外 | CLAUDE.md 文档漂移 | `CLAUDE.md` | — | 补齐 17 个未记录模块（3058 行）、双平台运行方式、ruff 实际不可用、changelog 约定 |
+| 计划外 | 用户可见变更未记 changelog | `i18n/CHANGELOG_zh.md`, `i18n/CHANGELOG_en.md` | 沿用既有 `## YYYY-MM-DD` 格式 | 中英各 8 条，条目数一致 |
+
+### 实施中新发现（审查未抓到）
+
+| 问题 | 位置 | 处理 |
+|---|---|---|
+| **第四个 CI 缺陷**：`test_gigaam_cache_is_hf_snapshot_only` 依赖「silero-vad 恰好已安装」，CI 未装该包时 `get_missing_models` 返回 `['Silero VAD']`，断言 `== []` 必然失败 | `tests/test_m2_platform.py:125` | 已修：monkeypatch `_has_silero_pkg`，使测试不依赖环境。已直接构造场景验证该假设 |
+| `_process_interim_final` 的语言回退现有两份 | `main.py` | **刻意保留**：早返分支绕过噪声过滤，否则缓冲的短应答（≤8 字符）会在 ≥2 秒片段里被当噪声丢弃。已属 B6 范围 |
+
+### 未完成 / 环境限制
+
+- **剩余 19 个任务未动**，其中 P1：A7（`ASRClient` 锁分离，A3 的前置）、A3（有界停止）、A8（MLX 生命周期，9 项问题）、A4（Windows 读循环）、B6（增量 ASR 去重）。
+- **C5 未完成部分**：N-P2-4、N-P3-8、N-P3-18（硬编码文案）与 N-P3-4（导出截断提示）。
+- **C7 未完成部分**：N-P3-22（`pyannote-audio`/`torchcodec` 是否为必需传递依赖未能核实，已加注释标记待验证）；双向对称性断言未补。
+- **环境限制**：沙箱无网络，无法建立「仅 numpy + pytest + yasbd-lib」的干净虚拟环境做端到端 CI 验证。曾用元路径拦截器近似，但其语义与真实缺包有偏差两次（异常类型、`find_spec` 返回值），silero 一处改用直接构造场景才确认。**D1「CI 能收集并运行全部测试」的结论需推分支跑一次才能证实。**
+- **未实机运行**：macOS 设备切换、MLX 服务、下载对话框、远程 ASR 服务均未在真实环境验证，结论基于源码与单元测试。
+- 改动尚未提交。
