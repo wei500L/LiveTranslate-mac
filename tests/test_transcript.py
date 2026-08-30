@@ -175,6 +175,51 @@ def test_the_metadata_sidecar_describes_the_session(tmp_path):
     assert meta["target_language"] == "en"
 
 
+def test_a_restarted_session_starts_from_a_clean_slate(tmp_path, monkeypatch):
+    """The app stops and restarts the pipeline with the same writer instance.
+    close() used to keep the counters, speech time and session info, so the
+    second meeting's sidecar and footer reported the first meeting's totals
+    and engine."""
+    import transcript_writer as tw
+    from datetime import datetime as real_datetime, timedelta
+
+    # A clock that advances 90s per now() call: two sessions opened from the
+    # same instance land on different timestamps instead of merging.
+    clock = {"t": real_datetime(2026, 1, 1, 9, 0, 0)}
+
+    class FakeDatetime(real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            clock["t"] += timedelta(seconds=90)
+            return clock["t"]
+
+    monkeypatch.setattr(tw, "datetime", FakeDatetime)
+
+    writer = _writer(tmp_path)
+    writer.set_session_info(asr_engine="whisper")
+    writer.write_original(1, "10:00:00", "hello", duration=1.5)
+    writer.write_translation(1, "你好")
+    writer.write_original(2, "10:00:05", "world", duration=1.5)
+    writer.finalize_no_translation(2)
+    writer.close()
+
+    writer.set_enabled(True)  # what a restart does
+    writer.write_original(10, "11:00:00", "second session", duration=1.0)
+    writer.finalize_no_translation(10)
+    writer.close()
+
+    sessions = read_session_meta(tmp_path)
+    assert len(sessions) == 2
+    second = sessions[0]  # newest first
+    assert second["entries"] == 1
+    assert second["speech_seconds"] == 1.0
+    assert second["translated"] == 0
+    assert "asr_engine" not in second  # the first session's engine must not leak
+
+    footer = (tmp_path / f"livetrans_{second['session']}_all.txt").read_text("utf-8")
+    assert "1 entries" in footer
+
+
 def test_disabled_writer_records_nothing(tmp_path):
     writer = TranscriptWriter(tmp_path)
     writer.set_enabled(False)

@@ -286,6 +286,12 @@ class TranscriptWriter:
             self._done.clear()
             self._order.clear()
             self._opened = False
+            # The writer outlives the session (the app stops and restarts with
+            # the same instance), so per-session state must not leak into the
+            # next one's counts, footer or sidecar.
+            self._counts = {"entries": 0, "translated": 0, "untranslated": 0}
+            self._speech_seconds = 0.0
+            self._info = {}
 
     def _write_summary_footer_locked(self):
         summary = self._summary_locked()

@@ -814,9 +814,26 @@ class DragHandle(QWidget):
         else:
             self.start_clicked.emit()
 
+    # Amber for paused, green for subtitle-on. These states used to be built
+    # with .replace() against strings that were no longer in _BTN_CSS, which
+    # silently produced the default stylesheet — a paused overlay and an
+    # enabled subtitle button were indistinguishable from their normal state
+    # (the subtitle button's text never changes, so the color was the only
+    # feedback it had).
     _PAUSED_CSS = _BTN_CSS.replace(
-        "rgba(255,255,255,20)", "rgba(220,180,60,50)"
-    ).replace("color: #aaa", "color: #ddb")
+        "rgba(42, 39, 34, 230)", "rgba(94, 70, 30, 235)"
+    ).replace(
+        "rgba(174, 143, 91, 100)", "rgba(231, 185, 111, 160)"
+    ).replace(
+        "color: #e8dfd2", "color: #ffe2ae"
+    )
+    _SUBTITLE_ON_CSS = _BTN_CSS.replace(
+        "rgba(42, 39, 34, 230)", "rgba(38, 74, 46, 235)"
+    ).replace(
+        "rgba(174, 143, 91, 100)", "rgba(140, 200, 150, 150)"
+    ).replace(
+        "color: #e8dfd2", "color: #d6efdb"
+    )
 
     def set_target_language(self, lang: str):
         idx = self._target_lang.findData(lang)
@@ -877,9 +894,7 @@ class DragHandle(QWidget):
 
     def set_subtitle_checked(self, checked: bool):
         self._subtitle_btn.setStyleSheet(
-            _BTN_CSS.replace("rgba(255,255,255,20)", "rgba(80,180,80,40)").replace(
-                "rgba(255,255,255,40)", "rgba(80,180,80,80)"
-            ) if checked else _BTN_CSS
+            self._SUBTITLE_ON_CSS if checked else _BTN_CSS
         )
 
 
@@ -1215,6 +1230,9 @@ class SubtitleOverlay(QWidget):
             self._msg_layout.removeWidget(msg)
             msg.deleteLater()
         self._messages.clear()
+        # Everything before this point was removed on purpose, not rotated
+        # out by the cap — a later export must not claim truncation for it.
+        self._messages_dropped = 0
 
     def _scroll_to_bottom(self):
         if not self._handle.auto_scroll:
@@ -1353,5 +1371,5 @@ class SubtitleOverlay(QWidget):
         self._handle.set_models(models, active_index)
 
     def clear(self):
-        self._messages_dropped = 0
+        # _on_clear does the work; it also resets the drop counter.
         self.clear_signal.emit()
