@@ -28,9 +28,10 @@ jobs:
       - name: Install test dependencies
         # Must cover every module the tests import at collection time. yasbd-lib
         # is here because test_segmentation.py exercises the sentence splitter
-        # directly; translator/mlx_service import openai+httpx lazily so their
+        # directly, and PyYAML because the i18n and config tests parse the YAML
+        # files; translator/mlx_service import openai+httpx lazily so their
         # pure-logic tests need no network stack.
-        run: python -m pip install --disable-pip-version-check "numpy>=1.24,<2.3" pytest "yasbd-lib>=0.15,<1.0"
+        run: python -m pip install --disable-pip-version-check "numpy>=1.24,<2.3" pytest "yasbd-lib>=0.15,<1.0" "PyYAML>=6.0"
       - name: Run offline platform tests
         run: python -m pytest -q
       - name: Check shell scripts

@@ -130,6 +130,34 @@ class RepetitionError(Exception):
     pass
 
 
+def stream_option_errors() -> tuple:
+    """Exception types that mean "this server rejected a request parameter".
+
+    Kept lazy for the same reason make_openai_client is: the offline test job
+    has neither openai nor httpx installed. Connection, timeout and auth errors
+    are deliberately excluded — retrying those doubles the cost of every failed
+    sentence and hides the real cause.
+    """
+    types = [TypeError]
+    try:
+        from openai import BadRequestError, UnprocessableEntityError
+
+        types += [BadRequestError, UnprocessableEntityError]
+    except Exception:  # pragma: no cover - openai absent in the offline job
+        pass
+    return tuple(types)
+
+
+_STREAM_OPTION_ERRORS_CACHE = None
+
+
+def _stream_option_errors() -> tuple:
+    global _STREAM_OPTION_ERRORS_CACHE
+    if _STREAM_OPTION_ERRORS_CACHE is None:
+        _STREAM_OPTION_ERRORS_CACHE = stream_option_errors()
+    return _STREAM_OPTION_ERRORS_CACHE
+
+
 _OVERRIDE_KEYS = (
     "temperature",
     "top_p",
@@ -385,10 +413,7 @@ class Translator:
             result = self._translate_streaming(system_prompt, text)
         else:
             result = self._translate_sync(system_prompt, text)
-        if self._check_repetition(result):
-            raise RepetitionError(result)
-        self._append_history(text, result)
-        return result
+        return self._finalize(text, result)
 
     def translate_iter(self, text: str, source_language: str = "en"):
         """Generator that yields accumulated partial text, then final result.
@@ -401,24 +426,69 @@ class Translator:
         system_prompt = self._build_system_prompt(source_language)
         if not self._streaming:
             result = self._translate_sync(system_prompt, text)
-            self._append_history(text, result)
-            yield result
+            yield self._finalize(text, result)
             return
 
-        # Streaming path
-        self._last_prompt_tokens = 0
-        self._last_completion_tokens = 0
+        chunks = []
+        for partial in self._stream_chunks(system_prompt, text):
+            chunks.append(partial)
+            if not self._json_response:
+                yield "".join(chunks)
+        yield self._finalize(text, self._collect(chunks))
+
+    def _finalize(self, source_text: str, result: str) -> str:
+        """The single exit for every translation result.
+
+        translate() and translate_iter() used to end differently: the streaming
+        generator's non-streaming branch skipped _warn_if_thinking_burned and
+        _check_repetition entirely, so flipping the streaming toggle silently
+        changed whether repeated output was detected at all.
+        """
+        self._warn_if_thinking_burned(result)
+        if self._check_repetition(result):
+            raise RepetitionError(result)
+        self._append_history(source_text, result)
+        return result
+
+    def _collect(self, chunks) -> str:
+        result = "".join(chunks).strip()
+        if self._json_response:
+            result = self._extract_json_translation(result)
+        return result
+
+    def _open_stream(self, system_prompt, text):
+        """Start a streaming request, degrading only on parameter rejection.
+
+        A bare `except Exception` here retried every failure — including a
+        connection error or a timeout — so an unreachable endpoint cost two full
+        timeouts per sentence instead of one.
+        """
         base_kwargs = self._build_request_kwargs(system_prompt, text, stream=True)
         try:
-            stream = self._client.chat.completions.create(
+            return self._client.chat.completions.create(
                 **base_kwargs,
                 stream_options={"include_usage": True},
             )
-        except Exception:
-            stream = self._client.chat.completions.create(**base_kwargs)
+        except Exception as exc:
+            # The exception classes are resolved lazily because openai is not
+            # installed in the offline test environment.
+            if not isinstance(exc, _stream_option_errors()):
+                raise
+            log.debug(
+                "Server rejected stream_options (%s); retrying without it", exc
+            )
+            return self._client.chat.completions.create(**base_kwargs)
 
+    def _stream_chunks(self, system_prompt, text):
+        """Yield content deltas from one streaming response.
+
+        Shared by translate_iter and _translate_streaming; keeping two copies of
+        this loop is how they drifted apart in the first place.
+        """
+        self._last_prompt_tokens = 0
+        self._last_completion_tokens = 0
+        stream = self._open_stream(system_prompt, text)
         deadline = time.monotonic() + self._timeout
-        chunks = []
         for chunk in stream:
             if time.monotonic() > deadline:
                 stream.close()
@@ -428,20 +498,11 @@ class Translator:
             if hasattr(chunk, "usage") and chunk.usage:
                 self._last_prompt_tokens = chunk.usage.prompt_tokens or 0
                 self._last_completion_tokens = chunk.usage.completion_tokens or 0
+            # A usage-only frame carries no choices at all.
             if chunk.choices:
                 delta = chunk.choices[0].delta
                 if delta.content:
-                    chunks.append(delta.content)
-                    if not self._json_response:
-                        yield "".join(chunks)
-        result = "".join(chunks).strip()
-        if self._json_response:
-            result = self._extract_json_translation(result)
-        self._warn_if_thinking_burned(result)
-        if self._check_repetition(result):
-            raise RepetitionError(result)
-        self._append_history(text, result)
-        yield result
+                    yield delta.content
 
     def _extract_json_translation(self, raw: str) -> str:
         """Extract translation from JSON response, fallback to raw text."""
@@ -463,13 +524,44 @@ class Translator:
                 f"provider in the model edit dialog (current: {self._thinking_style})"
             )
 
+    # A loop has to fill at least this much of the tail before we call it one.
+    _REPETITION_TAIL = 120
+    _REPETITION_MIN_CYCLES = 3
+
     @staticmethod
     def _check_repetition(text: str) -> bool:
-        """Detect repetition loops in model output."""
+        """Detect repetition loops in model output.
+
+        Two checks, both bounded so this stays cheap on the real-time path:
+
+        1. The original prefix check — the output starts by saying the same
+           thing twice.
+        2. A tail check — a model that produced a sane opening and then fell
+           into a loop repeats a short period over the last _REPETITION_TAIL
+           characters. The prefix check alone missed that entirely.
+        """
         if not text or len(text) < 40:
             return False
         for plen in range(8, len(text) // 2 + 1):
             if text[plen:plen * 2] == text[:plen]:
+                return True
+        return Translator._tail_is_periodic(text)
+
+    @staticmethod
+    def _tail_is_periodic(text: str) -> bool:
+        tail = text[-Translator._REPETITION_TAIL:]
+        # Need room for the minimum pattern repeated the minimum number of times.
+        max_period = len(tail) // Translator._REPETITION_MIN_CYCLES
+        if max_period < 8:
+            return False
+        for period in range(8, max_period + 1):
+            span = period * Translator._REPETITION_MIN_CYCLES
+            window = tail[-span:]
+            pattern = window[:period]
+            if all(
+                window[i:i + period] == pattern
+                for i in range(period, span, period)
+            ):
                 return True
         return False
 
@@ -484,38 +576,7 @@ class Translator:
         result = (resp.choices[0].message.content or "").strip()
         if self._json_response:
             result = self._extract_json_translation(result)
-        self._warn_if_thinking_burned(result)
         return result
 
     def _translate_streaming(self, system_prompt, text):
-        self._last_prompt_tokens = 0
-        self._last_completion_tokens = 0
-        base_kwargs = self._build_request_kwargs(system_prompt, text, stream=True)
-        try:
-            stream = self._client.chat.completions.create(
-                **base_kwargs,
-                stream_options={"include_usage": True},
-            )
-        except Exception:
-            stream = self._client.chat.completions.create(**base_kwargs)
-
-        deadline = time.monotonic() + self._timeout
-        chunks = []
-        for chunk in stream:
-            if time.monotonic() > deadline:
-                stream.close()
-                raise TimeoutError(
-                    f"Translation exceeded {self._timeout}s total timeout"
-                )
-            if hasattr(chunk, "usage") and chunk.usage:
-                self._last_prompt_tokens = chunk.usage.prompt_tokens or 0
-                self._last_completion_tokens = chunk.usage.completion_tokens or 0
-            if chunk.choices:
-                delta = chunk.choices[0].delta
-                if delta.content:
-                    chunks.append(delta.content)
-        result = "".join(chunks).strip()
-        if self._json_response:
-            result = self._extract_json_translation(result)
-        self._warn_if_thinking_burned(result)
-        return result
+        return self._collect(list(self._stream_chunks(system_prompt, text)))

@@ -146,6 +146,25 @@ mlx_service_running: "HY-MT 本地服务运行中"
 mlx_service_stopped: "HY-MT 已部署，可手动启动本地服务"
 mlx_service_starting: "正在启动 HY-MT 本地服务..."
 mlx_service_preparing: "正在准备 HY-MT 本地模型..."
+mlx_checking_env: "检查 MLX 运行环境..."
+mlx_creating_venv: "创建 MLX 虚拟环境..."
+mlx_model_already_ready: "HY-MT 4-bit 模型已准备好。"
+mlx_downloading: "从 ModelScope 下载 {repo}..."
+mlx_converting: "转换为 MLX 4-bit 模型..."
+mlx_model_ready: "HY-MT 4-bit 模型准备完成。"
+mlx_waiting_for_model: "正在等待 HY-MT 服务加载模型..."
+mlx_stopping_for_prepare: "正在停止 HY-MT 服务以替换模型..."
+mlx_stop_before_prepare: "HY-MT 服务仍在运行，无法替换模型目录。请先停止服务再重试。"
+mlx_requires_apple_silicon: "HY-MT 需要原生 Apple Silicon macOS。"
+mlx_model_not_deployed: "HY-MT 模型尚未部署：{path}。请在翻译设置中点击\u2018准备本地模型\u2019。"
+mlx_env_not_installed: "MLX 运行环境尚未安装：{path}。请在翻译设置中点击\u2018准备本地模型\u2019。"
+mlx_port_occupied: "端口 {port} 被非 MLX 服务占用，已拒绝终止该进程。"
+mlx_service_exited: "MLX 服务退出，退出码 {code}。"
+mlx_start_timeout: "等待 MLX 服务启动超时：{url}"
+mlx_command_failed: "命令执行失败（退出码 {code}）：{command}"
+mlx_replace_failed: "无法删除旧模型目录 {path}：{error}"
+mlx_restart_gave_up: "HY-MT 本地服务多次重启失败，已停止自动重试。请在设置中手动启动。"
+mlx_status_checking: "正在检查 HY-MT 状态..."
 btn_restore_default: "恢复默认"
 btn_apply_prompt: "应用提示词"
 group_timeout: "模型连接超时"
@@ -185,6 +204,12 @@ dialog_delete_msg: >-
   设置将被保留，所需模型将在下次启动时重新下载。
 
   是否继续？
+cache_stopping: "正在停止后台任务..."
+cache_deleting: "正在删除模型缓存..."
+cache_delete_failed: >-
+  以下路径删除失败：
+
+  {paths}
 
 # 对话框
 window_setup: "LiveTranslate - 初始设置"
@@ -196,6 +221,9 @@ btn_start_download: "开始下载"
 btn_retry: "重试"
 download_failed: "下载失败: {error}"
 download_complete: "下载完成！"
+btn_cancel: "取消"
+download_cancelling: "正在取消下载..."
+download_cancelled: "下载已取消"
 setup_api_hint: "模型下载完成！接下来请配置翻译 API。\n\n需要填写 API 地址、密钥和模型名称。\n推荐使用 DeepSeek（便宜好用）。"
 setup_api_title: "配置翻译 API"
 window_download: "LiveTranslate - 下载模型"
@@ -264,6 +292,18 @@ override_enable: "覆盖"
 override_hint: "未勾选时使用服务端默认值或全局配置"
 loading_model: "正在加载 {name}...\n请稍候。"
 error_title: "错误"
+error_mlx_not_running: >-
+  HY-MT 本地服务尚未启动。
+
+  请在\u2018翻译\u2019设置中的模型配置区域手动启动本地服务后再选择此模型。
+ui_lang_restart_required: "语言已更改，请重启应用程序。"
+export_no_transcript: "(本次会话没有转录文件)"
+export_truncated: >-
+  仅导出了最近 {count} 条消息（界面只保留这么多）。
+
+  完整记录见：
+
+  {paths}
 error_load_asr: "ASR 模型加载失败:\n{error}"
 error_audio_start: "音频采集启动失败:\n{error}"
 error_screen_permission: "需要屏幕录制权限。请在‘系统设置 > 隐私与安全性 > 屏幕录制’中允许 LiveTranslate，然后重启应用。"

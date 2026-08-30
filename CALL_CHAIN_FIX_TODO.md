@@ -7,8 +7,8 @@
 **覆盖范围**：两轮审查共 **72 项**问题（第一轮 13 项全部未修，第二轮新增 59 项），实施阶段又新发现
 **1 项**（N-P1-14），合计 **73 项**，归并为 **27 个任务**（D1 + A1~A10 + B1~B9 + C1~C7）。
 
-**当前进度**：6 个任务完整完成（D1、A1、A2、A5、A6、B5），2 个部分完成（C5、C7），19 个未开始。
-详见 §10 执行记录。实施分支 `fix/static-audit-2026-08`，测试 81 → 104 全绿，尚未提交。
+**当前进度**：**27 个任务全部完成**。详见 §10 执行记录。测试 81 → 190 全绿（另有 1 项在未安装
+FastAPI 的环境下 skip）。第二阶段（A3、A4、A7~A10、B1~B4、B6~B9、C1~C7 余项）在 `main` 上继续实施。
 
 **归并原则**：多项问题落在同一函数上时合并为一个任务，避免同一处代码被两次修改且意图冲突。受影响的合并点：
 
@@ -203,18 +203,16 @@ _running=False
 | **0** | **D1** | ✅ | **前置条件**。当时 `pytest -q` 就是失败的（`start.bat` 文案回归），CI 又装不全依赖、且发布不受测试门禁约束。没有可信的绿色基线，后面 26 个任务的「运行检查点」全都无法证伪。实施中还暴露出第 4 个 CI 缺陷（N-P1-14）。 |
 | 1 | **A6、A5** | ✅ | 两者都由 `_on_settings_changed` 触发，是日常使用中最高频的故障路径，改动局部、风险低。 |
 | 2 | **A1、A2、B5** | ✅ | 统一 ASR/翻译的结果契约与失败可见性，消除「静默无输出」这一最难排查的故障类别。 |
-| — | **C7** | 🔶 | 提前做了主体：它是 A1 的具体触发器（缺 `yasbd-lib` 会杀 ASR 线程）。`pyannote` 归属与双向对称断言仍待办。 |
-| — | **C5** | 🔶 | 提前做了 i18n 健壮性（`set_lang` 异常保护、废弃 API、缺键日志）。硬编码文案与导出提示仍待办。 |
-| **3** | **A7、A3** | ⬜ **下一步** | 一并重做停止/切换协议：锁分离 + 有界等待 + 单一退出入口。**A7 必须先于 A3**。 |
-| 4 | **A8** | ⬜ | MLX 生命周期与状态查询。同时消除 5 秒轮询的资源消耗、约 2 秒 UI 冻结、一处对运行中目录的 `rmtree`，以及设置面板卡死不可关闭的连锁反应。 |
-| 5 | **A4、A9、A10** | ⬜ | 采集读循环、下载对话框、后端错误契约——三处都属于「失败后静默降级」。 |
-| 6 | **B6** | ⬜ | 增量 ASR 短句去重，直接影响字幕正确性。 |
-| 7 | **B1 ~ B4、B7 ~ B9** | ⬜ | 翻译请求语义、计数、启动状态与字幕渲染。 |
-| 8 | **C1 ~ C4、C6**，及 C5/C7 余项 | ⬜ | 配置边界、服务暴露面、文案与可维护性收尾。 |
+| **3** | **A7、A3** | ✅ | 一并重做停止/切换协议：锁分离 + 有界等待 + 单一退出入口。A7 先于 A3 完成。B3 因与 A3 共用 `main()` 的退出/启动闭包，一并处理。 |
+| 4 | **A8** | ✅ | MLX 生命周期与状态查询。状态查询全部移入后台线程，取消在静默期同样生效，不再删除运行中的模型目录。 |
+| 5 | **A4、A9、A10** | ✅ | 采集读循环、下载对话框、后端错误契约。A4 与 A10 共同确立 `get_audio()` 的三态契约。 |
+| 6 | **B6** | ✅ | 增量 ASR 短句去重与密度丢弃后的状态复位。 |
+| 7 | **B1 ~ B4、B7 ~ B9** | ✅ | 翻译请求语义、计数、启动状态与字幕渲染。 |
+| 8 | **C1 ~ C4、C6**，及 C5/C7 余项 | ✅ | 配置边界、服务暴露面、文案与可维护性收尾。 |
 
-依赖约束：
+依赖约束（均已满足，保留以记录顺序理由）：
 
-- ~~**D1 先于一切**~~：已完成，基线已绿（104 项测试通过）。但其「CI 能收集并运行全部测试」一条**尚未在真实 CI 上证实**——沙箱无网络，建不了干净虚拟环境，需推分支跑一次。
+- ~~**D1 先于一切**~~：已完成，基线已绿（190 项测试通过）。「CI 能收集并运行全部测试」一条现已**在等价环境中证实**——见 §10「CI 等价环境验证」。
 - A1 先建立统一结果契约，A2 的错误分类依赖它。
 - **A7 必须先于 A3 完成**：A3 要求 `stop()` 有界，而当前无界等待正来自 `ASRClient` 的单锁设计。
 - **A8 的取消修复先于 N-P2-19 的验证**：设置面板卡死是取消无效的直接后果，不是独立缺陷。
@@ -315,7 +313,7 @@ CI 不安装 silero-vad，因此该调用返回 `['Silero VAD']`，断言必然�
 
 ### A3｜有界停止与统一退出入口（P1-5、P1-6、N-P1-6、N-P2-3、N-P3-5）
 
-**状态**：⬜ 未开始
+**状态**：✅ 已完成
 
 
 **涉及文件**：`main.py`、`control_panel.py`。
@@ -356,7 +354,7 @@ CI 不安装 silero-vad，因此该调用返回 `['Silero VAD']`，断言必然�
 
 ### A4｜Windows 采集读循环：队列背压、重启失败与持锁阻塞（P1-4、N-P2-21、N-P3-20）
 
-**状态**：⬜ 未开始
+**状态**：✅ 已完成
 
 
 **涉及文件**：`audio_capture.py`；必要时只在 `audio_capture_base.py` 增加最小共享 helper。
@@ -439,7 +437,7 @@ CI 不安装 silero-vad，因此该调用返回 `['Silero VAD']`，断言必然�
 
 ### A7｜ASRClient 锁分离与状态保真（N-P1-4、N-P2-5）
 
-**状态**：⬜ 未开始
+**状态**：✅ 已完成
 
 
 **涉及文件**：`asr_client.py`；调用侧核对 `main.py`。
@@ -469,7 +467,7 @@ CI 不安装 silero-vad，因此该调用返回 `['Silero VAD']`，断言必然�
 
 ### A8｜MLX 服务生命周期与状态查询（N-P1-7、N-P1-8、N-P1-13、N-P2-6、N-P2-7、N-P2-8、N-P2-9、N-P2-19、N-P3-9）
 
-**状态**：⬜ 未开始
+**状态**：✅ 已完成
 
 
 **涉及文件**：`mlx_service.py`、`control_panel.py`、`main.py`。
@@ -510,7 +508,7 @@ CI 不安装 silero-vad，因此该调用返回 `['Silero VAD']`，断言必然�
 
 ### A9｜下载对话框：线程化、可取消与全局状态恢复（N-P1-9、N-P2-10、N-P3-10、N-P3-11、N-P3-12）
 
-**状态**：⬜ 未开始
+**状态**：✅ 已完成
 
 
 **涉及文件**：`dialogs.py`。
@@ -533,7 +531,7 @@ CI 不安装 silero-vad，因此该调用返回 `['Silero VAD']`，断言必然�
 
 ### A10｜采集后端错误契约统一（N-P2-15、N-P3-14）
 
-**状态**：⬜ 未开始
+**状态**：✅ 已完成
 
 
 **涉及文件**：`audio_capture_pyaudio.py`；对照 `audio_capture_sck.py`、`audio_capture_base.py`。
@@ -555,7 +553,7 @@ CI 不安装 silero-vad，因此该调用返回 `['Silero VAD']`，断言必然�
 
 ### B1｜翻译结果收口统一（P2-1、N-P2-2、N-P3-2）
 
-**状态**：⬜ 未开始
+**状态**：✅ 已完成
 
 
 **涉及文件**：`translator.py`。
@@ -588,7 +586,7 @@ CI 不安装 silero-vad，因此该调用返回 `['Silero VAD']`，断言必然�
 
 ### B2｜Benchmark 与运行时请求等价，并消除其崩溃路径（P2-3、N-P2-11、N-P2-12、N-P2-13）
 
-**状态**：⬜ 未开始
+**状态**：✅ 已完成
 
 
 **涉及文件**：`benchmark.py`；必要时 `translator.py`。
@@ -613,7 +611,7 @@ CI 不安装 silero-vad，因此该调用返回 `['Silero VAD']`，断言必然�
 
 ### B3｜延迟启动与暂停竞态（P2-6）
 
-**状态**：⬜ 未开始
+**状态**：✅ 已完成
 
 
 **涉及文件**：`main.py`。
@@ -629,7 +627,7 @@ CI 不安装 silero-vad，因此该调用返回 `['Silero VAD']`，断言必然�
 
 ### B4｜字幕最短显示时间 FIFO（P2-5）
 
-**状态**：⬜ 未开始
+**状态**：✅ 已完成
 
 
 **涉及文件**：`subtitle_window.py`。
@@ -669,7 +667,7 @@ CI 不安装 silero-vad，因此该调用返回 `['Silero VAD']`，断言必然�
 
 ### B6｜增量 ASR 短句缓冲去重（N-P1-3、N-P3-6）
 
-**状态**：⬜ 未开始
+**状态**：✅ 已完成
 
 
 **涉及文件**：`main.py`；关联 `vad_processor.py` 的密度丢弃路径。
@@ -695,7 +693,7 @@ CI 不安装 silero-vad，因此该调用返回 `['Silero VAD']`，断言必然�
 
 ### B7｜翻译并发计数与线程数收口（N-P2-1、N-P3-1）
 
-**状态**：⬜ 未开始
+**状态**：✅ 已完成
 
 
 **涉及文件**：`main.py`。
@@ -719,7 +717,7 @@ CI 不安装 silero-vad，因此该调用返回 `['Silero VAD']`，断言必然�
 
 ### B8｜字幕窗口渲染与重建（N-P2-17、N-P3-16、N-P3-17）
 
-**状态**：⬜ 未开始
+**状态**：✅ 已完成
 
 
 **涉及文件**：`subtitle_window.py`。
@@ -748,7 +746,7 @@ CI 不安装 silero-vad，因此该调用返回 `['Silero VAD']`，断言必然�
 
 ### B9｜字幕设置的状态隔离（N-P2-20、N-P3-19）
 
-**状态**：⬜ 未开始
+**状态**：✅ 已完成
 
 
 **涉及文件**：`subtitle_settings.py`。
@@ -768,7 +766,7 @@ CI 不安装 silero-vad，因此该调用返回 `['Silero VAD']`，断言必然�
 
 ### C1｜active_model 删除和运行时切换（P2-2、N-P3-7）
 
-**状态**：⬜ 未开始
+**状态**：✅ 已完成
 
 
 **涉及文件**：`control_panel.py`，联动检查 `main.py` 的 `model_changed` 接收路径。
@@ -791,7 +789,7 @@ CI 不安装 silero-vad，因此该调用返回 `['Silero VAD']`，断言必然�
 
 ### C2｜远程 ASR 服务：配置入口与暴露面（P2-4、N-P2-14、N-P3-13）
 
-**状态**：⬜ 未开始
+**状态**：✅ 已完成
 
 
 **涉及文件**：`asr_server.py`，必要时 `REMOTE_ASR.md`。
@@ -820,7 +818,7 @@ CI 不安装 silero-vad，因此该调用返回 `['Silero VAD']`，断言必然�
 
 ### C3｜FunASR-Nano 原始错误保真（P3-1）
 
-**状态**：⬜ 未开始
+**状态**：✅ 已完成
 
 
 **涉及文件**：`funasr_nano/model.py`。
@@ -836,7 +834,7 @@ CI 不安装 silero-vad，因此该调用返回 `['Silero VAD']`，断言必然�
 
 ### C4｜ASR worker 请求转发契约（N-P3-3）
 
-**状态**：⬜ 未开始
+**状态**：✅ 已完成
 
 
 **涉及文件**：`asr_worker.py`。
@@ -851,7 +849,7 @@ CI 不安装 silero-vad，因此该调用返回 `['Silero VAD']`，断言必然�
 
 ### C5｜用户可见文案、i18n 健壮性与导出完整性（N-P2-4、N-P2-16、N-P3-4、N-P3-8、N-P3-15、N-P3-18）
 
-**状态**：🔶 部分完成（仅 i18n 健壮性；硬编码文案与导出提示未做）
+**状态**：✅ 已完成
 
 
 **涉及文件**：`main.py`、`mlx_service.py`、`control_panel.py`、`i18n.py`、`i18n/zh.yaml`、`i18n/en.yaml`、`subtitle_overlay.py`。
@@ -883,7 +881,7 @@ CI 不安装 silero-vad，因此该调用返回 `['Silero VAD']`，断言必然�
 
 ### C6｜控制面板后台任务去重（N-P2-18）
 
-**状态**：⬜ 未开始
+**状态**：✅ 已完成
 
 
 **涉及文件**：`control_panel.py`。
@@ -899,7 +897,7 @@ CI 不安装 silero-vad，因此该调用返回 `['Silero VAD']`，断言必然�
 
 ### C7｜依赖声明与平台对称性（N-P2-22、N-P2-23、N-P3-21、N-P3-22）
 
-**状态**：🔶 部分完成（依赖声明已补；pyannote 归属未核实、双向对称断言未补）
+**状态**：✅ 已完成
 
 
 **涉及文件**：`requirements.txt`、`requirements-mac.txt`、`tests/test_requirements.py`；可能涉及安装脚本注释。
@@ -951,14 +949,14 @@ CI 不安装 silero-vad，因此该调用返回 `['Silero VAD']`，断言必然�
 
 - [x] **`python -m pytest -q` 返回 0**。这是第一个要达成、也是每次改动后都要复查的条件；在它变绿之前，下面所有运行检查点都无法证伪。
 - [x] `python -m compileall -q .`，确认没有语法错误。
-- [ ] 若环境可用，安装并运行 `ruff check --select F,E,W --ignore E501,E402 *.py`；不可用时记录环境限制（本轮审查环境即缺少该工具）。
-- [ ] 为 A6 的 VAD 不变式、B6 的短句去重、C5 的 i18n 键一致性各补一条单测。
-- [ ] 在只装 CI 声明依赖的干净环境中确认 `pytest -q` 无收集失败。
+- [ ] 若环境可用，安装并运行 `ruff check --select F,E,W --ignore E501,E402 *.py`；不可用时记录环境限制（本轮实施环境仍缺少该工具，已回退到 compileall + AST 扫描，见 §10）。
+- [x] 为 A6 的 VAD 不变式、B6 的短句去重、C5 的 i18n 键一致性各补一条单测。
+- [x] 在只装 CI 声明依赖的干净环境中确认 `pytest -q` 无收集失败（用符号链接构造的等价 site-packages，见 §10）。
 - [ ] 在只执行 `pip install -r requirements.txt` 的干净环境中启动应用并开启增量 ASR，确认不会静默杀死 ASR 线程。
 
 *存活性与退出*
 
-- [ ] 代码审查确认所有退出入口都经过统一 stop，且没有无限阻塞 `put()`。
+- [x] 代码审查确认所有退出入口都经过统一 stop，且没有无限阻塞 `put()`。
 - [ ] 实际运行中制造一次 ASR 坏结果，确认后续音频仍出字幕。
 - [ ] 停止远程 ASR 服务，确认 UI 显示不可用；恢复服务后确认重新产出。
 - [ ] 在队列拥塞时观察 Windows 采集线程仍继续运行。
@@ -1048,35 +1046,84 @@ CI 不安装 silero-vad，因此该调用返回 `['Silero VAD']`，断言必然�
 
 ## 10. 执行记录
 
-实施分支：`fix/static-audit-2026-08`（基线 `cbd3a53`）。测试数 81 → 104，全部通过。
+第一阶段基线 `cbd3a53`，实施分支 `fix/static-audit-2026-08`（已并入 `main`）。
+第二阶段直接在 `main` 上继续。测试数 81 → 104 → **190**，全部通过。
 
-### 已完成
+### 已完成（27/27）
 
 | 任务 | 覆盖问题 | 改动文件 | 复用入口 / 保持不变的契约 | 运行核对结果 |
 |---|---|---|---|---|
-| D1 | N-P1-10, N-P1-11, N-P1-12, N-P1-14, N-P3-23 | `start.bat`, `translator.py`, `.github/workflows/release.yml`, `tests/test_requirements.py` | 采用方案 B（惰性导入）；产物命名与 tag 触发条件未变 | `pytest -q` 由 1 failed 转为全绿；临时移除 `needs` 后新断言确实失败、恢复后通过；屏蔽 openai/httpx 后 `translator`/`mlx_service` 仍可导入 |
+| D1 | N-P1-10, N-P1-11, N-P1-12, N-P1-14, N-P3-23 | `start.bat`, `translator.py`, `.github/workflows/release.yml`, `tests/test_requirements.py` | 采用方案 B（惰性导入）；产物命名与 tag 触发条件未变 | `pytest -q` 由 1 failed 转为全绿；临时移除 `needs` 后新断言确实失败、恢复后通过；CI 等价环境验证见下 |
 | A1 | P1-1 | `main.py` | 新增 `validate_asr_result` 实现 §2.1；Pipe 协议与 VAD 未动 | 契约测试 16 项通过；`result["text"]`/`result["language"]` 直接下标已全部消除 |
-| A2 | P1-2 | `asr_remote.py`, `main.py` | `RemoteASRError` 并入既有 `_recover_asr_worker` 路径；二进制协议未动 | HTTP 500 → 抛 `RemoteASRError`；合法空文本 → 仍返回 `None` |
-| A5 | P1-3, N-P1-2 | `audio_capture_sck.py`, `main.py` | 与同文件 `set_mic_device` 的相等性短路写法一致；未新增音频回退 | 3 项新测试：同名不重启、失败恢复旧设备、恢复也失败则明确 stopped |
+| A2 | P1-2 | `asr_remote.py`, `main.py` | `RemoteASRError` 并入既有 `_recover_asr_worker` 路径；二进制协议未动 | HTTP 500 → 抛 `RemoteASRError`；合法空文本 → 仍返回 `None`；补做：`unload()` 后 `status` 不再报 `ready`（否则 `_switch_asr_engine` 会复用已关闭的 client） |
+| A3 | P1-5, P1-6, N-P1-6, N-P2-3, N-P3-5 | `main.py`, `control_panel.py`, `i18n/*.yaml` | 停止顺序照 §2.5；`ControlPanel` 不再自行 `QApplication.quit()`（该 import 已移除） | 9 项新测试：顺序、幂等、满队列不阻塞、单步失败不跳过后续、哨兵不被解引用；`aboutToQuit` 降为兜底 |
+| A4 | P1-4, N-P2-21, N-P3-20 | `audio_capture.py`, `audio_capture_base.py` | 新增共享 `enqueue_latest()`（Windows 后端不继承 `AudioCaptureBase`）；采样率/块大小/重启触发条件未动 | 队列竞态测试通过；重启失败改为重试 + 有限次后 `fail_terminally()`；`read()` 移出锁 |
+| A5 | P1-3, N-P1-2 | `audio_capture_sck.py`, `main.py` | 与同文件 `set_mic_device` 的相等性短路写法一致；未新增音频回退 | 3 项测试：同名不重启、失败恢复旧设备、恢复也失败则明确 stopped |
 | A6 | N-P1-1 | `main.py`, `vad_processor.py` | 锁仍归 `LiveTranslateApp._vad_lock`；阈值与切分算法未动 | `_reset()` 不变式测试通过；`main.py` 中 VAD 写操作已全部在锁内 |
-| B5 | N-P1-5 | `main.py`, `i18n/*.yaml` | 新增 `TranslationUnavailable` 与 `_finalize_untranslated`；未合并 `_process_segment*` | 冒烟验证两条路径：可见失败写 transcript + overlay，退出中失败只写 transcript |
-| C5（部分） | N-P2-16, N-P3-15 | `i18n.py` | `t()` 缺键仍返回 key，不抛异常 | 中英键集合一致性测试通过；`getdefaultlocale` 废弃警告消失；四种 locale 环境下探测结果与旧实现一致 |
-| C7（主体） | N-P2-22, N-P2-23, N-P3-21 | `requirements.txt`, `requirements-mac.txt`, `main.py` | 安装脚本执行顺序未动（yasbd-lib 变为幂等冗余安装） | 分句器 ImportError 降级为不分句；全量测试通过 |
-| 计划外 | CLAUDE.md 文档漂移 | `CLAUDE.md` | — | 补齐 17 个未记录模块（3058 行）、双平台运行方式、ruff 实际不可用、changelog 约定 |
-| 计划外 | 用户可见变更未记 changelog | `i18n/CHANGELOG_zh.md`, `i18n/CHANGELOG_en.md` | 沿用既有 `## YYYY-MM-DD` 格式 | 中英各 8 条，条目数一致 |
+| A7 | N-P1-4, N-P2-5 | `asr_client.py`, `asr_remote.py` | 按 §2.6 拆 `_io_lock` / `_state_lock` + `_cancelled`；Pipe 消息语义与 `asr_worker.py` 未动 | 10 项新测试：退出不等待在途请求、忙时直接 terminate、取消中断轮询、句柄关闭竞态、id 失配归入可恢复错误、`terminate()` 无条件置 `failed` |
+| A8 | N-P1-7, N-P1-8, N-P1-13, N-P2-6～9, N-P2-19, N-P3-9 | `mlx_service.py`, `control_panel.py`, `main.py`, `i18n/*.yaml` | 复用既有 `_MLXHealthThread` 模式（§2.9）；HY-MT 转换流程与 `/v1` 协议未动 | 6 项新测试：版本探测按 venv mtime 缓存、服务运行时拒绝替换模型目录、静默子进程可取消、无 `killpg` 平台不抛 `AttributeError`、文案本地化 |
+| A9 | N-P1-9, N-P2-10, N-P3-10～12 | `dialogs.py`, `i18n/*.yaml` | 改用 `QThread` + 信号，与 `_ConnectionTestThread`/`_MLXTaskThread` 同形；下载模型集合与 hub 选择未动 | 10 项新测试：`fileno`/`encoding`/`errors` 齐备、异常与重复恢复、不覆盖他人替换的 stderr、向导默认值取自 `config.yaml` |
+| A10 | N-P2-15, N-P3-14 | `audio_capture_pyaudio.py`, `audio_capture_base.py`, `audio_capture.py` | `get_audio()` 三态契约写入基类 docstring | 8 项新测试；`__del__` 不再做阻塞 join |
+| B1 | P2-1, N-P2-2, N-P3-2 | `translator.py` | 新增 `_finalize()` 单一收口 + `_stream_chunks()` 单一流式循环；生成器接口未变 | 流式/非流式重复检测一致；`stream_options` 回退只捕获参数类异常；尾部复读可检出，实测 0.002ms/次 |
+| B2 | P2-3, N-P2-11～13 | `benchmark.py` | 直接复用 `Translator._build_request_kwargs()` | 6 项新测试：与运行时请求逐字段相等、HY-MT 托管配置、不写 history、回退只针对参数错误 |
+| B3 | P2-6 | `main.py` | 最小取消标志，未引入状态机 | `_is_running` 初值改为 `False`；`on_pause`/`on_quit` 置取消；`start()` 成功后若已被取消则回滚 |
+| B4 | P2-5 | `subtitle_window.py` | 单 timer + FIFO；最大句数与自动隐藏未动 | 4 项新测试：突发按序显示、同时只有一个 timer、clear 后旧 timer 不写入 |
+| B5 | N-P1-5 | `main.py`, `i18n/*.yaml` | 新增 `TranslationUnavailable` 与 `_finalize_untranslated`；未合并 `_process_segment*` | 冒烟验证两条路径；补做：`_translate_extra_langs` 的 `None` 解引用走同一异常 |
+| B6 | N-P1-3, N-P3-6 | `main.py`, `vad_processor.py` | 密度阈值与分句规则未动 | 6 项新测试：同一短句不重复缓冲、缓冲有上限、密度丢弃计数驱动状态复位 |
+| B7 | N-P2-1, N-P3-1 | `main.py` | generation 机制本身未动 | 过期回调改为直接 `return False`；`_on_model_changed` 改走 `_set_translation_workers()` 以复用钳制 |
+| B8 | N-P2-17, N-P3-16, N-P3-17 | `subtitle_window.py` | 断行偏好规则与动画未动 | 换行改二分查找（400 字符从约 8000 次测量降到 < 400）；`apply_settings` 复用 `_rebuild_text_widgets` |
+| B9 | N-P2-20, N-P3-19 | `subtitle_settings.py`, `subtitle_window.py` | 设置字段格式未动 | `get_settings()` 拆为纯读取 + `emit_settings()`；`lines` 逐元素复制，两侧不再共享可变对象 |
+| C1 | P2-2, N-P3-7 | `control_panel.py` | 模型字段格式未动 | 抽出纯函数 `active_index_after_removal()`，7 项测试含穷举属性检查；`_models()` 保证写回持久化对象 |
+| C2 | P2-4, N-P2-14, N-P3-13 | `asr_server.py`, `REMOTE_ASR.md` | `/transcribe` 二进制协议与 GPU lock 未动 | 默认绑定改 `127.0.0.1`；新增 `create_app()`/`lifespan`/可选 token/413 上限；两种入口共用 `default_config()`；模块可在无 FastAPI 环境导入，故离线 CI 也能验证其配置面 |
+| C3 | P3-1 | `funasr_nano/model.py` | 正常推理流程未动 | 加载失败改为 `raise ... from e` 并带输入引用，不再落到 `UnboundLocalError`；`meta_data` 可变默认参数改 `None` |
+| C4 | N-P3-3 | `asr_worker.py` | Pipe 字段与 `recoverable` 语义未动 | 明确转发/忽略并记 debug 日志；签名反射按 engine 实例缓存 |
+| C5 | N-P2-4, N-P2-16, N-P3-4, N-P3-8, N-P3-15, N-P3-18 | `main.py`, `mlx_service.py`, `control_panel.py`, `i18n.py`, `i18n/*.yaml`, `subtitle_overlay.py` | `mlx_service` 仍不依赖 i18n：改为可注入的 `translate` 回调 | AST 扫描全仓 UI 调用中的中文字面量，仅剩 `["English", "中文"]`（语言名按惯例用本族名，非可翻译文案）；导出超过 50 条时提示截断并给出 transcript 路径 |
+| C6 | N-P2-18 | `control_panel.py` | 缓存条目计算与展示格式未动 | 改为 `_CacheScanThread` + `isRunning()` 去重；`threading` 在该文件只剩 `cancel_event` 一处 |
+| C7 | N-P2-22, N-P2-23, N-P3-21, N-P3-22 | `requirements.txt`, `requirements-mac.txt`, `tests/test_requirements.py`, `asr_gigaam.py` | 安装脚本执行顺序未动 | `pyannote-audio`/`torchcodec` 归属已核实（见下）并移除；新增双向对称断言，实测移除 `socksio` 后确实失败 |
+| 计划外 | 见「实施中新发现」 | `audio_capture_sck.py`, `.github/workflows/release.yml`, `tests/*` | — | 三处会让真实 CI 变红的缺陷 |
 
 ### 实施中新发现（审查未抓到）
 
 | 问题 | 位置 | 处理 |
 |---|---|---|
-| **第四个 CI 缺陷**：`test_gigaam_cache_is_hf_snapshot_only` 依赖「silero-vad 恰好已安装」，CI 未装该包时 `get_missing_models` 返回 `['Silero VAD']`，断言 `== []` 必然失败 | `tests/test_m2_platform.py:125` | 已修：monkeypatch `_has_silero_pkg`，使测试不依赖环境。已直接构造场景验证该假设 |
-| `_process_interim_final` 的语言回退现有两份 | `main.py` | **刻意保留**：早返分支绕过噪声过滤，否则缓冲的短应答（≤8 字符）会在 ≥2 秒片段里被当噪声丢弃。已属 B6 范围 |
+| **第四个 CI 缺陷**：`test_gigaam_cache_is_hf_snapshot_only` 依赖「silero-vad 恰好已安装」 | `tests/test_m2_platform.py` | 已修：monkeypatch `_has_silero_pkg` |
+| **第五个 CI 缺陷**：`test_i18n_locales_define_the_same_keys` 等 import `yaml`，但 CI 的依赖清单里没有 PyYAML | `.github/workflows/release.yml` | 已修：CI 依赖补 `PyYAML>=6.0`（i18n 与配置测试确实需要解析 YAML） |
+| **第六个 CI 缺陷**：`_SCKStreamDelegate` 的非 macOS 回退分支从未生效——`_SCKStreamDelegate(self)` 对无 `__init__` 的桩类抛 `takes no arguments`，4 项 SCK 测试只在恰好装了 pyobjc 的机器上通过 | `audio_capture_sck.py:464` | 已修：回退路径改用同样的两步 init（`_SCKStreamDelegate().initWithOwner_(self)`） |
+| `RemoteASREngine.status` 恒返回 `"ready"`，`unload()` 之后仍如此，`_switch_asr_engine` 会复用已关闭的连接 | `asr_remote.py` | 已修：随 A7 的状态保真一并处理 |
+| `_process_interim_final` 的语言回退现有两份 | `main.py` | **刻意保留**：早返分支绕过噪声过滤，否则缓冲的短应答（≤8 字符）会在 ≥2 秒片段里被当噪声丢弃 |
+
+### CI 等价环境验证（D1 最后一项）
+
+沙箱无网络建不了干净虚拟环境，改用**符号链接构造的等价 site-packages**：按
+`importlib.metadata` 解析 CI 声明依赖（numpy / pytest / yasbd-lib / PyYAML）的完整传递闭包，
+只链接这些分发提供的顶层模块，再以 `python -S` + 重写 `sys.path` 运行 `pytest -q`。
+这与元路径拦截器不同——它是**真正的缺包**，`importlib.util.find_spec()` 的返回值语义也正确。
+
+结果：**116 passed, 26 skipped, 0 failed, 0 collection error**。修复前是 6 failed
+（上表中的第五、第六个 CI 缺陷各 1 项和 4 项，加 1 项本轮新写的测试缺 `importorskip`）。
+
+复现方式记录在此，便于下次改动后重跑：链接依赖闭包 → `python -S -c "sys.path = [repo, fake_site] + [非 site-packages 路径]; pytest.main(['-q','tests'])"`。
+
+### `pyannote-audio` / `torchcodec` 归属核实（C7 遗留项）
+
+结论：**不是必需传递依赖，已移除**。依据：
+
+1. `pip show` 显示 `pyannote-audio` 的 `Required-by` 为空；`torchcodec` 仅被 `pyannote-audio` 需要。
+2. GigaAM-v3 的远程代码（`modeling_gigaam.py:283`）只在 `get_pipeline()` 内 import `pyannote.audio`，
+   而 `get_pipeline()` 只被 `transcribe_longform()` 调用。
+3. `asr_gigaam.py` 的 docstring 明确不使用 `transcribe_longform`（worker 只喂 VAD 尺寸的短片段），
+   且该路径还要求 `HF_TOKEN` 环境变量。
+
+移除理由与恢复条件已写进 `requirements-mac.txt` 与 `asr_gigaam.py` 的注释，并有测试防止无理由地重新加入。
 
 ### 未完成 / 环境限制
 
-- **剩余 19 个任务未动**，其中 P1：A7（`ASRClient` 锁分离，A3 的前置）、A3（有界停止）、A8（MLX 生命周期，9 项问题）、A4（Windows 读循环）、B6（增量 ASR 去重）。
-- **C5 未完成部分**：N-P2-4、N-P3-8、N-P3-18（硬编码文案）与 N-P3-4（导出截断提示）。
-- **C7 未完成部分**：N-P3-22（`pyannote-audio`/`torchcodec` 是否为必需传递依赖未能核实，已加注释标记待验证）；双向对称性断言未补。
-- **环境限制**：沙箱无网络，无法建立「仅 numpy + pytest + yasbd-lib」的干净虚拟环境做端到端 CI 验证。曾用元路径拦截器近似，但其语义与真实缺包有偏差两次（异常类型、`find_spec` 返回值），silero 一处改用直接构造场景才确认。**D1「CI 能收集并运行全部测试」的结论需推分支跑一次才能证实。**
-- **未实机运行**：macOS 设备切换、MLX 服务、下载对话框、远程 ASR 服务均未在真实环境验证，结论基于源码与单元测试。
+- **未实机运行**：macOS 设备切换、MLX 服务生命周期、下载对话框取消、远程 ASR 服务、Windows 采集
+  读循环（本机为 macOS）均未在真实环境跑过。结论基于源码审查与单元测试。§7 中标记为「实际运行」
+  的核对项因此仍未勾选。
+- **`ruff` 不可用**：venv 与系统均未安装。回退到 `python -m compileall -q .`（通过）加一个
+  基于 AST 的 F401 扫描，其结果只剩既有的 `# noqa` 标注项、`from __future__ import annotations`
+  和平台条件再导出，无新增。
+- **真实 CI 未跑**：上述等价环境验证覆盖了「能否收集与运行」，但 GitHub Actions 上的
+  `bash -n`、macOS runner 版本差异等仍需推分支确认。
 - 改动尚未提交。

@@ -4,7 +4,8 @@ import queue
 import time
 import sys
 import numpy as np
-from audio_capture_base import CaptureMetrics
+from audio_capture_base import CaptureMetrics, enqueue_latest
+from platform_permissions import CaptureRuntimeError
 
 if sys.platform == "win32":
     try:
@@ -18,6 +19,9 @@ else:
 log = logging.getLogger("LiveTranslate.Audio")
 
 DEVICE_CHECK_INTERVAL = 2.0  # seconds
+# How many consecutive stream restarts may fail before capture gives up.
+# Spinning forever on a dead stream looks identical to silence.
+RESTART_MAX_ATTEMPTS = 5
 
 
 def list_output_devices():
@@ -106,6 +110,13 @@ class AudioCapture:
         self._mic_restart_event = threading.Event()
         self._mic_buf = np.array([], dtype=np.float32)
         self._metrics = CaptureMetrics()
+        # See AudioCaptureBase's docstring for the shared get_audio() contract.
+        self._terminal_error = None
+
+    def fail_terminally(self, reason: str):
+        self._terminal_error = reason
+        self._metrics.last_error = reason
+        log.error("Audio capture failed terminally: %s", reason)
 
     def _get_wasapi_info(self):
         for i in range(self._pa.get_host_api_count()):
@@ -302,6 +313,7 @@ class AudioCapture:
     def _read_loop(self):
         """Synchronous read loop in a background thread."""
         last_device_check = time.monotonic()
+        restart_failures = 0
 
         while self._running:
             # Handle pending loopback restart request
@@ -315,8 +327,25 @@ class AudioCapture:
                         except queue.Empty:
                             break
                     log.info(f"Audio capture restarted on: {self._current_device_name}")
+                    restart_failures = 0
+                    self._metrics.last_error = None
                 except Exception as e:
-                    log.error(f"Restart after device change failed: {e}")
+                    # Clearing the event and then failing used to leave the loop
+                    # spinning on a dead stream forever: no audio, no error, no
+                    # sign anything was wrong.
+                    restart_failures += 1
+                    self._metrics.last_error = f"device restart failed: {e}"
+                    log.error(
+                        "Restart after device change failed "
+                        f"({restart_failures}/{RESTART_MAX_ATTEMPTS}): {e}"
+                    )
+                    if restart_failures >= RESTART_MAX_ATTEMPTS:
+                        self.fail_terminally(
+                            f"audio device restart failed {restart_failures} times: {e}"
+                        )
+                        self._running = False
+                        break
+                    self._restart_event.set()  # retry on the next iteration
                     time.sleep(0.5)
                 continue
 
@@ -368,14 +397,16 @@ class AudioCapture:
                 native_chunk = int(self._native_rate * self.chunk_duration)
                 try:
                     data = None
+                    # The lock only guards the _stream reference; the blocking
+                    # read happens outside it so _restart_stream() (which wants
+                    # the same lock) is not held off for the duration.
                     with self._lock:
-                        if not self._stream:
-                            time.sleep(0.005)
-                            continue
-                        if self._stream.get_read_available() >= native_chunk:
-                            data = self._stream.read(
-                                native_chunk, exception_on_overflow=False
-                            )
+                        stream = self._stream
+                    if not stream:
+                        time.sleep(0.005)
+                        continue
+                    if stream.get_read_available() >= native_chunk:
+                        data = stream.read(native_chunk, exception_on_overflow=False)
                     if data is not None:
                         loopback_audio = self._resample_to_mono(
                             data, self._native_channels, self._native_rate
@@ -389,9 +420,22 @@ class AudioCapture:
                         time.sleep(0.5)
                         self._restart_stream()
                         self._metrics.restart_count += 1
+                        restart_failures = 0
                         log.info("Stream restarted after read error")
                     except Exception as re:
-                        log.error(f"Restart failed: {re}")
+                        restart_failures += 1
+                        self._metrics.last_error = f"restart after read error: {re}"
+                        log.error(
+                            f"Restart failed "
+                            f"({restart_failures}/{RESTART_MAX_ATTEMPTS}): {re}"
+                        )
+                        if restart_failures >= RESTART_MAX_ATTEMPTS:
+                            self.fail_terminally(
+                                f"audio stream restart failed "
+                                f"{restart_failures} times: {re}"
+                            )
+                            self._running = False
+                            break
                         time.sleep(1)
                     continue
 
@@ -429,19 +473,17 @@ class AudioCapture:
                 mic_rms = float(np.sqrt(np.mean(mic_chunk**2)))
                 audio = loopback_audio + mic_chunk
 
-            try:
-                self._metrics.callback_blocks += 1
-                self.audio_queue.put_nowait((audio, mic_rms))
-            except queue.Full:
-                self._metrics.dropped_blocks += 1
-                self.audio_queue.get_nowait()
-                self.audio_queue.put_nowait((audio, mic_rms))
-            self._metrics.output_blocks += 1
-            self._metrics.queue_depth = self.audio_queue.qsize()
+            # enqueue_latest() owns the drop-oldest policy and swallows both the
+            # queue.Empty from get_nowait and the queue.Full from the retry.
+            # Doing it inline here let either escape into _read_loop, which has
+            # no outer handler: one slow consumer window killed capture for good.
+            self._metrics.callback_blocks += 1
+            enqueue_latest(self.audio_queue, (audio, mic_rms), self._metrics)
 
     def start(self):
         if self._running:
             return
+        self._terminal_error = None
         self._loopback_disabled = self._device_name == "__disabled__"
         if not self._loopback_disabled:
             self._open_stream()
@@ -466,6 +508,9 @@ class AudioCapture:
         log.info("Audio capture stopped")
 
     def get_audio(self, timeout=1.0):
+        """See AudioCaptureBase for the three-outcome contract."""
+        if self._terminal_error is not None:
+            raise CaptureRuntimeError(self._terminal_error)
         try:
             return self.audio_queue.get(timeout=timeout)
         except queue.Empty:

@@ -37,10 +37,11 @@ six>=1.16.0
 sentencepiece>=0.2.0
 tiktoken>=0.7.0
 transformers==4.57.1
-# Not imported directly by this project; pinned as part of the GigaAM-v3
-# native stack above. Re-verify before removing.
-pyannote-audio>=4.0,<5
-torchcodec>=0.7
+# pyannote-audio / torchcodec were dropped here on purpose. GigaAM-v3's remote
+# code imports pyannote only inside transcribe_longform(), a path asr_gigaam.py
+# never takes (the ASR worker feeds it VAD-sized segments) and which also needs
+# an HF_TOKEN. They pulled in the whole lightning stack for nothing. Restore
+# both if long-form transcription is ever enabled.
 silero-vad>=5.0
 # Sentence splitting for incremental ASR (main.py::_get_segmenter).
 yasbd-lib>=0.15,<1.0

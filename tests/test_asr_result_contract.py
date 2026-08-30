@@ -23,6 +23,7 @@ def _engine(response):
     engine = mod.RemoteASREngine.__new__(mod.RemoteASREngine)
     engine._client = type("C", (), {"post": lambda self, *a, **k: response})()
     engine._url = "http://example.invalid/transcribe"
+    engine._closed = False
     engine.language = None
     return engine, mod
 
@@ -82,6 +83,7 @@ def test_connection_failure_raises_rather_than_looking_like_silence():
 
     engine._client = type("C", (), {"post": lambda self, *a, **k: boom()})()
     engine._url = "http://example.invalid/transcribe"
+    engine._closed = False
     engine.language = None
     with pytest.raises(mod.RemoteASRError):
         engine.transcribe(AUDIO)

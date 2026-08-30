@@ -464,7 +464,11 @@ class SCKAudioCapture(AudioCaptureBase):
         if hasattr(_SCKStreamDelegate, "alloc"):
             self._delegate = _SCKStreamDelegate.alloc().initWithOwner_(self)
         else:
-            self._delegate = _SCKStreamDelegate(self)
+            # Non-macOS fallback: no Objective-C alloc, but the same two-step
+            # init contract. Passing the owner to the constructor raised
+            # "takes no arguments", which is why the SCK tests only ever ran
+            # where pyobjc happened to be installed.
+            self._delegate = _SCKStreamDelegate().initWithOwner_(self)
         self._stream_error_value = None
         try:
             self._stream = self._build_stream()

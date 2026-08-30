@@ -912,6 +912,10 @@ class SubtitleOverlay(QWidget):
         self._config = config
         self._messages = {}
         self._max_messages = 50
+        # Messages rotated out of the view. The cap is deliberate (memory and
+        # render cost); the export just has to be honest about it.
+        self._messages_dropped = 0
+        self._transcript_paths = {}
         self._click_through = False
         self._height_before_compact = None
         self._mode_anim = None
@@ -1183,6 +1187,9 @@ class SubtitleOverlay(QWidget):
             old_msg = self._messages.pop(oldest_id)
             self._msg_layout.removeWidget(old_msg)
             old_msg.deleteLater()
+            # Remember that the view is no longer the whole session, so an
+            # export can say so instead of quietly handing over a partial log.
+            self._messages_dropped += 1
 
         QTimer.singleShot(50, self._scroll_to_bottom)
 
@@ -1281,6 +1288,23 @@ class SubtitleOverlay(QWidget):
                 "LiveTranslate",
                 t("export_failed").format(error=str(e)),
             )
+            return
+
+        if self._messages_dropped:
+            QMessageBox.information(
+                parent or self,
+                "LiveTranslate",
+                t("export_truncated").format(
+                    count=len(self._messages),
+                    paths="\n".join(
+                        str(p) for p in self._transcript_paths.values()
+                    ) or t("export_no_transcript"),
+                ),
+            )
+
+    def set_transcript_paths(self, paths: dict):
+        """Where the complete session log lives, for the truncation notice."""
+        self._transcript_paths = dict(paths or {})
 
     # Thread-safe public API
     def add_message(self, msg_id, timestamp, original, source_lang, asr_ms):
@@ -1320,4 +1344,5 @@ class SubtitleOverlay(QWidget):
         self._handle.set_models(models, active_index)
 
     def clear(self):
+        self._messages_dropped = 0
         self.clear_signal.emit()

@@ -146,6 +146,25 @@ mlx_service_running: "HY-MT local service is running"
 mlx_service_stopped: "HY-MT is deployed and ready to start"
 mlx_service_starting: "Starting HY-MT local service..."
 mlx_service_preparing: "Preparing HY-MT local model..."
+mlx_checking_env: "Checking the MLX runtime environment..."
+mlx_creating_venv: "Creating the MLX virtual environment..."
+mlx_model_already_ready: "The HY-MT 4-bit model is already prepared."
+mlx_downloading: "Downloading {repo} from ModelScope..."
+mlx_converting: "Converting to an MLX 4-bit model..."
+mlx_model_ready: "The HY-MT 4-bit model is ready."
+mlx_waiting_for_model: "Waiting for the HY-MT service to load the model..."
+mlx_stopping_for_prepare: "Stopping the HY-MT service so the model can be replaced..."
+mlx_stop_before_prepare: "The HY-MT service is still running, so its model directory cannot be replaced. Stop the service and try again."
+mlx_requires_apple_silicon: "HY-MT requires native Apple Silicon macOS."
+mlx_model_not_deployed: "The HY-MT model is not deployed: {path}. Click \u2018Prepare local model\u2019 in Translation settings."
+mlx_env_not_installed: "The MLX environment is not installed: {path}. Click \u2018Prepare local model\u2019 in Translation settings."
+mlx_port_occupied: "Port {port} is occupied by a non-MLX service; refusing to terminate it."
+mlx_service_exited: "The MLX service exited with code {code}."
+mlx_start_timeout: "Timed out waiting for the MLX service at {url}"
+mlx_command_failed: "Command failed with exit code {code}: {command}"
+mlx_replace_failed: "Could not remove the old model directory {path}: {error}"
+mlx_restart_gave_up: "The HY-MT local service failed to restart repeatedly; automatic retries have stopped. Start it manually in Settings."
+mlx_status_checking: "Checking HY-MT status..."
 btn_restore_default: "Restore Default"
 btn_apply_prompt: "Apply Prompt"
 group_timeout: "Model Connect Timeout"
@@ -186,6 +205,12 @@ dialog_delete_msg: >-
   re-downloaded on next launch.
 
   Continue?
+cache_stopping: "Stopping background tasks..."
+cache_deleting: "Deleting model cache..."
+cache_delete_failed: >-
+  These paths could not be deleted:
+
+  {paths}
 
 # Dialogs
 window_setup: "LiveTranslate - Initial Setup"
@@ -197,6 +222,9 @@ btn_start_download: "Start Download"
 btn_retry: "Retry"
 download_failed: "Download failed: {error}"
 download_complete: "Download complete!"
+btn_cancel: "Cancel"
+download_cancelling: "Cancelling the download..."
+download_cancelled: "Download cancelled"
 setup_api_hint: "Models downloaded! Now configure the translation API.\n\nYou need an API base URL, API key, and model name.\nDeepSeek is recommended (affordable and effective)."
 setup_api_title: "Configure Translation API"
 window_download: "LiveTranslate - Download Models"
@@ -265,6 +293,19 @@ override_enable: "Override"
 override_hint: "When unchecked, uses server default or global config"
 loading_model: "Loading {name}...\nPlease wait."
 error_title: "Error"
+error_mlx_not_running: >-
+  The HY-MT local service is not running.
+
+  Start it from the model configuration area in Translation settings,
+  then select this model again.
+ui_lang_restart_required: "Language changed. Please restart the application."
+export_no_transcript: "(no transcript file for this session)"
+export_truncated: >-
+  Only the most recent {count} messages were exported (the UI keeps no more).
+
+  The full record is in:
+
+  {paths}
 error_load_asr: "Failed to load ASR model:\n{error}"
 error_audio_start: "Failed to start audio capture:\n{error}"
 error_screen_permission: "Screen Recording permission is required. Enable LiveTranslate in System Settings > Privacy & Security > Screen Recording, then restart the app."

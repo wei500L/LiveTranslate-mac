@@ -2,7 +2,9 @@
 
 The integration follows the official Hugging Face Transformers loading path.
 Long-form ``transcribe_longform`` is intentionally not part of this backend yet;
-the ASR worker supplies VAD-sized short segments.
+the ASR worker supplies VAD-sized short segments. That also keeps
+``pyannote-audio`` (and an ``HF_TOKEN``) out of the dependency set — the model's
+remote code only imports it inside that unused path.
 """
 
 from __future__ import annotations

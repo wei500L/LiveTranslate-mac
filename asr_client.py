@@ -46,24 +46,43 @@ class ASRClient:
         self._ctx = mp.get_context("spawn")
         self._conn: Connection | None = None
         self._process: mp.Process | None = None
-        self._lock = threading.RLock()
+        # Two locks, never one. _io_lock serializes pipe round-trips and can be
+        # held for up to request_timeout/ready_timeout; _state_lock only guards
+        # the _conn/_process/_status fields and is always constant-time.
+        # Sharing a single lock made shutdown() wait behind an in-flight
+        # transcribe, which put the Qt thread's freeze right back after
+        # _run_asr had deliberately released its own lock to avoid it.
+        self._io_lock = threading.RLock()
+        self._state_lock = threading.RLock()
+        # Set by shutdown()/terminate() so a blocked _recv_response gives up
+        # instead of polling until its deadline.
+        self._cancelled = threading.Event()
         self._status = "created"
+
+    _TERMINAL_STATUSES = ("failed", "stopping", "stopped", "exited")
 
     @property
     def status(self) -> str:
-        if self._process is not None and self._process.exitcode is not None:
-            if self._status not in ("failed", "stopping", "stopped"):
+        with self._state_lock:
+            if self._process is not None and self._process.exitcode is not None:
+                if self._status not in self._TERMINAL_STATUSES:
+                    self._status = "exited"
+            elif self._process is None and self._status not in self._TERMINAL_STATUSES:
+                # Handles already closed but the status still claims the worker
+                # is usable; callers reuse a client on `status == "ready"`.
                 self._status = "exited"
-        return self._status
+            return self._status
 
     @property
     def pid(self) -> int | None:
-        return self._process.pid if self._process is not None else None
+        with self._state_lock:
+            return self._process.pid if self._process is not None else None
 
     def start(self):
-        with self._lock:
+        with self._state_lock:
             if self._process is not None:
                 return
+            self._cancelled.clear()
             parent_conn, child_conn = self._ctx.Pipe(duplex=True)
             name = f"ASRWorker-{self.config.get('engine_type', 'unknown')}"
             process = self._ctx.Process(
@@ -81,19 +100,19 @@ class ASRClient:
 
     def wait_ready(self, timeout: float | None = None):
         timeout = self.ready_timeout if timeout is None else timeout
-        with self._lock:
+        with self._io_lock:
             self._ensure_started()
-            self._status = "loading"
+            self._set_status("loading")
             response = self._recv_response(timeout, expected_id=None)
             if not response.get("ok"):
-                self._status = "failed"
+                self._set_status("failed")
                 raise ASRWorkerError(response.get("error") or {})
             if response.get("type") != "ready":
-                self._status = "failed"
+                self._set_status("failed")
                 raise ASRClientError(
                     f"Unexpected ASR worker startup response: {response.get('type')}"
                 )
-            self._status = "ready"
+            self._set_status("ready")
             log.info(
                 f"ASR worker ready: pid={self.pid}, "
                 f"{response.get('payload') or {}}"
@@ -121,13 +140,26 @@ class ASRClient:
         )
 
     def shutdown(self):
-        with self._lock:
+        """Stop the worker within a bounded time, gracefully when possible.
+
+        Deliberately does NOT block on _io_lock: an in-flight transcribe can
+        hold that for request_timeout (120s by default), and this runs on the
+        Qt thread during quit and engine switches.
+        """
+        with self._state_lock:
             if self._process is None:
                 return
             self._status = "stopping"
             process = self._process
             conn = self._conn
-            if process.is_alive() and conn is not None:
+
+        # Tell any in-flight _recv_response to give up.
+        self._cancelled.set()
+
+        # Try for a clean handshake, but only if the pipe is free right now.
+        graceful = self._io_lock.acquire(timeout=0.5)
+        try:
+            if graceful and process.is_alive() and conn is not None:
                 msg_id = uuid.uuid4().hex
                 try:
                     conn.send({"id": msg_id, "type": "shutdown", "payload": {}})
@@ -138,43 +170,77 @@ class ASRClient:
                             pass
                 except (BrokenPipeError, EOFError, OSError):
                     pass
+            elif not graceful:
+                log.info(
+                    "ASR worker busy; skipping graceful shutdown handshake "
+                    "and terminating pid=%s", process.pid,
+                )
+        finally:
+            if graceful:
+                self._io_lock.release()
+
+        process.join(timeout=self.shutdown_timeout)
+        if process.is_alive():
+            log.warning(f"ASR worker did not exit, terminating pid={process.pid}")
+            process.terminate()
             process.join(timeout=self.shutdown_timeout)
-            if process.is_alive():
-                log.warning(f"ASR worker did not exit, terminating pid={process.pid}")
-                process.terminate()
-                process.join(timeout=self.shutdown_timeout)
+        if process.is_alive():
+            log.error("ASR worker ignored SIGTERM, killing pid=%s", process.pid)
+            try:
+                process.kill()
+            except Exception:
+                log.debug("kill() failed", exc_info=True)
+            process.join(timeout=self.shutdown_timeout)
+
+        with self._state_lock:
             self._close_handles()
             self._status = "stopped"
-            log.info("ASR worker stopped")
+        log.info("ASR worker stopped")
 
     def terminate(self):
-        with self._lock:
-            if self._process is not None and self._process.is_alive():
-                self._status = "failed"
-                self._process.terminate()
-                self._process.join(timeout=self.shutdown_timeout)
+        """Kill the worker now. Same lock discipline as shutdown()."""
+        self._cancelled.set()
+        with self._state_lock:
+            process = self._process
+            # Unconditional: a process that already exited on its own must not
+            # leave the status reading "ready", or _switch_asr_engine will reuse
+            # a dead client and the resulting ASRClientError never reaches the
+            # worker-recovery path.
+            self._status = "failed"
+        if process is not None and process.is_alive():
+            process.terminate()
+            process.join(timeout=self.shutdown_timeout)
+        with self._state_lock:
             self._close_handles()
 
+    def _set_status(self, status: str):
+        with self._state_lock:
+            self._status = status
+
     def _request(self, request_type: str, payload: dict, timeout: float):
-        with self._lock:
+        with self._io_lock:
             self._ensure_ready()
             msg_id = uuid.uuid4().hex
+            with self._state_lock:
+                conn = self._conn
+            if conn is None:
+                raise ASRWorkerExited("ASR worker pipe is already closed")
             try:
-                self._conn.send(
-                    {"id": msg_id, "type": request_type, "payload": payload}
-                )
+                conn.send({"id": msg_id, "type": request_type, "payload": payload})
             except (BrokenPipeError, EOFError, OSError) as exc:
-                self._status = "exited"
+                self._set_status("exited")
                 raise ASRWorkerExited(f"ASR worker pipe closed: {exc}") from exc
 
-            previous_status = self._status
-            if request_type == "transcribe":
-                self._status = "busy"
+            with self._state_lock:
+                previous_status = self._status
+                if request_type == "transcribe":
+                    self._status = "busy"
             try:
                 response = self._recv_response(timeout, expected_id=msg_id)
             finally:
-                if self._status == "busy":
-                    self._status = previous_status
+                with self._state_lock:
+                    if self._status == "busy":
+                        self._status = previous_status
 
             if not response.get("ok"):
                 raise ASRWorkerError(response.get("error") or {})
@@ -183,43 +249,66 @@ class ASRClient:
     def _recv_response(self, timeout: float, expected_id: str | None):
         deadline = time.monotonic() + timeout
         while True:
+            if self._cancelled.is_set():
+                # shutdown()/terminate() is tearing the worker down; stop
+                # polling instead of holding the caller until the deadline.
+                self._set_status("exited")
+                raise ASRWorkerExited("ASR worker shutdown was requested")
+
             remaining = deadline - time.monotonic()
             if remaining <= 0:
-                self._status = "failed"
                 self.terminate()
                 raise ASRWorkerTimeout(
                     f"ASR worker response timed out after {timeout:g}s"
                 )
 
-            conn = self._conn
-            if conn is not None and conn.poll(min(0.2, remaining)):
+            with self._state_lock:
+                conn = self._conn
+                process = self._process
+            try:
+                ready = conn is not None and conn.poll(min(0.2, remaining))
+            except OSError as exc:
+                # shutdown()/terminate() closed the handle out from under this
+                # poll. That is a cancellation, not a protocol failure.
+                self._set_status("exited")
+                raise ASRWorkerExited("ASR worker pipe was closed") from exc
+            if ready:
                 try:
                     response = conn.recv()
-                except EOFError as exc:
-                    self._status = "exited"
+                except (EOFError, OSError) as exc:
+                    self._set_status("exited")
                     raise ASRWorkerExited("ASR worker pipe closed") from exc
                 if expected_id is None or response.get("id") == expected_id:
                     return response
-                raise ASRClientError(
-                    "ASR worker response id mismatch: "
+                # A stale/mismatched frame leaves the pipe desynchronized, so
+                # every later request would mismatch too. Raise the worker-death
+                # type instead of a bare ASRClientError: only the former reaches
+                # _run_asr's recovery path, and the client is unusable either way.
+                self._set_status("exited")
+                raise ASRWorkerExited(
+                    "ASR worker response id mismatch (pipe desynchronized): "
                     f"expected={expected_id}, got={response.get('id')}"
                 )
 
-            process = self._process
             if process is not None and process.exitcode is not None:
-                self._status = "exited"
+                self._set_status("exited")
                 raise ASRWorkerExited(
                     f"ASR worker exited with code {process.exitcode}"
                 )
+            if process is None:
+                self._set_status("exited")
+                raise ASRWorkerExited("ASR worker handles were closed")
 
     def _ensure_started(self):
-        if self._process is None or self._conn is None:
-            raise ASRClientError("ASR worker has not been started")
+        with self._state_lock:
+            if self._process is None or self._conn is None:
+                raise ASRClientError("ASR worker has not been started")
 
     def _ensure_ready(self):
         self._ensure_started()
-        if self.status != "ready":
-            raise ASRClientError(f"ASR worker is not ready: {self.status}")
+        current = self.status
+        if current != "ready":
+            raise ASRClientError(f"ASR worker is not ready: {current}")
 
     def _close_handles(self):
         if self._conn is not None:

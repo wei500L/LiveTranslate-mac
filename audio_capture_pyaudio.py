@@ -17,6 +17,9 @@ from platform_permissions import (
 
 log = logging.getLogger("LiveTranslate.Audio.PyAudio")
 
+# Consecutive read failures tolerated before the capture is declared dead.
+READ_MAX_FAILURES = 20
+
 
 def _load_pyaudio():
     try:
@@ -129,6 +132,7 @@ class PyAudioCapture(AudioCaptureBase):
             self.push_audio(samples)
 
     def _read_loop(self):
+        failures = 0
         while self._running and not self._stop_event.is_set():
             try:
                 data = self._stream.read(
@@ -143,9 +147,20 @@ class PyAudioCapture(AudioCaptureBase):
                 )
                 mic_rms = float(np.sqrt(np.mean(audio * audio))) if audio.size else 0.0
                 self.push_audio(audio, mic_rms=mic_rms)
+                failures = 0
             except Exception as exc:
+                failures += 1
                 self._metrics.last_error = str(exc)
-                log.warning("Microphone read failed: %s", exc)
+                log.warning(
+                    "Microphone read failed (%s/%s): %s",
+                    failures, READ_MAX_FAILURES, exc,
+                )
+                if failures >= READ_MAX_FAILURES:
+                    # A permanently unreadable device is a terminal condition,
+                    # not an endless retry: the pipeline must be told.
+                    self.fail_terminally(f"microphone read keeps failing: {exc}")
+                    self._running = False
+                    return
                 time.sleep(0.05)
 
     def set_device(self, device_name):
@@ -202,13 +217,20 @@ class PyAudioCapture(AudioCaptureBase):
             self._pa = None
 
     def get_audio(self, timeout=1.0):
-        try:
-            return self.audio_queue.get(timeout=timeout)
-        except Exception:
-            return None
+        """Same three outcomes as every other backend (see AudioCaptureBase).
+
+        This used to be `except Exception: return None`, which made a dead
+        capture indistinguishable from a quiet one — the identical condition
+        that SCKAudioCapture reports as a CaptureRuntimeError.
+        """
+        return super().get_audio(timeout)
 
     def __del__(self):
-        try:
-            self.stop()
-        except Exception:
-            pass
+        # Best-effort only: __del__ can run during interpreter teardown, where a
+        # 3s thread join and PyAudio.terminate() are exactly what you do not
+        # want. Callers own the lifecycle via stop(); this just warns.
+        if getattr(self, "_running", False):
+            log.warning(
+                "PyAudioCapture was garbage-collected while running; "
+                "call stop() explicitly"
+            )

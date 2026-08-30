@@ -36,6 +36,7 @@ class RemoteASREngine:
         self._client = httpx.Client(
             timeout=httpx.Timeout(timeout, connect=5.0), trust_env=False
         )
+        self._closed = False
         self.language = None
 
         # Verify the server is reachable and speaks our protocol.
@@ -57,7 +58,10 @@ class RemoteASREngine:
 
     @property
     def status(self) -> str:
-        return "ready"
+        # Never report a torn-down engine as usable: _switch_asr_engine reuses
+        # the active backend on `status == "ready"`, and an unloaded client
+        # would raise on the next request instead of being rebuilt.
+        return "stopped" if self._closed else "ready"
 
     @property
     def pid(self):
@@ -85,6 +89,9 @@ class RemoteASREngine:
         return True
 
     def unload(self):
+        if self._closed:
+            return
+        self._closed = True
         self._client.close()
         log.info("Remote ASR connection closed")
 
@@ -104,6 +111,9 @@ class RemoteASREngine:
         # both into None made the pipeline treat an unreachable server as
         # silence: no error, no reconnect, no worker-state change — just
         # permanently missing subtitles.
+        if self._closed:
+            raise RemoteASRError("remote ASR connection is already closed")
+
         try:
             r = self._client.post(self._url, content=payload)
         except Exception as e:

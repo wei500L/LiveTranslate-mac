@@ -306,7 +306,11 @@ class FunASRNano(nn.Module):
 
         return contents
 
-    def data_load_speech(self, contents: dict, tokenizer, frontend, meta_data={}, **kwargs):
+    def data_load_speech(self, contents: dict, tokenizer, frontend, meta_data=None, **kwargs):
+        # meta_data used to default to a shared, mutable {} that every call
+        # wrote its timings into.
+        if meta_data is None:
+            meta_data = {}
         system = contents["system"]
         user = contents["user"]
         assistant = contents["assistant"]
@@ -384,7 +388,21 @@ class FunASRNano(nn.Module):
                             time2 = time.perf_counter()
                             meta_data["load_data"] = f"{time2 - time1:0.3f}"
                         except Exception as e:
-                            logging.error(f"Loading wav failed! {str(e)}, {traceback.format_exc()}")
+                            # Logging and falling through left data_src unbound,
+                            # so extract_fbank below raised UnboundLocalError and
+                            # the real decode failure never reached the caller.
+                            source = (
+                                sub_str
+                                if isinstance(sub_str, str)
+                                else f"<{type(sub_str).__name__}>"
+                            )
+                            logging.error(
+                                f"Loading wav failed! {source}: {e}, "
+                                f"{traceback.format_exc()}"
+                            )
+                            raise RuntimeError(
+                                f"Failed to load audio input {source}: {e}"
+                            ) from e
 
                         speech, speech_lengths = extract_fbank(
                             data_src,

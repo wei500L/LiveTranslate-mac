@@ -70,7 +70,14 @@ from translator import Translator, RepetitionError
 from mlx_service import MLXServiceManager, is_hy_mt_model
 from transcript_writer import TranscriptWriter
 
-from PyQt6.QtWidgets import QApplication, QSystemTrayIcon, QMenu, QDialog, QMessageBox
+from PyQt6.QtWidgets import (
+    QApplication,
+    QDialog,
+    QMenu,
+    QMessageBox,
+    QProgressDialog,
+    QSystemTrayIcon,
+)
 from PyQt6.QtGui import (
     QAction,
     QActionGroup,
@@ -81,7 +88,7 @@ from PyQt6.QtGui import (
     QFont,
     QFontDatabase,
 )
-from PyQt6.QtCore import QTimer, Qt
+from PyQt6.QtCore import QThread, QTimer, Qt, pyqtSignal
 
 from subtitle_overlay import SubtitleOverlay
 from subtitle_window import SubtitleWindow
@@ -213,6 +220,35 @@ def validate_asr_result(result, kind: str):
     return text, language
 
 
+class _CacheDeleteThread(QThread):
+    """rmtree off the Qt thread: a multi-GB model tree can block it for seconds.
+
+    Reports every failure back instead of swallowing it, so the user learns
+    which paths survived rather than only the log doing.
+    """
+
+    done = pyqtSignal(list)  # [(path, error_message), ...]
+
+    def __init__(self, paths):
+        super().__init__()
+        self._paths = list(paths)
+
+    def run(self):
+        import shutil
+
+        failures = []
+        for path in self._paths:
+            try:
+                shutil.rmtree(path)
+                log.info(f"Deleted: {path}")
+            except FileNotFoundError:
+                pass
+            except Exception as exc:
+                log.error(f"Failed to delete {path}: {exc}")
+                failures.append((str(path), str(exc)))
+        self.done.emit(failures)
+
+
 def create_app_icon() -> QIcon:
     pix = QPixmap(64, 64)
     pix.fill(QColor(0, 0, 0, 0))
@@ -301,6 +337,7 @@ class LiveTranslateApp:
         self._last_speech_activity = time.monotonic()
         self._target_language = config["translation"]["target_language"]
         self._mlx_service = MLXServiceManager()
+        self._mlx_service.translate = t
         self._translator = Translator(
             api_base=translation_api_base(config["translation"].get("api_base")),
             api_key=translation_api_key(config["translation"].get("api_key")),
@@ -320,6 +357,11 @@ class LiveTranslateApp:
         self._capture_thread = None
         self._asr_thread = None
         self._asr_queue = queue.Queue(maxsize=16)
+        # Shutdown is expressed by an event, not only by a queue sentinel: a full
+        # queue used to make stop()'s blocking put(None) wait forever, and the
+        # sentinel itself could be dropped by _enqueue_asr's overflow path.
+        self._stop_event = threading.Event()
+        self._stopped = True
         self._translation_workers = 8
         self._tl_executor = None
         self._extra_tl_executor = None
@@ -350,6 +392,9 @@ class LiveTranslateApp:
         self._mem_threshold_mb = 4096
         self._mem_warned = False
         self._mem_warning_callback = None
+        # Tray-notification sink for conditions the user must act on even when
+        # no window is open (e.g. the MLX service gave up restarting).
+        self._notify_callback = None
 
         self._asr_count = 0
         self._translate_count = 0
@@ -372,6 +417,20 @@ class LiveTranslateApp:
 
     def set_overlay(self, overlay: SubtitleOverlay):
         self._overlay = overlay
+        self._publish_transcript_paths()
+
+    def _publish_transcript_paths(self):
+        """Tell the overlay where the complete session log is.
+
+        The overlay keeps only the last 50 messages, so an export has to be able
+        to point at the transcript for anything older.
+        """
+        if self._overlay is None:
+            return
+        try:
+            self._overlay.set_transcript_paths(self._transcript.session_paths())
+        except Exception:
+            log.debug("Could not publish transcript paths", exc_info=True)
 
     def set_subtitle_window(self, subwin: SubtitleWindow):
         self._subwin = subwin
@@ -384,6 +443,13 @@ class LiveTranslateApp:
         panel.mlx_health_checked.connect(self._on_mlx_probe_result)
         panel.models_list_changed.connect(self._on_models_list_changed)
         self._mlx_restart_pending = False
+        # Edge tracking: the 5s probe used to call _disable_translator() on every
+        # tick while the service was down, so each tick bumped the translator
+        # generation and cleared the context history.
+        self._mlx_available = None
+        self._mlx_restart_count = 0
+        self._mlx_restart_max = 3
+        self._mlx_next_restart_at = 0.0
         self._mlx_monitor_timer = QTimer()
         self._mlx_monitor_timer.setInterval(5000)
         self._mlx_monitor_timer.timeout.connect(self._monitor_mlx_service)
@@ -404,20 +470,54 @@ class LiveTranslateApp:
             return
         if running:
             self._mlx_restart_pending = False
+            self._mlx_restart_count = 0
+            self._mlx_next_restart_at = 0.0
+            if self._mlx_available is not True:
+                self._mlx_available = True
+                log.info("HY-MT local service is available")
             if self._translator is None:
                 self._on_model_changed(self._panel.get_active_model())
             return
-        self._disable_translator()
-        if not self._mlx_restart_pending:
-            self._mlx_restart_pending = self._panel.auto_start_mlx_service()
+
+        # Only on the available -> unavailable edge. Repeating it every 5s
+        # invalidated in-flight translations and wiped the context history over
+        # and over while the service was simply down.
+        if self._mlx_available is not False:
+            self._mlx_available = False
+            log.warning("HY-MT local service is unavailable; translation disabled")
+            self._disable_translator()
+
+        if self._mlx_restart_pending:
+            return
+        if self._mlx_restart_count >= self._mlx_restart_max:
+            return  # gave up; the user must start it from Settings
+        if time.monotonic() < self._mlx_next_restart_at:
+            return
+        self._mlx_restart_pending = self._panel.auto_start_mlx_service()
+        if self._mlx_restart_pending:
+            self._mlx_restart_count += 1
+            # 10s, 20s, 40s: same shape as the ASR worker restart budget.
+            self._mlx_next_restart_at = time.monotonic() + 10.0 * (
+                2 ** (self._mlx_restart_count - 1)
+            )
+            log.info(
+                "HY-MT auto-restart attempt %s/%s",
+                self._mlx_restart_count,
+                self._mlx_restart_max,
+            )
+            if self._mlx_restart_count >= self._mlx_restart_max:
+                self._notify_user(t("mlx_restart_gave_up"))
 
     def _on_mlx_service_state_changed(self, running: bool):
         active = self._panel.get_active_model() if self._panel else None
         if not is_hy_mt_model(active):
             return
         if running:
+            self._mlx_available = True
+            self._mlx_restart_count = 0
             self._on_model_changed(active)
-        else:
+        elif self._mlx_available is not False:
+            self._mlx_available = False
             self._disable_translator()
 
     def _on_models_list_changed(self, models: list, active_idx: int):
@@ -499,6 +599,7 @@ class LiveTranslateApp:
             self._set_translation_workers(settings["translation_workers"])
         if "auto_save_transcript" in settings:
             self._transcript.set_enabled(settings["auto_save_transcript"])
+            self._publish_transcript_paths()
 
     def _mark_asr_unavailable(self, reason: str, client=None):
         with self._asr_lock:
@@ -647,10 +748,7 @@ class LiveTranslateApp:
         )
         if is_hy_mt_model(model_config):
             if not self._mlx_service.is_running():
-                message = (
-                    "HY-MT 本地服务尚未启动。\n"
-                    "请在‘翻译’设置中的模型配置区域手动启动本地服务后再选择此模型。"
-                )
+                message = t("error_mlx_not_running")
                 log.warning("HY-MT MLX service is not running; refusing automatic start")
                 self._disable_translator()
                 if self._panel:
@@ -706,7 +804,10 @@ class LiveTranslateApp:
             self._translation_results.clear()
             self._translation_pending = 0
         if self._panel:
-            self._translation_workers = int(
+            # Through the setter, so the max(4, min(16, ...)) clamp applies here
+            # too. Assigning the field directly let a hand-edited
+            # user_settings.json spin up an unbounded pool.
+            self._set_translation_workers(
                 self._panel.get_settings().get(
                     "translation_workers", self._translation_workers
                 )
@@ -763,12 +864,15 @@ class LiveTranslateApp:
     def _commit_translation_result(self, msg_id, text, translated, generation):
         with self._translation_lock:
             if generation != self._translator_generation:
-                self._translation_results.pop(msg_id, None)
-                try:
-                    self._translation_order.remove(msg_id)
-                except ValueError:
-                    pass
-                self._translation_pending = max(0, self._translation_pending - 1)
+                # A model switch already zeroed _translation_pending and cleared
+                # the order/results for this generation. Decrementing the counter
+                # or removing an id here corrupts the *new* generation's
+                # bookkeeping — msg_ids are monotonic, so anything still keyed
+                # under this id belongs to the newer run.
+                log.debug(
+                    "Discarding translation result from generation %s (now %s)",
+                    generation, self._translator_generation,
+                )
                 return False
             self._translation_results[msg_id] = (text, translated)
             while self._translation_order:
@@ -877,11 +981,7 @@ class LiveTranslateApp:
         log.info(f"Switching ASR worker: {self._asr_type} -> {engine_type}")
         # Reset interim state for the engine boundary. The active worker is
         # stopped before the target worker starts loading.
-        self._interim_active = False
-        self._interim_pending = ""
-        self._last_interim_samples = 0
-        self._last_interim_check_time = 0.0
-        self._interim_committed_tail = ""
+        self._reset_interim_state()
         # Engine boundary: drop the in-flight buffer rather than emitting it
         # through a worker that is about to be torn down.
         with self._vad_lock:
@@ -1408,6 +1508,18 @@ class LiveTranslateApp:
     def set_memory_warning_callback(self, callback):
         self._mem_warning_callback = callback
 
+    def set_notification_callback(self, callback):
+        self._notify_callback = callback
+
+    def _notify_user(self, message: str):
+        if self._notify_callback is None:
+            log.warning("Notification with no sink: %s", message)
+            return
+        try:
+            self._notify_callback(message)
+        except Exception:
+            log.error("Notification callback failed", exc_info=True)
+
     def _log_mem_periodic(self):
         snap = self._mem_snapshot()
         total_delta = snap["rss"] - self._mem_baseline_mb
@@ -1533,21 +1645,39 @@ class LiveTranslateApp:
 
         def _do_translate(lang):
             with self._translation_lock:
-                translator = self._translator.fork_for_request(
+                base = self._translator
+                if base is None:
+                    # Same condition as the primary path: an unavailable
+                    # translation service is a named failure, not a None
+                    # dereference inside a worker thread.
+                    raise TranslationUnavailable(
+                        "translation service is unavailable"
+                    )
+                translator = base.fork_for_request(
                     target_language=lang,
                     history_snapshot=list(self._translation_history),
                 )
             return lang, translator.translate(text, source_lang)
 
+        executor = self._extra_tl_executor
+        if executor is None:
+            log.debug("Extra-language executor is gone; skipping %s", extra_langs)
+            return
         futures = []
         for lang in extra_langs:
-            futures.append(self._extra_tl_executor.submit(_do_translate, lang))
+            try:
+                futures.append(executor.submit(_do_translate, lang))
+            except RuntimeError:
+                log.debug("Extra-language executor shut down mid-submit")
+                break
 
         for future in as_completed(futures):
             try:
                 lang, result = future.result()
                 tl_dict[lang] = result
                 log.info(f"Extra translate [{lang}]: {result}")
+            except TranslationUnavailable as e:
+                log.warning(f"Extra translate skipped: {e}")
             except Exception as e:
                 import openai
                 if isinstance(e, (openai.APIConnectionError, openai.APITimeoutError,
@@ -1574,12 +1704,15 @@ class LiveTranslateApp:
             max_workers=4, thread_name_prefix="translate-extra"
         )
         self._asr_queue = queue.Queue(maxsize=16)
+        self._stop_event.clear()
+        self._stopped = False
         self._running = True
         self._paused = False
         try:
             self._audio.start()
         except Exception:
             self._running = False
+            self._stopped = True
             self._tl_executor.shutdown(wait=False, cancel_futures=True)
             self._extra_tl_executor.shutdown(wait=False, cancel_futures=True)
             self._tl_executor = None
@@ -1604,68 +1737,140 @@ class LiveTranslateApp:
             f"GPU(alloc/reserved)={snap['gpu_alloc']:.0f}/{snap['gpu_reserved']:.0f}MB "
             f"(baseline for delta tracking)"
         )
+        self._publish_transcript_paths()
         log.info("Pipeline started (capture + ASR threads)")
 
     def stop(self):
+        """Tear the pipeline down. Idempotent, bounded and complete.
+
+        Every step is wrapped: a failure in one of them must not skip worker,
+        file or service reclamation further down (CALL_CHAIN_FIX_TODO 2.3/2.5).
+        A repeat call only mops up whatever the first one left behind.
+        """
+        first_call = not self._stopped
+        self._stopped = True
         self._running = False
-        self._audio.stop()
+        self._stop_event.set()
+
+        self._stop_step("audio capture", self._audio.stop)
         if self._capture_thread:
             self._capture_thread.join(timeout=3)
+            if self._capture_thread.is_alive():
+                log.warning("Capture thread still running after timeout")
             self._capture_thread = None
-        self._asr_queue.put(None)
+
+        # Best-effort wake-up only. _asr_loop also polls _stop_event, so a full
+        # queue can no longer strand this call the way a blocking put() did.
+        try:
+            self._asr_queue.put_nowait(None)
+        except queue.Full:
+            log.debug("ASR queue full; relying on the stop event to end the loop")
         if self._asr_thread:
             self._asr_thread.join(timeout=10)
             if self._asr_thread.is_alive():
                 log.warning("ASR thread still running after timeout, proceeding with cleanup")
             self._asr_thread = None
-        # Flush remaining VAD buffer after pipeline threads are done
-        if self._interim_active:
-            remaining = self._vad.force_flush()
-            if remaining is not None and self._asr_ready:
-                self._process_interim_final(remaining)
-        else:
-            remaining = self._vad.flush()
-            if remaining is not None and self._asr_ready:
-                self._process_segment(remaining)
-        self._interim_active = False
-        self._interim_pending = ""
-        self._last_interim_samples = 0
-        self._last_interim_check_time = 0.0
-        self._interim_committed_tail = ""
+
+        # Flush the remaining VAD buffer once the pipeline threads are done, and
+        # only while ASR can still serve it — a flush against a dead worker would
+        # queue translation work the executors below are about to refuse.
+        if first_call:
+            self._stop_step("VAD flush", self._flush_on_stop)
+        self._reset_interim_state()
+
+        # After the flush, so translations it produced are awaited rather than
+        # cancelled.
         if self._tl_executor is not None:
-            self._tl_executor.shutdown(wait=True)
+            self._stop_step("translation executor", self._tl_executor.shutdown)
+            self._tl_executor = None
         if self._extra_tl_executor is not None:
-            self._extra_tl_executor.shutdown(wait=True)
-        self._tl_executor = None
-        self._extra_tl_executor = None
-        self._transcript.close()
+            self._stop_step(
+                "extra-language executor", self._extra_tl_executor.shutdown
+            )
+            self._extra_tl_executor = None
+
+        self._stop_step("transcript", self._transcript.close)
         if self._mem_periodic_timer is not None:
-            try:
-                self._mem_periodic_timer.stop()
-            except Exception:
-                pass
+            self._stop_step("memory timer", self._mem_periodic_timer.stop)
             self._mem_periodic_timer = None
         if getattr(self, "_mlx_monitor_timer", None) is not None:
-            self._mlx_monitor_timer.stop()
+            self._stop_step("MLX monitor timer", self._mlx_monitor_timer.stop)
             self._mlx_monitor_timer = None
-        snap = self._mem_snapshot()
-        total_delta = snap["rss"] - self._mem_baseline_mb
-        log.info(
-            f"MEM[stop] RSS={snap['rss']:.1f}MB ({total_delta:+.1f} since start) "
-            f"GPU(alloc/reserved)={snap['gpu_alloc']:.0f}/{snap['gpu_reserved']:.0f}MB "
-            f"asr_calls={self._mem_asr_call_count} outputs={self._asr_count}"
-        )
-        self._shutdown_asr_worker()
-        self._mlx_service.stop()
+
+        if first_call:
+            try:
+                snap = self._mem_snapshot()
+                total_delta = snap["rss"] - self._mem_baseline_mb
+                log.info(
+                    f"MEM[stop] RSS={snap['rss']:.1f}MB ({total_delta:+.1f} since start) "
+                    f"GPU(alloc/reserved)={snap['gpu_alloc']:.0f}/{snap['gpu_reserved']:.0f}MB "
+                    f"asr_calls={self._mem_asr_call_count} outputs={self._asr_count}"
+                )
+            except Exception:
+                log.debug("Final memory snapshot failed", exc_info=True)
+
+        self._stop_step("ASR worker", self._shutdown_asr_worker)
+        self._stop_step("MLX service", self._mlx_service.stop)
         log.info("Pipeline stopped")
+
+    def _stop_step(self, what: str, action):
+        """Run one cleanup step; log and continue so later steps still run."""
+        try:
+            action()
+        except Exception:
+            log.error("Cleanup step failed: %s", what, exc_info=True)
+
+    def _flush_on_stop(self):
+        if not self._asr_ready:
+            with self._vad_lock:
+                self._vad._reset()
+            return
+        if self._interim_active:
+            with self._vad_lock:
+                remaining = self._vad.force_flush()
+            if remaining is not None:
+                self._process_interim_final(remaining)
+        else:
+            with self._vad_lock:
+                remaining = self._vad.flush()
+            if remaining is not None:
+                self._process_segment(remaining)
+
+    def wait_until_stopped(self, timeout: float = 15.0) -> bool:
+        """True once no pipeline thread and no ASR worker process is left.
+
+        Used by the delete-cache-and-exit path, which must not unlink model
+        directories a worker still holds open. Checks the actual child
+        processes: _shutdown_asr_worker clears self._asr before the worker has
+        finished dying, so that field proves nothing here.
+        """
+        deadline = time.monotonic() + timeout
+        for thread in (self._capture_thread, self._asr_thread):
+            if thread is None:
+                continue
+            thread.join(timeout=max(0.0, deadline - time.monotonic()))
+        while time.monotonic() < deadline:
+            if not self._live_worker_pids():
+                return True
+            time.sleep(0.1)
+        remaining = self._live_worker_pids()
+        if remaining:
+            log.warning("ASR worker processes still alive: %s", remaining)
+        return not remaining
+
+    @staticmethod
+    def _live_worker_pids():
+        import multiprocessing as mp_mod
+
+        return [
+            proc.pid
+            for proc in mp_mod.active_children()
+            if (proc.name or "").startswith("ASRWorker")
+        ]
 
     def pause(self):
         self._paused = True
-        self._interim_active = False
-        self._interim_pending = ""
-        self._last_interim_samples = 0
-        self._last_interim_check_time = 0.0
-        self._interim_committed_tail = ""
+        self._reset_interim_state()
         if self._overlay:
             self._overlay.update_monitor(0.0, 0.0)
         log.info("Pipeline paused")
@@ -1936,13 +2141,17 @@ class LiveTranslateApp:
 
         # Output committed sentences
         actually_committed = False
+        consumed_any = False
         for sent in complete:
             text = sent.strip()
             if not text:
                 continue
             if self._is_short_utterance(text):
-                self._interim_pending += text
-                log.debug(f"Interim short utterance buffered: '{text}', pending='{self._interim_pending}'")
+                self._buffer_interim_fragment(text)
+                # Buffering still consumes the audio: the trim and the echo tail
+                # below must run, or the next pass re-recognizes the same words
+                # and appends them to _interim_pending all over again.
+                consumed_any = True
                 continue
 
             if self._interim_pending:
@@ -1951,8 +2160,9 @@ class LiveTranslateApp:
 
             self._process_segment_text(text, result_lang, asr_ms)
             actually_committed = True
+            consumed_any = True
 
-        if not actually_committed:
+        if not consumed_any:
             return False
 
         if trim_samples > 0:
@@ -1963,8 +2173,40 @@ class LiveTranslateApp:
         self._interim_committed_tail = committed_text[-50:] if len(committed_text) > 50 else committed_text
 
         self._interim_active = True
-        log.info(f"Interim ASR: committed {len(complete)} sentence(s), trimmed {trim_samples / 16000:.2f}s")
-        return True
+        log.info(
+            f"Interim ASR: consumed {len(complete)} sentence(s) "
+            f"({'committed' if actually_committed else 'buffered only'}), "
+            f"trimmed {trim_samples / 16000:.2f}s"
+        )
+        return actually_committed
+
+    _INTERIM_PENDING_MAX = 200
+
+    def _buffer_interim_fragment(self, text: str):
+        """Hold a short fragment until the next real sentence absorbs it.
+
+        Bounded and tail-deduplicated: a re-recognized fragment must not be
+        appended twice, and a buffer that somehow keeps growing must not grow
+        without limit.
+        """
+        pending = self._interim_pending
+        if pending.endswith(text):
+            log.debug(f"Interim fragment already buffered, skipping: '{text}'")
+            return
+        pending += text
+        if len(pending) > self._INTERIM_PENDING_MAX:
+            dropped = len(pending) - self._INTERIM_PENDING_MAX
+            pending = pending[-self._INTERIM_PENDING_MAX:]
+            log.debug(f"Interim pending buffer capped; dropped {dropped} oldest chars")
+        self._interim_pending = pending
+        log.debug(f"Interim short utterance buffered: '{text}', pending='{pending}'")
+
+    def _reset_interim_state(self):
+        self._interim_active = False
+        self._interim_pending = ""
+        self._last_interim_samples = 0
+        self._last_interim_check_time = 0.0
+        self._interim_committed_tail = ""
 
     def _process_segment_text(self, text: str, source_lang: str, asr_ms: float = 0):
         """Output a text result (from interim or final) — similar to _process_segment but skips ASR."""
@@ -2084,6 +2326,7 @@ class LiveTranslateApp:
             ),
             dtype=np.float32,
         )
+        last_discarded = self._vad.discarded_segments
         while self._running:
             try:
                 item = self._audio.get_audio(timeout=1.0)
@@ -2121,6 +2364,16 @@ class LiveTranslateApp:
             with self._vad_lock:
                 speech_segment = self._vad.process_chunk(chunk)
                 speaking = self._vad._is_speaking
+                discarded = self._vad.discarded_segments
+
+            if discarded != last_discarded:
+                # The density filter dropped a segment. It emits nothing, so
+                # without this the utterance's interim state (pending fragments
+                # and the echo tail) would leak into the next one.
+                last_discarded = discarded
+                if self._interim_active or self._interim_pending:
+                    log.debug("Low-density segment discarded; resetting interim state")
+                self._reset_interim_state()
 
             if speaking or speech_segment is not None:
                 self._last_speech_activity = time.monotonic()
@@ -2150,22 +2403,48 @@ class LiveTranslateApp:
             self._enqueue_asr("vad_flush", speech_segment)
 
     def _enqueue_asr(self, seg_type: str, segment):
+        """Queue a segment for the ASR thread, dropping the oldest on overflow.
+
+        Never raises: this runs on the capture thread, which has no outer
+        handler and must not die because the consumer fell behind.
+        """
+        if self._stop_event.is_set():
+            return
+        try:
+            self._asr_queue.put_nowait((seg_type, segment))
+            return
+        except queue.Full:
+            pass
+        try:
+            dropped = self._asr_queue.get_nowait()
+        except queue.Empty:
+            dropped = None
+        if dropped is None:
+            # Either the queue drained underneath us, or we just pulled out the
+            # stop sentinel. Put the sentinel back rather than swallowing it.
+            self._requeue_stop_sentinel()
+        else:
+            log.warning(f"ASR queue full, dropped {dropped[0]} segment")
         try:
             self._asr_queue.put_nowait((seg_type, segment))
         except queue.Full:
-            try:
-                dropped = self._asr_queue.get_nowait()
-                log.warning(f"ASR queue full, dropped {dropped[0]} segment")
-            except queue.Empty:
-                pass
-            try:
-                self._asr_queue.put_nowait((seg_type, segment))
-            except queue.Full:
-                log.warning("ASR queue still full after drop, skipping segment")
+            log.warning("ASR queue still full after drop, skipping segment")
+
+    def _requeue_stop_sentinel(self):
+        if not self._stop_event.is_set():
+            return
+        try:
+            self._asr_queue.put_nowait(None)
+        except queue.Full:
+            pass
 
     def _asr_loop(self):
-        while self._running:
+        while self._running and not self._stop_event.is_set():
             try:
+                # 1s, unchanged: the idle branch below paces the worker-recycle
+                # check, and stop() no longer depends on this timeout — the loop
+                # condition sees _stop_event, and the sentinel usually wakes it
+                # immediately anyway.
                 item = self._asr_queue.get(timeout=1.0)
             except queue.Empty:
                 # Idle moment: recycle a bloated worker while no audio is waiting.
@@ -2193,11 +2472,7 @@ class LiveTranslateApp:
                         else:
                             self._process_segment(segment)
                     finally:
-                        self._interim_active = False
-                        self._interim_pending = ""
-                        self._last_interim_samples = 0
-                        self._last_interim_check_time = 0.0
-                        self._interim_committed_tail = ""
+                        self._reset_interim_state()
                 elif seg_type == "interim":
                     self._drain_interim_duplicates()
                     self._do_interim_asr()
@@ -2219,7 +2494,15 @@ class LiveTranslateApp:
             except queue.Empty:
                 break
             if item is None or item[0] != "interim":
-                self._asr_queue.put(item)
+                # put_nowait, not put: this runs on the ASR thread, which is the
+                # only consumer — a blocking put on a full queue would deadlock.
+                try:
+                    self._asr_queue.put_nowait(item)
+                except queue.Full:
+                    if item is None:
+                        self._stop_event.set()
+                    else:
+                        log.warning("ASR queue full while requeueing %s", item[0])
                 break
 
 
@@ -2368,7 +2651,10 @@ def main():
     live_trans.set_overlay(overlay)
     live_trans.set_subtitle_window(subwin)
     live_trans.set_panel(panel)
-    app.aboutToQuit.connect(live_trans._mlx_service.stop)
+    # Fallback only: every deliberate exit goes through on_quit() below, which
+    # has already run stop(). stop() is idempotent, so a window-manager quit or
+    # an unhandled exit still reclaims threads, files, worker and MLX service.
+    app.aboutToQuit.connect(live_trans.stop)
 
     def _deferred_init():
         panel._apply_settings()
@@ -2404,15 +2690,22 @@ def main():
     menu = QMenu()
 
     # --- Pause / Resume toggle ---
-    pause_action = QAction(t("tray_pause"))
-    _is_running = [True]  # mutable for closure
+    pause_action = QAction(t("tray_resume"))
+    # The pipeline only starts on the deferred callback below, so it is not
+    # running yet — claiming otherwise made the tray and overlay lie for the
+    # first 500ms and let that callback overwrite a pause the user got in first.
+    _is_running = [False]  # mutable for closure
+    _start_cancelled = [False]
+    _quitting = [False]
+    _cache_delete_thread = []
+    overlay.set_running(False)
 
     def on_start():
+        if _start_cancelled[0]:
+            log.info("Deferred start skipped: paused or quit before it ran")
+            return
         try:
             live_trans.start()
-            overlay.set_running(True)
-            _is_running[0] = True
-            pause_action.setText(t("tray_pause"))
         except Exception as e:
             log.error(f"Start error: {e}", exc_info=True)
             overlay.set_running(False)
@@ -2423,14 +2716,26 @@ def main():
                 t("error_title"),
                 t("error_audio_start").format(error=_audio_start_error(e)),
             )
+            return
+        # Only after a successful start, and only if nothing cancelled us while
+        # start() was blocking on the audio device.
+        if _start_cancelled[0]:
+            log.info("Pipeline start superseded by a pause/quit; stopping again")
+            live_trans.stop()
+            return
+        overlay.set_running(True)
+        _is_running[0] = True
+        pause_action.setText(t("tray_pause"))
 
     def on_pause():
+        _start_cancelled[0] = True
         live_trans.pause()
         overlay.set_running(False)
         _is_running[0] = False
         pause_action.setText(t("tray_resume"))
 
     def on_resume():
+        _start_cancelled[0] = False
         if not live_trans._running:
             on_start()
             return
@@ -2844,8 +3149,67 @@ def main():
     quit_action = QAction(t("quit"))
 
     def on_quit():
-        live_trans.stop()
+        """The single exit path. Tray, overlay, panel and SIGINT all land here."""
+        if _quitting[0]:
+            log.debug("Quit already in progress; ignoring repeat request")
+            return
+        _quitting[0] = True
+        _start_cancelled[0] = True
+        try:
+            live_trans.stop()
+        except Exception:
+            log.error("Pipeline stop failed during quit", exc_info=True)
         app.quit()
+
+    def on_delete_cache_and_quit(entries):
+        """Stop everything, then delete the model cache, then exit.
+
+        Order matters: the ASR worker holds model files open, and on Windows a
+        directory with an open handle simply refuses to go away.
+        """
+        if _quitting[0]:
+            return
+        _quitting[0] = True
+        _start_cancelled[0] = True
+
+        busy = QProgressDialog(t("cache_stopping"), "", 0, 0, panel)
+        busy.setWindowTitle(t("dialog_delete_title"))
+        busy.setCancelButton(None)
+        busy.setWindowModality(Qt.WindowModality.ApplicationModal)
+        busy.show()
+        QApplication.processEvents()
+
+        try:
+            live_trans.stop()
+        except Exception:
+            log.error("Pipeline stop failed before cache delete", exc_info=True)
+        if not live_trans.wait_until_stopped():
+            log.warning(
+                "ASR worker still present after stop; cache delete may fail"
+            )
+
+        busy.setLabelText(t("cache_deleting"))
+        QApplication.processEvents()
+
+        thread = _CacheDeleteThread([path for _, path, _ in entries])
+        _cache_delete_thread.append(thread)  # keep a reference alive
+
+        def _delete_done(failures):
+            busy.close()
+            if failures:
+                QMessageBox.critical(
+                    panel,
+                    t("error_title"),
+                    t("cache_delete_failed").format(
+                        paths="\n".join(f"{p}: {e}" for p, e in failures)
+                    ),
+                )
+            app.quit()
+
+        thread.done.connect(_delete_done)
+        thread.start()
+
+    panel.delete_cache_and_quit_requested.connect(on_delete_cache_and_quit)
 
     quit_action.triggered.connect(on_quit)
     menu.addAction(quit_action)
@@ -2889,9 +3253,23 @@ def main():
 
     live_trans.set_memory_warning_callback(_on_memory_warning)
 
+    def _on_notification(message: str):
+        tray.showMessage(
+            "LiveTranslate", message, QSystemTrayIcon.MessageIcon.Warning, 10000
+        )
+
+    live_trans.set_notification_callback(_on_notification)
+
     QTimer.singleShot(500, on_start)
 
-    signal.signal(signal.SIGINT, lambda *_: on_quit())
+    def _on_sigint(*_):
+        # Post the request; do NOT join threads, close files or reap child
+        # processes from inside a signal handler. stop()'s idempotence covers a
+        # second Ctrl-C arriving while the first one is still being serviced.
+        log.info("SIGINT received, requesting shutdown")
+        QTimer.singleShot(0, on_quit)
+
+    signal.signal(signal.SIGINT, _on_sigint)
     timer = QTimer()
     timer.timeout.connect(lambda: None)
     timer.start(200)

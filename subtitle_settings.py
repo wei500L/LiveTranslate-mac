@@ -611,7 +611,14 @@ class SubtitleSettingsWidget(QWidget):
     def _schedule_emit(self):
         self._debounce_timer.start()
 
-    def _emit_settings(self):
+    def _collect_settings(self) -> dict:
+        """Read the controls into self._settings and return an isolated copy.
+
+        The copy is deep enough that "lines" is a fresh list of fresh dicts:
+        emitting the internal object made the receiver (SubtitleWindow) share
+        mutable state with the settings controls, so later edits mutated the
+        window's live configuration behind its back.
+        """
         s = {
             "line_spacing": self._spacing_spin.value(),
             "window_width": self._width_spin.value(),
@@ -626,11 +633,25 @@ class SubtitleSettingsWidget(QWidget):
             "lines": self._settings.get("lines", DEFAULT_SUBTITLE_WIN_SETTINGS["lines"]),
         }
         self._settings.update(s)
-        self.settings_changed.emit(self._settings)
+        snapshot = dict(self._settings)
+        snapshot["lines"] = [dict(line) for line in self._settings.get("lines", [])]
+        return snapshot
+
+    def _emit_settings(self):
+        self.settings_changed.emit(self._collect_settings())
 
     def get_settings(self) -> dict:
+        """Read the current values. Pure — use emit_settings() to broadcast.
+
+        This used to call _emit_settings(), so merely *reading* the settings
+        propagated them all the way to SubtitleWindow.apply_settings() and
+        rebuilt every text widget.
+        """
+        return self._collect_settings()
+
+    def emit_settings(self):
+        """Broadcast the current values to listeners."""
         self._emit_settings()
-        return dict(self._settings)
 
 
 class SubtitleSettingsDialog(QDialog):
@@ -650,4 +671,8 @@ class SubtitleSettingsDialog(QDialog):
         self.resize(560, min(640, available_screen_height(self)))
 
     def get_settings(self) -> dict:
+        """Read-only; see SubtitleSettingsWidget.get_settings."""
         return self._widget.get_settings()
+
+    def emit_settings(self):
+        self._widget.emit_settings()

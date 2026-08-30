@@ -156,6 +156,25 @@ class MLXServiceManager:
         self.log_dir = self.root / "logs"
         self.pid_file = self.log_dir / MLX_PID_FILE.name
         self.process: subprocess.Popen | None = None
+        # Set by the UI layer so user-visible strings get localized without this
+        # module importing i18n. Keys pass through untranslated by default.
+        self.translate = None
+        self._version_cache: tuple[float, bool] | None = None
+
+    def _text(self, key: str, **params) -> str:
+        """Localize a message key, falling back to the key itself."""
+        text = key
+        if self.translate is not None:
+            try:
+                text = self.translate(key)
+            except Exception:
+                text = key
+        if params:
+            try:
+                return text.format(**params)
+            except (KeyError, IndexError, ValueError):
+                return text
+        return text
 
     @property
     def server_executable(self) -> Path:
@@ -175,8 +194,26 @@ class MLXServiceManager:
         return sys.platform == "darwin" and os.uname().machine == "arm64"
 
     def _versions_are_compatible(self) -> bool:
-        if not self.env_dir.joinpath("bin", "python").is_file():
+        """Whether .mlx-venv holds the pinned package versions.
+
+        Cached against the venv's mtime: this spawns a Python interpreter, and
+        it used to run on the Qt thread on every model-list selection change.
+        """
+        python = self.env_dir / "bin" / "python"
+        if not python.is_file():
+            self._version_cache = None
             return False
+        try:
+            stamp = self.env_dir.stat().st_mtime
+        except OSError:
+            stamp = 0.0
+        if self._version_cache is not None and self._version_cache[0] == stamp:
+            return self._version_cache[1]
+        result = self._probe_versions()
+        self._version_cache = (stamp, result)
+        return result
+
+    def _probe_versions(self) -> bool:
         check = subprocess.run(
             [
                 str(self.env_dir / "bin" / "python"),
@@ -218,6 +255,13 @@ class MLXServiceManager:
         cancel_event: threading.Event | None = None,
         env: dict[str, str] | None = None,
     ) -> None:
+        """Run a child process, streaming its output, cancellable at any time.
+
+        Cancellation used to be checked only inside `for line in stdout`, so a
+        multi-GB download that produced no output for minutes ignored the
+        cancel button entirely. The reader now runs on its own thread while this
+        one polls the event on a fixed period.
+        """
         self._notify(progress_callback, "$ " + " ".join(command))
         process = subprocess.Popen(
             command,
@@ -227,22 +271,69 @@ class MLXServiceManager:
             stderr=subprocess.STDOUT,
             text=True,
             bufsize=1,
+            # Own process group, so cancelling kills the whole tree (pip spawns
+            # its own children) rather than just the parent.
+            start_new_session=True,
         )
+
+        def _pump():
+            try:
+                assert process.stdout is not None
+                for line in process.stdout:
+                    line = line.strip()
+                    if line:
+                        self._notify(progress_callback, line)
+            except Exception:
+                log.debug("Output pump ended early", exc_info=True)
+
+        reader = threading.Thread(target=_pump, name="mlx-output", daemon=True)
+        reader.start()
         try:
-            assert process.stdout is not None
-            for line in process.stdout:
-                self._check_cancel(cancel_event)
-                line = line.strip()
-                if line:
-                    self._notify(progress_callback, line)
-            code = process.wait()
-        except Exception:
-            if process.poll() is None:
-                process.terminate()
-            process.wait(timeout=10)
+            while True:
+                try:
+                    code = process.wait(timeout=0.25)
+                    break
+                except subprocess.TimeoutExpired:
+                    self._check_cancel(cancel_event)
+        except BaseException:
+            self._kill_process_tree(process)
             raise
+        finally:
+            reader.join(timeout=2)
         if code != 0:
-            raise MLXServiceError(f"Command failed with exit code {code}: {' '.join(command)}")
+            raise MLXServiceError(
+                self._text(
+                    "mlx_command_failed", code=code, command=" ".join(command)
+                )
+            )
+
+    @staticmethod
+    def _kill_process_tree(process: subprocess.Popen) -> None:
+        """Terminate a child and its group; never let cleanup mask the cause."""
+        if process.poll() is not None:
+            return
+        try:
+            if hasattr(os, "killpg"):
+                os.killpg(os.getpgid(process.pid), signal.SIGTERM)
+            else:
+                process.terminate()
+        except (OSError, AttributeError, ValueError):
+            try:
+                process.terminate()
+            except OSError:
+                return
+        try:
+            process.wait(timeout=10)
+            return
+        except subprocess.TimeoutExpired:
+            log.warning("Child %s ignored SIGTERM; killing", process.pid)
+        except OSError:
+            return
+        try:
+            process.kill()
+            process.wait(timeout=5)
+        except (OSError, subprocess.TimeoutExpired):
+            log.error("Child %s could not be killed", process.pid)
 
     def prepare_model(
         self,
@@ -255,17 +346,24 @@ class MLXServiceManager:
         removed in ``finally`` after conversion succeeds or fails.
         """
         if not self.is_supported_platform():
-            raise MLXServiceError("HY-MT requires native Apple Silicon macOS")
+            raise MLXServiceError(self._text("mlx_requires_apple_silicon"))
+        # The server holds the model directory open; replacing it underneath a
+        # running mlx_lm.server would delete files it is still reading.
+        if self.is_running():
+            self._notify(progress_callback, self._text("mlx_stopping_for_prepare"))
+            self.stop()
+            if self.is_running():
+                raise MLXServiceError(self._text("mlx_stop_before_prepare"))
         models_dir = self.root / "models"
         models_dir.mkdir(parents=True, exist_ok=True)
         source_dir = models_dir / ".hy-mt1.5-7b-bf16.tmp"
         temp_model_dir = models_dir / f".{self.model_dir.name}.tmp"
         try:
             self._check_cancel(cancel_event)
-            self._notify(progress_callback, "检查 MLX 运行环境...")
+            self._notify(progress_callback, self._text("mlx_checking_env"))
             if not self.is_environment_ready():
                 if not self.env_dir.joinpath("bin", "python").is_file():
-                    self._notify(progress_callback, "创建 MLX 虚拟环境...")
+                    self._notify(progress_callback, self._text("mlx_creating_venv"))
                     self._run_logged(
                         [sys.executable, "-m", "venv", str(self.env_dir)],
                         progress_callback,
@@ -285,22 +383,27 @@ class MLXServiceManager:
                     progress_callback,
                     cancel_event,
                 )
+                self._version_cache = None
 
             self._check_cancel(cancel_event)
             if self.is_model_ready():
-                self._notify(progress_callback, "HY-MT 4-bit 模型已准备好。")
+                self._notify(progress_callback, self._text("mlx_model_already_ready"))
                 return
 
+            # modelscope goes into .mlx-venv, never into the venv the app itself
+            # is running from: preparing a translation model must not mutate the
+            # interpreter that is currently executing the GUI.
+            mlx_python = str(self.env_dir / "bin" / "python")
             try:
                 subprocess.run(
-                    [sys.executable, "-c", "import modelscope"],
+                    [mlx_python, "-c", "import modelscope"],
                     check=True,
                     stdout=subprocess.DEVNULL,
                     stderr=subprocess.DEVNULL,
                 )
             except (OSError, subprocess.CalledProcessError):
                 self._run_logged(
-                    [sys.executable, "-m", "pip", "install", "modelscope>=1.20.0"],
+                    [mlx_python, "-m", "pip", "install", "modelscope>=1.20.0"],
                     progress_callback,
                     cancel_event,
                 )
@@ -308,18 +411,20 @@ class MLXServiceManager:
             shutil.rmtree(source_dir, ignore_errors=True)
             shutil.rmtree(temp_model_dir, ignore_errors=True)
             source_dir.mkdir(parents=True, exist_ok=True)
-            self._notify(progress_callback, f"从 ModelScope 下载 {HY_MT_REPO}...")
+            self._notify(
+                progress_callback, self._text("mlx_downloading", repo=HY_MT_REPO)
+            )
             download_script = (
                 "import sys; from modelscope import snapshot_download; "
                 "snapshot_download(model_id=sys.argv[2], local_dir=sys.argv[1])"
             )
             self._run_logged(
-                [sys.executable, "-c", download_script, str(source_dir), HY_MT_REPO],
+                [mlx_python, "-c", download_script, str(source_dir), HY_MT_REPO],
                 progress_callback,
                 cancel_event,
             )
             self._check_cancel(cancel_event)
-            self._notify(progress_callback, "转换为 MLX 4-bit 模型...")
+            self._notify(progress_callback, self._text("mlx_converting"))
             self._run_logged(
                 [
                     str(self.env_dir / "bin" / "mlx_lm.convert"),
@@ -342,9 +447,21 @@ class MLXServiceManager:
             tokenizer_config = source_dir / "tokenizer_config.json"
             if tokenizer_config.is_file():
                 shutil.copy2(tokenizer_config, temp_model_dir / "tokenizer_config.json")
-            shutil.rmtree(self.model_dir, ignore_errors=True)
+            # No ignore_errors here: a half-removed model directory that then
+            # gets os.replace()d over is exactly how a corrupt install happens.
+            if self.model_dir.exists():
+                try:
+                    shutil.rmtree(self.model_dir)
+                except OSError as exc:
+                    raise MLXServiceError(
+                        self._text(
+                            "mlx_replace_failed",
+                            path=str(self.model_dir),
+                            error=exc,
+                        )
+                    ) from exc
             os.replace(temp_model_dir, self.model_dir)
-            self._notify(progress_callback, "HY-MT 4-bit 模型准备完成。")
+            self._notify(progress_callback, self._text("mlx_model_ready"))
         finally:
             shutil.rmtree(source_dir, ignore_errors=True)
             shutil.rmtree(temp_model_dir, ignore_errors=True)
@@ -420,19 +537,14 @@ class MLXServiceManager:
         self._cleanup_stale_pid()
         if not self.is_model_ready():
             raise MLXServiceError(
-                f"HY-MT MLX model is not deployed: {self.model_dir}. "
-                "请在翻译设置中点击‘准备本地模型’。"
+                self._text("mlx_model_not_deployed", path=str(self.model_dir))
             )
         if not self.is_environment_ready():
             raise MLXServiceError(
-                f"MLX environment is not installed: {self.env_dir}. "
-                "请在翻译设置中点击‘准备本地模型’。"
+                self._text("mlx_env_not_installed", path=str(self.env_dir))
             )
         if self._port_is_open():
-            raise MLXServiceError(
-                f"Port {MLX_PORT} is occupied by a non-MLX service; "
-                "refusing to terminate it."
-            )
+            raise MLXServiceError(self._text("mlx_port_occupied", port=MLX_PORT))
 
         self.log_dir.mkdir(parents=True, exist_ok=True)
         # mlx-lm's /v1/models handler scans the Hugging Face cache even for a
@@ -476,9 +588,16 @@ class MLXServiceManager:
 
         deadline = time.monotonic() + timeout
         while time.monotonic() < deadline:
-            self._check_cancel(cancel_event)
+            try:
+                self._check_cancel(cancel_event)
+            except MLXServiceError:
+                # Cancelling the wait must also reap the server we just spawned,
+                # exactly as the timeout branch below does — otherwise the
+                # process and its pid file outlive the cancelled task.
+                self.stop()
+                raise
             if progress_callback is not None:
-                progress_callback("正在等待 HY-MT 服务加载模型...")
+                progress_callback(self._text("mlx_waiting_for_model"))
             if self._probe() is not None:
                 log.info("Managed MLX service is ready on %s", self.base_url)
                 return
@@ -490,11 +609,14 @@ class MLXServiceManager:
                     pass
                 self.pid_file.unlink(missing_ok=True)
                 raise MLXServiceError(
-                    f"MLX service exited with code {self.process.returncode}.\n{tail}"
+                    self._text(
+                        "mlx_service_exited", code=self.process.returncode
+                    )
+                    + f"\n{tail}"
                 )
             time.sleep(0.5)
         self.stop()
-        raise MLXServiceError(f"Timed out waiting for MLX service at {self.base_url}")
+        raise MLXServiceError(self._text("mlx_start_timeout", url=self.base_url))
 
     def stop(self) -> None:
         pid = self.process.pid if self.process and self.process.poll() is None else self._read_pid()
@@ -507,22 +629,37 @@ class MLXServiceManager:
             self.process = None
             return
         log.info("Stopping managed MLX service (pid=%s)", pid)
-        try:
-            os.killpg(pid, signal.SIGTERM)
-        except ProcessLookupError:
-            pass
-        except OSError:
-            try:
-                os.kill(pid, signal.SIGTERM)
-            except OSError:
-                pass
+        # os.killpg and SIGKILL do not exist on Windows, and this runs from
+        # aboutToQuit on every platform: an AttributeError here would escape
+        # into Qt's shutdown rather than falling back to terminate().
+        self._signal_pid(pid, "SIGTERM")
         deadline = time.monotonic() + 5
         while self._pid_is_alive(pid) and time.monotonic() < deadline:
             time.sleep(0.1)
         if self._pid_is_alive(pid):
-            try:
-                os.killpg(pid, signal.SIGKILL)
-            except OSError:
-                pass
+            self._signal_pid(pid, "SIGKILL")
         self.pid_file.unlink(missing_ok=True)
         self.process = None
+
+    def _signal_pid(self, pid: int, name: str) -> None:
+        """Signal a process group, falling back to the process, then to Popen."""
+        sig = getattr(signal, name, None) or getattr(signal, "SIGTERM")
+        for send in (
+            lambda: os.killpg(pid, sig),
+            lambda: os.kill(pid, sig),
+        ):
+            try:
+                send()
+                return
+            except ProcessLookupError:
+                return
+            except (OSError, AttributeError):
+                continue
+        if self.process is not None and self.process.pid == pid:
+            try:
+                if name == "SIGKILL":
+                    self.process.kill()
+                else:
+                    self.process.terminate()
+            except OSError:
+                pass

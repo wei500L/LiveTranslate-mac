@@ -50,6 +50,10 @@ class VADProcessor:
         self.max_speech_samples = int(max_speech_duration * sample_rate)
         self._chunk_duration = chunk_duration
         self.mode = "silero"  # "silero", "energy", "disabled"
+        # Monotonic counter of segments dropped by the density filter. The
+        # pipeline watches it to reset interim state on a path that emits
+        # nothing (see LiveTranslateApp._capture_loop).
+        self.discarded_segments = 0
 
         # Silero v5 ships its model inside the `silero-vad` PyPI package, so load
         # it from there (zero network). Only fall back to the torch.hub cache
@@ -355,6 +359,10 @@ class VADProcessor:
                     f"discarding {dur:.1f}s segment"
                 )
                 self._reset()
+                # A discarded segment produces no vad_flush event, so the
+                # pipeline never learned the utterance had ended and carried its
+                # interim state (pending fragments, echo tail) into the next one.
+                self.discarded_segments += 1
                 return None
         segment = np.concatenate(self._speech_buffer)
         self._reset()

@@ -1,5 +1,35 @@
 # Changelog
 
+## 2026-08-30
+- Fixed a possible hang, or leftover processes, on exit: the stop sequence delivered its stop signal with a blocking queue write, which waited forever when the queue was full and the recognition thread had already gone; stopping is now idempotent and bounded, and a failure in one cleanup step no longer skips reclaiming the threads, transcript files, recognition worker and local service after it
+- Fixed exit and engine switching taking up to 120 seconds while the recognition worker was busy transcribing: the client's request lock and lifecycle lock were the same lock, so quitting queued behind the in-flight transcription; shutdown now aborts the worker immediately and the UI responds within a second or two, and switching engines mid-model-load can also be aborted at once
+- Fixed the recognition worker reporting "ready" after it was gone: a process that exited on its own, or whose handles were already closed, was treated as reusable, so later requests neither recovered nor reported an error
+- Fixed "delete all models and exit" leaving files behind: it used to quit Qt directly, bypassing pipeline cleanup while the recognition worker still held the model directories open; it now stops everything and confirms the worker is gone before deleting, deletes in the background with progress shown, and lists any paths it could not remove
+- Fixed Ctrl-C running several seconds of cleanup inside the signal handler; pressing it twice no longer duplicates that cleanup
+- Fixed pausing or quitting within 500ms of launch being overridden by the deferred start callback; the tray and overlay no longer claim to be running before the pipeline actually is
+- Fixed a roughly 2-second freeze when clicking the model list with the HY-MT model selected: deployment, environment and service status each spawned a subprocess or issued an HTTP request synchronously on the UI thread; all three now run in the background and the UI reads cached values
+- Fixed the translation context being cleared every 5 seconds while the HY-MT service was down: every probe reset the translator; it now happens once, on the available-to-unavailable transition, and automatic restarts have backoff and an attempt limit, after which you are told to start it manually
+- Fixed cancellation having no effect during quiet stretches of a model download: cancellation was only checked when the child process emitted a new line, so a download that printed nothing could not be interrupted; it now takes effect at any point and terminates the whole process tree, leaving no stray process or pid file
+- Fixed the console going silent after quitting mid-download: the replaced sys.stderr was only restored on the success path, so an early exit left it pointing at a destroyed window forever; every exit path now restores it
+- Fixed HY-MT model preparation installing dependencies into the app's own runtime environment, and possibly deleting a model directory the running service still had open
+- Fixed the first-run wizard writing a VAD threshold that disagreed with config.yaml (0.3 vs 0.5)
+- Fixed the subtitle window dropping sentences during a burst: a new final subtitle cancelled the one still waiting to be shown; they are now queued and displayed in arrival order
+- Fixed repetition detection depending on the streaming toggle: the non-streaming path skipped it entirely; added detection for output that starts fine and then falls into a loop
+- Fixed each sentence costing two full timeouts when the translation service is unreachable: the streaming fallback caught every exception and retried the whole request
+- Fixed incremental recognition emitting the same short reply repeatedly: buffering a short sentence did not advance the audio trim or the echo-dedup state, so the next pass recognized the same words again
+- Fixed leftover incremental state from a discarded noise segment carrying into the next utterance
+- Fixed settings, the overlay and the running translator possibly pointing at different models after a deletion: removing an entry before the active one shifted every later index up
+- Fixed the model benchmark issuing a different request than real translation: it now reuses the same request assembly (thinking mode, overrides, extra_body, JSON mode, role split), and benchmarking a thinking model or an unreachable endpoint no longer crashes or takes twice as long
+- Fixed quadratic line-wrapping cost on the UI thread for long subtitles, and a leading separator when one target language had an empty translation
+- Fixed repeatedly switching to the cache page spawning several concurrent model-directory scans
+- Fixed exported conversation logs being silently incomplete past 50 messages: the export now says it holds only the most recent N and points at the full transcript file
+- Fixed Windows audio capture going silent on queue congestion or a failed device restart: it now drops the oldest block instead of killing the capture thread, and retries a failed restart before stopping explicitly
+- Fixed a terminal capture failure being reported as "no data right now" in the macOS microphone-only mode; all three capture backends now express "no data" and "terminal failure" the same way
+- The remote ASR server now listens on 127.0.0.1 by default (0.0.0.0 exposed an unauthenticated GPU inference endpoint to the network), with an optional shared secret and a request body size limit; `uvicorn asr_server:app` no longer fails to start for lack of configuration
+- Fun-ASR-Nano audio loading failures now keep the original error instead of being masked by a follow-on UnboundLocalError
+- All HY-MT service progress and error messages, and the language-change notice, now follow the UI language
+- Removed the unused pyannote-audio / torchcodec macOS dependencies (only the long-form transcription path needs them, which this project does not take); added a two-way dependency symmetry check so a package can no longer go missing on one platform
+
 ## 2026-08-29
 - Fixed subtitles being stuck on "translating" forever when the local HY-MT model is selected but its service is not running: that failure shared one exception type with "the app is exiting" and was silently skipped, so the message never settled, never reached the combined transcript, and the internal pending table grew for the rest of the session; it now shows an explicit error and closes out properly
 - Fixed recognition stopping permanently when an ASR backend returned a malformed result: a missing or wrongly typed field killed the ASR thread while the capture thread kept filling a queue nobody drained, so no new subtitles appeared and no restart logic fired; results are now validated against one shared contract, and a single bad result is dropped and logged while later audio keeps being recognized

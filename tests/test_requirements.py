@@ -82,9 +82,22 @@ def test_mac_requirements_pin_gigaam_compatible_stack():
     assert "torch==2.8.0" in text
     assert "torchaudio==2.8.0" in text
     assert "transformers==4.57.1" in text
-    assert "pyannote-audio>=4.0,<5" in text
-    assert "torchcodec>=0.7" in text
     assert "socksio>=1.0.0" in text
+
+
+def test_the_unused_longform_stack_stays_out_of_the_dependency_set():
+    """pyannote-audio pulls in lightning and torchcodec for a code path
+    asr_gigaam.py never takes. It was declared and asserted, which froze an
+    unused heavyweight dependency into the contract."""
+    text = Path("requirements-mac.txt").read_text(encoding="utf-8")
+    declared = {
+        line.split("#", 1)[0].strip().lower()
+        for line in text.splitlines()
+        if line.split("#", 1)[0].strip()
+    }
+    assert not [d for d in declared if d.startswith(("pyannote", "torchcodec"))]
+    # The reason has to survive in the file, or someone re-adds them.
+    assert "transcribe_longform" in text
 
 
 def test_mac_launchers_require_the_verified_environment_marker():
@@ -119,6 +132,64 @@ def test_mac_requirements_contain_every_cross_platform_dependency():
 
     mac_names = {package_name(line) for line in mac}
     assert {package_name(line) for line in common} <= mac_names
+
+
+# Dependencies that legitimately exist on exactly one platform, with the reason.
+PLATFORM_ONLY = {
+    "pyaudiowpatch": "windows: WASAPI loopback capture",
+    "pyaudio": "macos: CoreAudio microphone fallback",
+    "torch": "macos pins the GigaAM-compatible arm64 build; windows installs "
+             "torch separately with a CUDA index-url",
+    "torchaudio": "same as torch",
+}
+
+
+def _package_names(path: str) -> set[str]:
+    names = set()
+    for line in Path(path).read_text(encoding="utf-8").splitlines():
+        requirement = line.split("#", 1)[0].strip().lower()
+        if not requirement:
+            continue
+        for separator in ("[", "=", ">", "<", "!", "~"):
+            requirement = requirement.split(separator, 1)[0]
+        names.add(requirement.strip())
+    return names
+
+
+def test_platform_specific_dependencies_are_all_deliberate():
+    """Both directions, not just windows ⊆ mac.
+
+    The one-way check let a dependency exist on macOS only and go unnoticed —
+    which is exactly how socksio ended up missing on Windows while the per-model
+    proxy field happily accepted socks5:// URLs.
+    """
+    windows = _package_names("requirements.txt")
+    mac = _package_names("requirements-mac.txt")
+
+    asymmetric = {
+        name
+        for name in (windows ^ mac)
+        # The pyobjc-* group is macOS by construction; it is checked as a group
+        # by the next test rather than enumerated package by package here.
+        if name not in PLATFORM_ONLY and not name.startswith("pyobjc-")
+    }
+    assert not asymmetric, (
+        f"platform-asymmetric dependencies without a documented reason: "
+        f"{sorted(asymmetric)}. Add them to the other file, or list them in "
+        f"PLATFORM_ONLY with why."
+    )
+
+
+def test_pyobjc_frameworks_are_a_recognised_macos_only_group():
+    mac_only = _package_names("requirements-mac.txt") - _package_names(
+        "requirements.txt"
+    )
+    unexplained = {
+        name
+        for name in mac_only
+        if not name.startswith("pyobjc-") and name not in PLATFORM_ONLY
+    }
+    assert not unexplained, f"undocumented macOS-only dependencies: {sorted(unexplained)}"
 
 
 def test_release_workflow_has_arm64_test_and_distinct_macos_artifact():

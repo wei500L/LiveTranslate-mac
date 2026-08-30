@@ -122,15 +122,61 @@ def normalize_torch_device(device: str | None) -> str:
     return normalize_device(device)
 
 
+# Payload keys that are part of the request envelope rather than transcribe
+# kwargs. Everything else is forwarded when the backend accepts it.
+_ENVELOPE_KEYS = frozenset({"audio"})
+
+_SIGNATURE_CACHE: dict[int, tuple] = {}
+
+
+def _accepted_kwargs(engine) -> tuple[set, bool]:
+    """(parameter names, accepts **kwargs) for this engine's transcribe.
+
+    Cached per engine instance: a worker handles one backend for its whole life,
+    and reflecting on every real-time call is pure overhead.
+    """
+    key = id(engine)
+    cached = _SIGNATURE_CACHE.get(key)
+    if cached is not None:
+        return cached
+    signature = inspect.signature(engine.transcribe)
+    names = set(signature.parameters)
+    var_kw = any(
+        param.kind is inspect.Parameter.VAR_KEYWORD
+        for param in signature.parameters.values()
+    )
+    _SIGNATURE_CACHE.clear()  # only ever one live engine per worker process
+    _SIGNATURE_CACHE[key] = (names, var_kw)
+    return names, var_kw
+
+
 def _transcribe(engine, payload: dict):
+    """Forward a transcribe request, saying out loud what it could not forward.
+
+    Anything the backend does not accept used to vanish without a trace, so a
+    client-side option could be ignored with no way to tell from either side.
+    """
     audio = payload.get("audio")
     if not isinstance(audio, np.ndarray):
         raise TypeError("transcribe payload audio must be a numpy.ndarray")
 
+    names, accepts_var_kwargs = _accepted_kwargs(engine)
     kwargs = {}
-    signature = inspect.signature(engine.transcribe)
-    if "word_timestamps" in signature.parameters:
-        kwargs["word_timestamps"] = bool(payload.get("word_timestamps", False))
+    ignored = []
+    for key, value in payload.items():
+        if key in _ENVELOPE_KEYS:
+            continue
+        if key in names or accepts_var_kwargs:
+            kwargs[key] = value
+        else:
+            ignored.append(key)
+    if "word_timestamps" in kwargs:
+        kwargs["word_timestamps"] = bool(kwargs["word_timestamps"])
+    if ignored:
+        log.debug(
+            "Backend %s does not accept transcribe kwargs %s; ignoring",
+            type(engine).__name__, sorted(ignored),
+        )
     return engine.transcribe(audio, **kwargs)
 
 

@@ -96,12 +96,24 @@ DEFAULT_SUBTITLE_WIN_SETTINGS = {
 
 
 def _merge_settings(base, override):
+    """Merge settings into a structure this window owns outright.
+
+    "lines" is copied element-wise rather than aliased: the settings widget and
+    this window must not end up holding the same mutable list of dicts, or
+    editing a line in the panel silently rewrites the live subtitle config.
+    """
     result = {**base}
     for k, v in (override or {}).items():
         if k == "lines" and isinstance(v, list):
-            result["lines"] = v
+            result["lines"] = [
+                dict(line) if isinstance(line, dict) else line for line in v
+            ]
         else:
             result[k] = v
+    result.setdefault("lines", [])
+    result["lines"] = [
+        dict(line) if isinstance(line, dict) else line for line in result["lines"]
+    ]
     return result
 
 
@@ -360,11 +372,18 @@ class _SubtitleTextWidget(QWidget):
                 segments.append(text)
                 break
 
+            # Binary search for the longest fitting prefix. Measuring every
+            # prefix in turn made this O(n^2) in glyph shaping — and it runs on
+            # the Qt thread for every subtitle update and every resize event.
+            lo, hi = 1, len(text)
             best = 0
-            for i in range(1, len(text) + 1):
-                if fm.horizontalAdvance(text[:i]) > avail_w:
-                    break
-                best = i
+            while lo <= hi:
+                mid = (lo + hi) // 2
+                if fm.horizontalAdvance(text[:mid]) <= avail_w:
+                    best = mid
+                    lo = mid + 1
+                else:
+                    hi = mid - 1
             if best == 0:
                 best = 1
 
@@ -514,7 +533,10 @@ class SubtitleWindow(QWidget):
         self._auto_hide_timer.timeout.connect(self._on_auto_hide_timeout)
         self._is_hidden_by_timeout = False
         # Pending overflow segments for delayed insertion
-        self._pending_segment_timers = []
+        # FIFO of finals waiting out the minimum display time, plus the single
+        # timer for its head.
+        self._pending_sentences = []
+        self._segment_timer = None
         # Minimum display time: queue rapid updates instead of replacing instantly
         self._last_insert_time = 0.0
         self._min_display_ms = 1500  # minimum ms before a sentence can be replaced
@@ -666,20 +688,9 @@ class SubtitleWindow(QWidget):
 
     def apply_settings(self, settings: dict):
         self._settings = _merge_settings(DEFAULT_SUBTITLE_WIN_SETTINGS, settings)
-
-        for w in self._text_widgets:
-            self._content_layout.removeWidget(w)
-            w.deleteLater()
-        self._text_widgets = []
-
-        for line_cfg in self._settings.get("lines", []):
-            if not line_cfg.get("enabled", True):
-                continue
-            tw = _SubtitleTextWidget()
-            tw.set_config(line_cfg)
-            tw.height_changed.connect(self._fit_height_animated)
-            self._text_widgets.append(tw)
-            self._content_layout.addWidget(tw)
+        # Was an inline copy of _rebuild_text_widgets; two implementations of the
+        # same twelve lines is exactly how they drift apart.
+        self._rebuild_text_widgets()
 
         self._content_layout.setSpacing(self._settings.get("line_spacing", 8))
 
@@ -816,23 +827,54 @@ class SubtitleWindow(QWidget):
 
     @pyqtSlot(str, str)
     def _on_update_text(self, original: str, translations_json: str):
-        translations = json.loads(translations_json)
-        self._cancel_pending_segments()
+        """Queue one final subtitle, honouring the minimum display time.
 
-        # Respect minimum display time: delay if previous sentence was inserted recently
+        A new message used to cancel whatever was pending, so a burst of short
+        sentences showed only the last one — every sentence that arrived inside
+        another's minimum display window was silently dropped. They are now
+        queued and shown in arrival order instead.
+        """
+        translations = json.loads(translations_json)
+        self._pending_sentences.append((original, translations))
+        self._drain_pending_sentences()
+
+    def _drain_pending_sentences(self):
+        """Show the head of the queue now, or arm the single timer for it."""
+        if self._segment_timer is not None or not self._pending_sentences:
+            return
         now_ms = time.monotonic() * 1000
         elapsed = now_ms - self._last_insert_time
-        base_delay = max(0, int(self._min_display_ms - elapsed)) if self._last_insert_time > 0 else 0
-
-        if base_delay == 0:
+        delay = (
+            max(0, int(self._min_display_ms - elapsed))
+            if self._last_insert_time > 0
+            else 0
+        )
+        if delay == 0:
+            original, translations = self._pending_sentences.pop(0)
             self._insert_sentence(original, translations)
-        else:
-            timer = QTimer(self)
-            timer.setSingleShot(True)
-            timer.setInterval(base_delay)
-            timer.timeout.connect(lambda o=original, t=translations: self._insert_sentence(o, t))
-            timer.start()
-            self._pending_segment_timers.append(timer)
+            self._drain_pending_sentences()
+            return
+        timer = QTimer(self)
+        timer.setSingleShot(True)
+        timer.setInterval(delay)
+        timer.timeout.connect(self._on_segment_timer)
+        self._segment_timer = timer
+        timer.start()
+
+    def _on_segment_timer(self):
+        self._clear_segment_timer()
+        if not self._pending_sentences:
+            return
+        original, translations = self._pending_sentences.pop(0)
+        self._insert_sentence(original, translations)
+        self._drain_pending_sentences()
+
+    def _clear_segment_timer(self):
+        timer = self._segment_timer
+        self._segment_timer = None
+        if timer is not None:
+            timer.stop()
+            timer.deleteLater()
 
     def _insert_sentence(self, original: str, translations: dict):
         """Insert a single sentence and refresh display."""
@@ -850,11 +892,9 @@ class SubtitleWindow(QWidget):
         self._last_insert_time = time.monotonic() * 1000
 
     def _cancel_pending_segments(self):
-        """Cancel any pending delayed segment insertions."""
-        for timer in self._pending_segment_timers:
-            timer.stop()
-            timer.deleteLater()
-        self._pending_segment_timers.clear()
+        """Drop the queue and its timer. Only clear/new-session/teardown."""
+        self._clear_segment_timer()
+        self._pending_sentences.clear()
 
 
     def _refresh_display(self):
@@ -882,7 +922,9 @@ class SubtitleWindow(QWidget):
                     if isinstance(tl_dict, str):
                         if tl_dict:
                             texts.append(tl_dict)
-                    elif lang and lang in tl_dict:
+                    elif lang and tl_dict.get(lang):
+                        # `lang in tl_dict` alone let an empty translation through
+                        # and produced a leading " | " in the joined line.
                         texts.append(tl_dict[lang])
                     elif "" in tl_dict and tl_dict[""]:
                         texts.append(tl_dict[""])

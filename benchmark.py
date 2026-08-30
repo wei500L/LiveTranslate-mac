@@ -3,7 +3,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from translator import make_openai_client
+from translator import Translator, stream_option_errors
 
 BENCH_SENTENCES = {
     "ja": [
@@ -51,6 +51,32 @@ BENCH_SENTENCES = {
 }
 
 
+def build_bench_translator(model: dict, prompt: str, target_lang: str, timeout_s):
+    """A Translator configured exactly like the runtime one, minus the state.
+
+    context_turns stays 0 and nothing here touches the app's active Translator:
+    a benchmark must measure the real request shape without writing history or
+    changing what the pipeline is using.
+    """
+    return Translator(
+        api_base=model["api_base"],
+        api_key=model["api_key"],
+        model=model["model"],
+        target_language=target_lang,
+        max_tokens=model.get("overrides", {}).get("max_tokens", 256),
+        temperature=model.get("overrides", {}).get("temperature", 0.3),
+        streaming=model.get("streaming", True),
+        system_prompt=model.get("system_prompt") or prompt,
+        proxy=model.get("proxy", "none"),
+        no_system_role=model.get("no_system_role", False),
+        json_response=model.get("json_response", False),
+        timeout=timeout_s,
+        overrides=model.get("overrides"),
+        extra_body=model.get("extra_body"),
+        thinking_style=model.get("thinking_style"),
+    )
+
+
 def run_benchmark(models, source_lang, target_lang, timeout_s, prompt, result_callback):
     """Run benchmark in a background thread. Calls result_callback(str) for each output line."""
     sentences = BENCH_SENTENCES.get(source_lang, BENCH_SENTENCES["en"])
@@ -66,55 +92,58 @@ def run_benchmark(models, source_lang, target_lang, timeout_s, prompt, result_ca
         name = m["name"]
         lines = [f"Model: {name}", f"  {'─' * 50}"]
         try:
-            client = make_openai_client(
-                m["api_base"],
-                m["api_key"],
-                proxy=m.get("proxy", "none"),
-                timeout=timeout_s,
+            bench_translator = build_bench_translator(
+                m, prompt, target_lang, timeout_s
             )
+            client = bench_translator._client
+            system_prompt = bench_translator._build_system_prompt(source_lang)
             ttfts = []
             totals = []
 
             for i, text in enumerate(sentences):
-                if m.get("no_system_role"):
-                    messages = [{"role": "user", "content": f"{prompt}\n{text}"}]
-                else:
-                    messages = [
-                        {"role": "system", "content": prompt},
-                        {"role": "user", "content": text},
-                    ]
+                # Exactly the runtime request: thinking style, overrides,
+                # extra_body, response_format and the system/user role split all
+                # come from the same assembly point the pipeline uses, so a
+                # benchmark result describes the request the app will actually
+                # send.
+                kwargs = bench_translator._build_request_kwargs(
+                    system_prompt, text, stream=True
+                )
                 try:
                     t0 = time.perf_counter()
-                    stream = client.chat.completions.create(
-                        model=m["model"],
-                        messages=messages,
-                        max_tokens=256,
-                        temperature=0.3,
-                        stream=True,
-                    )
+                    stream = client.chat.completions.create(**kwargs)
                     ttft = None
                     chunks = []
                     for chunk in stream:
                         if ttft is None:
                             ttft = (time.perf_counter() - t0) * 1000
+                        # A usage-only frame has no choices; indexing [0] here
+                        # raised IndexError and silently fell through to the
+                        # non-streaming path, polluting the latency numbers.
+                        if not chunk.choices:
+                            continue
                         delta = chunk.choices[0].delta
                         if delta.content:
                             chunks.append(delta.content)
                     total_ms = (time.perf_counter() - t0) * 1000
                     result_text = "".join(chunks).strip()
                     ttft = ttft or total_ms
-                except Exception:
+                except Exception as exc:
+                    # Only fall back for a rejected stream parameter. A
+                    # connection error retried here costs a second full timeout
+                    # per sentence, multiplied by the round count.
+                    if not isinstance(exc, stream_option_errors()):
+                        raise
+                    kwargs.pop("stream", None)
+                    kwargs.pop("stream_options", None)
                     t0 = time.perf_counter()
-                    resp = client.chat.completions.create(
-                        model=m["model"],
-                        messages=messages,
-                        max_tokens=256,
-                        temperature=0.3,
-                        stream=False,
-                    )
+                    resp = client.chat.completions.create(**kwargs)
                     total_ms = (time.perf_counter() - t0) * 1000
                     ttft = total_ms
-                    result_text = resp.choices[0].message.content.strip()
+                    # `or ""`: a thinking model that burned its whole budget
+                    # returns content=None, and this tool is exactly what a user
+                    # reaches for to diagnose that (issue #38).
+                    result_text = (resp.choices[0].message.content or "").strip()
 
                 ttfts.append(ttft)
                 totals.append(total_ms)

@@ -10,6 +10,8 @@ from dataclasses import dataclass, asdict
 
 import numpy as np
 
+from platform_permissions import CaptureRuntimeError
+
 log = logging.getLogger("LiveTranslate.Audio")
 
 
@@ -23,8 +25,46 @@ class CaptureMetrics:
     last_error: str | None = None
 
 
+def enqueue_latest(audio_queue, item, metrics) -> bool:
+    """Drop-oldest enqueue that never raises.
+
+    Shared with the Windows WASAPI backend, which predates AudioCaptureBase and
+    does not inherit from it. Both queue.Empty (a consumer beat us to the head)
+    and queue.Full (a producer refilled it) are ordinary races here, and letting
+    either escape kills the capture thread.
+    """
+    try:
+        audio_queue.put_nowait(item)
+    except queue.Full:
+        metrics.dropped_blocks += 1
+        try:
+            audio_queue.get_nowait()
+            audio_queue.put_nowait(item)
+        except (queue.Empty, queue.Full):
+            return False
+    metrics.output_blocks += 1
+    metrics.queue_depth = audio_queue.qsize()
+    return True
+
+
 class AudioCaptureBase:
-    """Normalize arbitrary native callback buffers to 16k mono 512-sample blocks."""
+    """Normalize arbitrary native callback buffers to 16k mono 512-sample blocks.
+
+    **get_audio() contract, identical in all three backends.** The pipeline's
+    _capture_loop distinguishes exactly two outcomes, so a backend must never
+    blur them:
+
+    * ``None`` — no block available within ``timeout``. Transient and normal;
+      the loop keeps polling.
+    * ``(audio, mic_rms)`` — one 512-sample block.
+    * raises ``CaptureRuntimeError`` (or another ``PlatformCaptureError``) —
+      the capture is terminally dead. The loop stops the pipeline and reports it.
+
+    A backend that turns a terminal failure into ``None`` produces the worst
+    failure mode this app has: the process keeps running, the UI keeps saying
+    "Running", and no audio ever arrives again. Set ``_terminal_error`` from a
+    backend thread to make the next get_audio() raise.
+    """
 
     block_size = 512
     _resample_index_cache = {}
@@ -44,6 +84,9 @@ class AudioCaptureBase:
         self._pending_mic_samples = 0
         self._metrics = CaptureMetrics()
         self._lock = threading.RLock()
+        # Set by a backend thread that has failed for good; get_audio() turns it
+        # into the exception the pipeline expects.
+        self._terminal_error: str | None = None
 
     @staticmethod
     def resample_to_mono(
@@ -115,18 +158,11 @@ class AudioCaptureBase:
         )
 
     def _enqueue(self, audio: np.ndarray, mic_rms: float | None):
-        item = (np.asarray(audio, dtype=np.float32), mic_rms)
-        try:
-            self.audio_queue.put_nowait(item)
-        except queue.Full:
-            self._metrics.dropped_blocks += 1
-            try:
-                self.audio_queue.get_nowait()
-                self.audio_queue.put_nowait(item)
-            except (queue.Empty, queue.Full):
-                return
-        self._metrics.output_blocks += 1
-        self._metrics.queue_depth = self.audio_queue.qsize()
+        enqueue_latest(
+            self.audio_queue,
+            (np.asarray(audio, dtype=np.float32), mic_rms),
+            self._metrics,
+        )
 
     def push_audio(
         self,
@@ -183,7 +219,16 @@ class AudioCaptureBase:
             self._metrics.queue_depth = self.audio_queue.qsize()
             return asdict(self._metrics)
 
+    def fail_terminally(self, reason: str):
+        """Mark the capture dead; the next get_audio() raises."""
+        self._terminal_error = reason
+        self._metrics.last_error = reason
+        log.error("Audio capture failed terminally: %s", reason)
+
     def get_audio(self, timeout=1.0):
+        """See the class docstring for the three-outcome contract."""
+        if self._terminal_error is not None:
+            raise CaptureRuntimeError(self._terminal_error)
         try:
             return self.audio_queue.get(timeout=timeout)
         except queue.Empty:
@@ -196,6 +241,7 @@ class AudioCaptureBase:
 
     def start(self):
         self._stop_event.clear()
+        self._terminal_error = None
         self._running = True
 
 

@@ -9,7 +9,6 @@ from pathlib import Path
 from PyQt6.QtCore import QThread, Qt, QTimer, pyqtSignal
 from PyQt6.QtGui import QFont
 from PyQt6.QtWidgets import (
-    QApplication,
     QColorDialog,
     QComboBox,
     QDoubleSpinBox,
@@ -116,21 +115,53 @@ class _MLXTaskThread(QThread):
             self.succeeded.emit()
 
 
+class _CacheScanThread(QThread):
+    """Walk the model cache off the Qt thread.
+
+    Scanning several GB of model directories took seconds, and _on_tab_changed
+    started a fresh bare thread on every switch to the cache page — so flipping
+    tabs a few times had several full traversals running at once.
+    """
+
+    result = pyqtSignal(list)
+
+    def run(self):
+        entries = []
+        try:
+            for name, path in get_cache_entries():
+                entries.append((name, str(path), dir_size(path)))
+        except Exception:
+            log.error("Cache scan failed", exc_info=True)
+        self.result.emit(entries)
+
+
 class _MLXHealthThread(QThread):
-    """Probe the managed service without blocking the Qt event loop."""
+    """Probe the managed service without blocking the Qt event loop.
+
+    Reports the full status triple, not just "running": is_model_ready(),
+    is_environment_ready() and is_running() respectively walk a directory,
+    spawn a Python interpreter and issue a 1.5s HTTP request, and the panel
+    used to call all three synchronously from a list-selection handler.
+    """
 
     checked = pyqtSignal(bool)
+    status = pyqtSignal(dict)
 
     def __init__(self, manager, parent=None):
         super().__init__(parent)
         self.manager = manager
 
     def run(self):
+        state = {"deployed": False, "environment": False, "running": False}
         try:
-            running = self.manager.is_running()
+            state["deployed"] = self.manager.is_model_ready()
+            state["environment"] = self.manager.is_environment_ready()
+            if state["deployed"] and state["environment"]:
+                state["running"] = self.manager.is_running()
         except Exception:
-            running = False
-        self.checked.emit(running)
+            log.debug("MLX health probe failed", exc_info=True)
+        self.status.emit(state)
+        self.checked.emit(state["running"])
 
 
 def migrate_performance_settings(settings: dict | None) -> dict | None:
@@ -146,6 +177,24 @@ def migrate_performance_settings(settings: dict | None) -> dict | None:
     settings.setdefault("translation_workers", 8)
     settings["performance_profile_version"] = PERFORMANCE_PROFILE_VERSION
     return settings
+
+
+def active_index_after_removal(removed: int, active: int, remaining: int) -> int:
+    """Where active_model points after `removed` is deleted from the list.
+
+    Removing an entry *before* the active one shifts everything after it up by
+    one; only clamping the tail (as the old code did) left active_model pointing
+    at a different model than the running Translator was using.
+    """
+    if remaining <= 0:
+        return 0
+    if removed < active:
+        index = active - 1
+    elif removed == active:
+        index = active  # take whatever slid into this slot
+    else:
+        index = active
+    return max(0, min(index, remaining - 1))
 
 
 def _open_folder(path):
@@ -202,14 +251,23 @@ class ControlPanel(QWidget):
     _bench_result = pyqtSignal(str)
     _cache_result = pyqtSignal(list)
     reset_positions = pyqtSignal()
+    # The panel asks the app to quit; it must not quit the Qt application
+    # itself, which would skip the pipeline cleanup entirely.
+    delete_cache_and_quit_requested = pyqtSignal(list)
 
     def __init__(self, config, saved_settings=None):
         super().__init__()
         self._config = config
         self._mlx_manager = MLXServiceManager()
+        # mlx_service deliberately has no i18n dependency; the UI layer supplies
+        # the lookup so its progress and error strings reach the user localized.
+        self._mlx_manager.translate = t
         self._mlx_task = None
         self._mlx_health_task = None
         self._mlx_task_target_index = None
+        # Filled by _MLXHealthThread; None means "not probed yet".
+        self._mlx_status_cache = None
+        self._cache_task = None
         self.setWindowTitle(t("window_control_panel"))
         self.setMinimumSize(760, 520)
         self.resize(900, min(760, available_screen_height(self)))
@@ -1239,18 +1297,22 @@ class ControlPanel(QWidget):
             self._refresh_cache()
 
     def _refresh_cache(self):
+        if self._cache_task is not None and self._cache_task.isRunning():
+            self._cache_total.setText(t("scanning"))
+            return
         self._cache_list.clear()
         self._cache_total.setText(t("scanning"))
+        task = _CacheScanThread(self)
+        self._cache_task = task
+        task.result.connect(self._cache_result.emit)
+        task.finished.connect(self._on_cache_scan_finished)
+        task.start()
 
-        def _scan():
-            entries = get_cache_entries()
-            results = []
-            for name, path in entries:
-                size = dir_size(path)
-                results.append((name, str(path), size))
-            self._cache_result.emit(results)
-
-        threading.Thread(target=_scan, daemon=True).start()
+    def _on_cache_scan_finished(self):
+        task = self._cache_task
+        self._cache_task = None
+        if task is not None:
+            task.deleteLater()
 
     def _on_cache_result(self, results):
         self._cache_list.clear()
@@ -1266,9 +1328,14 @@ class ControlPanel(QWidget):
         )
 
     def _delete_all_and_exit(self):
+        """Confirm, then hand the work to the app.
+
+        The panel deliberately does neither the delete nor the quit: model
+        directories can only be removed after the ASR worker that has them open
+        is gone, and only the app owns that shutdown order.
+        """
         if not self._cache_entries:
             return
-        import shutil
 
         total_size = sum(s for _, _, s in self._cache_entries)
         ret = QMessageBox.warning(
@@ -1282,13 +1349,7 @@ class ControlPanel(QWidget):
         )
         if ret != QMessageBox.StandardButton.Yes:
             return
-        for name, path, _ in self._cache_entries:
-            try:
-                shutil.rmtree(path)
-                log.info(f"Deleted: {path}")
-            except Exception as e:
-                log.error(f"Failed to delete {path}: {e}")
-        QApplication.instance().quit()
+        self.delete_cache_and_quit_requested.emit(list(self._cache_entries))
 
     def _get_asr_lang_code(self) -> str:
         """Get the language code from the ASR language combo (stored as userData)."""
@@ -1453,6 +1514,12 @@ class ControlPanel(QWidget):
         return None
 
     def _update_mlx_controls(self, *_):
+        """Paint the MLX controls from cached state only.
+
+        Nothing here may touch the filesystem, spawn a process or open a
+        socket: this is wired to _model_list.currentRowChanged, and the three
+        manager queries it used to make froze the panel for ~2s per click.
+        """
         if not hasattr(self, "_mlx_controls"):
             return
         model = self._selected_mlx_model()
@@ -1460,9 +1527,22 @@ class ControlPanel(QWidget):
         self._mlx_controls.setVisible(visible)
         if not visible:
             return
-        ready = self._mlx_manager.is_model_ready() and self._mlx_manager.is_environment_ready()
-        running = self._mlx_manager.is_running() if ready else False
         busy = self._mlx_task is not None and self._mlx_task.isRunning()
+        if self._mlx_status_cache is None:
+            # Nothing probed yet: say so and let the background thread answer.
+            self._mlx_prepare_btn.setVisible(False)
+            self._mlx_start_btn.setVisible(False)
+            self._mlx_stop_btn.setVisible(False)
+            self._mlx_progress.setVisible(busy)
+            if not busy:
+                self._mlx_status.setText(t("mlx_status_checking"))
+            self.request_mlx_health_check()
+            return
+        ready = (
+            self._mlx_status_cache["deployed"]
+            and self._mlx_status_cache["environment"]
+        )
+        running = self._mlx_status_cache["running"]
         self._mlx_prepare_btn.setEnabled(not busy and not ready)
         self._mlx_prepare_btn.setVisible(not ready)
         self._mlx_progress.setVisible(busy)
@@ -1486,6 +1566,7 @@ class ControlPanel(QWidget):
             target_index = self._model_list.currentRow()
         self._mlx_task_target_index = target_index
         self._mlx_task_activate = activate_on_success
+        self._mlx_task_action = action
         self._mlx_task = _MLXTaskThread(self._mlx_manager, action, self)
         self._mlx_task.progress.connect(self._on_mlx_progress)
         self._mlx_task.failed.connect(self._on_mlx_task_failed)
@@ -1507,7 +1588,11 @@ class ControlPanel(QWidget):
     def _on_mlx_task_succeeded(self):
         row = self._mlx_task_target_index
         models = self._current_settings.get("models", [])
-        if isinstance(row, int) and 0 <= row < len(models) and self._mlx_manager.is_running():
+        # The action tells us whether a service is now up; re-probing here would
+        # put a 1.5s HTTP request back on the Qt thread for no new information
+        # ("prepare" deliberately leaves the service stopped).
+        started = getattr(self, "_mlx_task_action", None) == "start"
+        if isinstance(row, int) and 0 <= row < len(models) and started:
             model = models[row]
             if getattr(self, "_mlx_task_activate", True):
                 self._current_settings["active_model"] = row
@@ -1541,14 +1626,26 @@ class ControlPanel(QWidget):
             return False
         if not self._mlx_manager.is_supported_platform():
             return False
-        ready = self._mlx_manager.is_model_ready() and self._mlx_manager.is_environment_ready()
-        if ready and not self._mlx_manager.is_running():
+        state = self._mlx_status_cache
+        if state is None:
+            # Startup only: nothing has probed yet, so pay for one direct query
+            # and seed the cache the periodic health thread maintains afterwards.
+            state = {
+                "deployed": self._mlx_manager.is_model_ready(),
+                "environment": self._mlx_manager.is_environment_ready(),
+                "running": False,
+            }
+            if state["deployed"] and state["environment"]:
+                state["running"] = self._mlx_manager.is_running()
+            self._mlx_status_cache = state
+        if state["deployed"] and state["environment"] and not state["running"]:
             self._run_mlx_task("start", target_index=active_index, activate_on_success=False)
             return True
         return False
 
     def _stop_mlx_service(self):
         self._mlx_manager.stop()
+        self._mlx_status_cache = None
         self.mlx_service_state_changed.emit(False)
         if self._selected_mlx_model() is not None:
             self._current_settings["active_model"] = self._model_list.currentRow()
@@ -1576,14 +1673,23 @@ class ControlPanel(QWidget):
         self._mlx_task = None
         if task is not None:
             task.deleteLater()
+        # prepare/start just changed the very state the cache describes.
+        self._mlx_status_cache = None
         self._update_mlx_controls()
         self._maybe_close_after_mlx_tasks()
+
+    def _on_mlx_status(self, state: dict):
+        changed = state != self._mlx_status_cache
+        self._mlx_status_cache = state
+        if changed:
+            self._update_mlx_controls()
 
     def request_mlx_health_check(self):
         if self._mlx_health_task is not None and self._mlx_health_task.isRunning():
             return
         task = _MLXHealthThread(self._mlx_manager, self)
         self._mlx_health_task = task
+        task.status.connect(self._on_mlx_status)
         task.checked.connect(self.mlx_health_checked.emit)
         task.finished.connect(self._on_mlx_health_finished)
         task.start()
@@ -1616,14 +1722,14 @@ class ControlPanel(QWidget):
         if dlg.exec():
             data = dlg.get_data()
             if data["name"] and data["model"]:
-                self._current_settings.setdefault("models", []).append(data)
+                self._models().append(data)
                 self._refresh_model_list()
                 _save_settings(self._current_settings)
                 self._emit_models_list_changed()
 
     def _edit_model(self):
         row = self._model_list.currentRow()
-        models = self._current_settings.get("models", [])
+        models = self._models()
         if row < 0 or row >= len(models):
             return
         dlg = ModelEditDialog(self, models[row])
@@ -1639,9 +1745,17 @@ class ControlPanel(QWidget):
                 if row == active:
                     self.model_changed.emit(data)
 
+    def _models(self) -> list:
+        """The persisted model list, creating it if absent.
+
+        `.get("models", [])` handed back a throwaway list when the key was
+        missing, so append/pop on the result silently went nowhere.
+        """
+        return self._current_settings.setdefault("models", [])
+
     def _dup_model(self):
         row = self._model_list.currentRow()
-        models = self._current_settings.get("models", [])
+        models = self._models()
         if row < 0 or row >= len(models):
             return
         dup = dict(models[row])
@@ -1652,18 +1766,37 @@ class ControlPanel(QWidget):
         self._emit_models_list_changed()
 
     def _remove_model(self):
+        """Delete a model, keeping active_model pointing at the same entry.
+
+        The old code only clamped the index when it ran off the end, so deleting
+        anything *before* the active model shifted the whole list up and left
+        active_model silently pointing at a different model than the one the
+        running Translator was using.
+        """
         row = self._model_list.currentRow()
-        models = self._current_settings.get("models", [])
+        models = self._models()
         if row < 0 or row >= len(models) or len(models) <= 1:
             return
+
+        old_active = self._current_settings.get("active_model", 0)
+        if not isinstance(old_active, int):
+            old_active = 0
+        old_model = models[old_active] if 0 <= old_active < len(models) else None
+
         models.pop(row)
-        active = self._current_settings.get("active_model", 0)
-        if active >= len(models):
-            self._current_settings["active_model"] = len(models) - 1
+        new_active = active_index_after_removal(row, old_active, len(models))
+        self._current_settings["active_model"] = new_active
+
         self._refresh_model_list()
         self._model_list.setCurrentRow(min(row, len(models) - 1))
         _save_settings(self._current_settings)
         self._emit_models_list_changed()
+
+        # Tell the app only when the active model object actually changed;
+        # a pure index shift onto the same dict needs no Translator rebuild.
+        new_model = models[new_active] if 0 <= new_active < len(models) else None
+        if new_model is not None and new_model is not old_model:
+            self.model_changed.emit(new_model)
 
     def _on_model_double_clicked(self, item):
         row = self._model_list.row(item)
@@ -1742,18 +1875,14 @@ class ControlPanel(QWidget):
     def _on_ui_lang_changed(self, index):
         lang = "en" if index == 0 else "zh"
         self._current_settings["ui_lang"] = lang
-        _save_settings(self._current_settings)
         from i18n import set_lang
 
+        # set_lang first, so the notice below is already in the new language.
         set_lang(lang)
-        from PyQt6.QtWidgets import QMessageBox
-
-        QMessageBox.information(
-            self,
-            "LiveTranslate",
-            "Language changed. Please restart the application.\n"
-            "语言已更改，请重启应用程序。",
-        )
+        # Through _auto_save like every other setting, rather than writing the
+        # file directly and skipping _apply_settings.
+        self._auto_save()
+        QMessageBox.information(self, "LiveTranslate", t("ui_lang_restart_required"))
 
     def _auto_save(self):
         self._save_timer.start()

@@ -36,6 +36,21 @@ from mlx_service import MLXServiceManager, hy_mt_model_config, is_hy_mt_model
 
 log = logging.getLogger("LiveTranslate.Dialogs")
 
+CONFIG_FILE = Path(__file__).parent / "config.yaml"
+
+
+def _config_asr_defaults() -> dict:
+    """ASR/VAD defaults from config.yaml, so the wizard has one source of truth."""
+    try:
+        import yaml
+
+        data = yaml.safe_load(CONFIG_FILE.read_text(encoding="utf-8")) or {}
+        asr = data.get("asr")
+        return asr if isinstance(asr, dict) else {}
+    except Exception:
+        log.warning("Could not read ASR defaults from config.yaml", exc_info=True)
+        return {}
+
 
 def available_screen_height(widget: QWidget) -> int:
     """Usable vertical space on the widget's screen, minus a margin for
@@ -96,22 +111,37 @@ _ANSI_RE = re.compile(r"\x1b\[[0-9;]*[A-Za-z]")
 
 
 class _StderrCapture:
-    """Captures stderr (tqdm) and forwards cleaned lines via callback."""
+    """Captures stderr (tqdm) and forwards cleaned lines via callback.
+
+    Implements the full minimal file interface, not just write/flush/isatty:
+    third-party download code probes ``fileno``, ``encoding`` and ``errors``,
+    and an AttributeError on any of them lands in the middle of a download.
+    ``detach()`` drops the callback so a destroyed dialog can never be emitted
+    to, even if something outlives the restore.
+    """
 
     def __init__(self, callback, original):
         self._cb = callback
         self._orig = original
 
+    def detach(self):
+        self._cb = None
+
     def write(self, text):
         if self._orig:
             self._orig.write(text)
-        if not text:
+        if not text or self._cb is None:
             return
         cleaned = _ANSI_RE.sub("", text)
         for line in cleaned.splitlines():
             line = line.strip()
             if line:
-                self._cb(line)
+                try:
+                    self._cb(line)
+                except RuntimeError:
+                    # The owning dialog was destroyed; stop forwarding.
+                    self._cb = None
+                    return
 
     def flush(self):
         if self._orig:
@@ -119,6 +149,105 @@ class _StderrCapture:
 
     def isatty(self):
         return False
+
+    def fileno(self):
+        if self._orig is None:
+            raise OSError("captured stderr has no file descriptor")
+        return self._orig.fileno()
+
+    @property
+    def encoding(self):
+        return getattr(self._orig, "encoding", "utf-8")
+
+    @property
+    def errors(self):
+        return getattr(self._orig, "errors", "replace")
+
+
+class _OutputCapture:
+    """Install/restore the root log handler and sys.stderr as one unit.
+
+    Restoration must not depend on reaching a success branch: the previous code
+    restored only in _check_done's happy path, so quitting mid-download left
+    sys.stderr pointing at a deleted QDialog's signal for the rest of the
+    process's life.
+    """
+
+    def __init__(self, emit):
+        self._handler = _LogCapture(emit)
+        self._emit = emit
+        self._capture = None
+        self._original = None
+        self._installed = False
+
+    def install(self):
+        if self._installed:
+            return
+        logging.getLogger().addHandler(self._handler)
+        self._original = sys.stderr
+        self._capture = _StderrCapture(self._emit, self._original)
+        sys.stderr = self._capture
+        self._installed = True
+
+    def restore(self):
+        if not self._installed:
+            return
+        self._installed = False
+        try:
+            logging.getLogger().removeHandler(self._handler)
+        except Exception:
+            pass
+        if self._capture is not None:
+            self._capture.detach()
+        # Only put back what we replaced; something else may have swapped it
+        # again in the meantime, and clobbering that would be worse.
+        if sys.stderr is self._capture:
+            sys.stderr = self._original
+        self._capture = None
+
+    def __enter__(self):
+        self.install()
+        return self
+
+    def __exit__(self, *_):
+        self.restore()
+        return False
+
+
+class _DownloadThread(QThread):
+    """Run model downloads off the Qt thread, cancellably.
+
+    Replaces a bare threading.Thread polled by a 200ms QTimer — the pattern
+    that made cancellation and teardown-time restoration impossible. Same shape
+    as _ConnectionTestThread here and _MLXTaskThread in control_panel.
+    """
+
+    failed = pyqtSignal(str)
+    succeeded = pyqtSignal()
+
+    def __init__(self, steps, parent=None):
+        super().__init__(parent)
+        self._steps = list(steps)
+        self.cancel_event = threading.Event()
+
+    def run(self):
+        try:
+            for step in self._steps:
+                if self.cancel_event.is_set():
+                    self.failed.emit(t("download_cancelled"))
+                    return
+                step()
+        except Exception as exc:
+            if self.cancel_event.is_set():
+                self.failed.emit(t("download_cancelled"))
+            else:
+                log.error(f"Download failed: {exc}", exc_info=True)
+                self.failed.emit(str(exc))
+            return
+        if self.cancel_event.is_set():
+            self.failed.emit(t("download_cancelled"))
+        else:
+            self.succeeded.emit()
 
 
 class _ConnectionTestThread(QThread):
@@ -261,9 +390,15 @@ class SetupWizardDialog(QDialog):
         self._log_view.hide()
         layout.addWidget(self._log_view)
 
+        self._cancel_btn = QPushButton(t("btn_cancel"))
+        self._cancel_btn.clicked.connect(self._cancel_download)
+        self._cancel_btn.hide()
+        layout.addWidget(self._cancel_btn)
+
         self._error = None
         self._log_signal.connect(self._append_log)
-        self._log_handler = _LogCapture(self._log_signal.emit)
+        self._capture = _OutputCapture(self._log_signal.emit)
+        self._download_thread = None
 
         # Auto-start countdown
         self._countdown = 15
@@ -322,67 +457,83 @@ class SetupWizardDialog(QDialog):
 
         hub = "ms" if self._hub_combo.currentIndex() == 0 else "hf"
         self._proxy = self._download_proxy()
+        proxy = self._proxy
 
-        logging.getLogger().addHandler(self._log_handler)
-        self._orig_stderr = sys.stderr
-        sys.stderr = _StderrCapture(self._log_signal.emit, self._orig_stderr)
-
+        self._capture.install()
         self._error = None
-        self._download_thread = threading.Thread(
-            target=self._download_worker, args=(hub, self._proxy), daemon=True
+        self._cancel_btn.show()
+        self._download_thread = _DownloadThread(
+            [
+                lambda: download_silero(proxy=proxy),
+                lambda: download_asr(
+                    "funasr", model_size="sensevoice-small", hub=hub, proxy=proxy
+                ),
+            ],
+            self,
         )
+        self._download_thread.failed.connect(self._on_failed)
+        self._download_thread.succeeded.connect(self._on_succeeded)
+        self._download_thread.finished.connect(self._on_finished)
         self._download_thread.start()
 
-        self._poll_timer = QTimer()
-        self._poll_timer.setInterval(200)
-        self._poll_timer.timeout.connect(self._check_done)
-        self._poll_timer.start()
+    def _cancel_download(self):
+        if self._download_thread is not None and self._download_thread.isRunning():
+            self._cancel_btn.setEnabled(False)
+            self._append_log(t("download_cancelling"))
+            self._download_thread.cancel_event.set()
 
-    def _download_worker(self, hub, proxy):
-        try:
-            download_silero(proxy=proxy)
-            download_asr("funasr", model_size="sensevoice-small", hub=hub, proxy=proxy)
-        except Exception as e:
-            self._error = str(e)
-            log.error(f"Download failed: {e}", exc_info=True)
+    def _on_finished(self):
+        # Always, on every outcome including cancellation and a closed dialog.
+        self._capture.restore()
+        self._cancel_btn.hide()
+        self._cancel_btn.setEnabled(True)
 
-    def _check_done(self):
-        if self._download_thread.is_alive():
-            return
-        self._poll_timer.stop()
-        sys.stderr = self._orig_stderr
-        logging.getLogger().removeHandler(self._log_handler)
+    def _on_failed(self, message):
+        self._error = message
+        self._append_log(f"\n{t('download_failed').format(error=message)}")
+        self._download_btn.setEnabled(True)
+        self._download_btn.setText(t("btn_retry"))
+        self._hub_combo.setEnabled(True)
+        self._proxy_mode.setEnabled(True)
+        self._proxy_url.setEnabled(self._proxy_mode.currentIndex() == 2)
 
-        if self._error:
-            self._append_log(f"\n{t('download_failed').format(error=self._error)}")
-            self._download_btn.setEnabled(True)
-            self._download_btn.setText(t("btn_retry"))
-            self._hub_combo.setEnabled(True)
-            self._proxy_mode.setEnabled(True)
-            self._proxy_url.setEnabled(self._proxy_mode.currentIndex() == 2)
-            return
-
+    def _on_succeeded(self):
         self._append_log(f"\n{t('download_complete')}")
         hub = "ms" if self._hub_combo.currentIndex() == 0 else "hf"
         from control_panel import _save_settings
 
+        # VAD/segmentation defaults come from config.yaml rather than a second
+        # hardcoded copy: the wizard's vad_threshold used to be 0.3 while
+        # config.yaml said 0.5, so a first launch silently disagreed with every
+        # other launch.
+        asr_defaults = _config_asr_defaults()
         settings = {
             "hub": hub,
             "download_proxy": self._proxy,
             "asr_engine": "funasr",
             "funasr_model": "sensevoice-small",
             "vad_mode": "silero",
-            "vad_threshold": 0.3,
+            "vad_threshold": asr_defaults.get("vad_threshold", 0.5),
             "energy_threshold": 0.02,
-            "min_speech_duration": 1.0,
-            "max_speech_duration": 8.0,
+            "min_speech_duration": asr_defaults.get("min_speech_duration", 1.0),
+            "max_speech_duration": asr_defaults.get("max_speech_duration", 8.0),
             "silence_mode": "auto",
             "silence_duration": 0.8,
-            "asr_language": "auto",
+            "asr_language": asr_defaults.get("language", "auto"),
             "target_language": "zh",
         }
         _save_settings(settings)
         QTimer.singleShot(500, self.accept)
+
+    def closeEvent(self, event):
+        self._cancel_download()
+        self._capture.restore()
+        super().closeEvent(event)
+
+    def reject(self):
+        self._cancel_download()
+        self._capture.restore()
+        super().reject()
 
 
 class ModelDownloadDialog(QDialog):
@@ -415,6 +566,10 @@ class ModelDownloadDialog(QDialog):
         self._log_view.setObjectName("logView")
         layout.addWidget(self._log_view)
 
+        self._cancel_btn = QPushButton(t("btn_cancel"))
+        self._cancel_btn.clicked.connect(self._cancel_download)
+        layout.addWidget(self._cancel_btn)
+
         self._close_btn = QPushButton(t("btn_close"))
         self._close_btn.clicked.connect(self.reject)
         self._close_btn.hide()
@@ -424,9 +579,10 @@ class ModelDownloadDialog(QDialog):
         self._hub = hub
         self._proxy = proxy
         self._error = None
+        self._download_thread = None
 
         self._log_signal.connect(self._append_log)
-        self._log_handler = _LogCapture(self._log_signal.emit)
+        self._capture = _OutputCapture(self._log_signal.emit)
 
         QTimer.singleShot(100, self._start_download)
 
@@ -436,65 +592,74 @@ class ModelDownloadDialog(QDialog):
             self._log_view.verticalScrollBar().maximum()
         )
 
-    def _start_download(self):
-        logging.getLogger().addHandler(self._log_handler)
-        self._orig_stderr = sys.stderr
-        sys.stderr = _StderrCapture(self._log_signal.emit, self._orig_stderr)
+    def _download_step(self, model):
+        """One model download, bound so _DownloadThread can check cancellation
+        between models. The set of models and the hub/proxy handling are
+        unchanged."""
+        kind = model["type"]
+        if kind == "silero-vad":
+            return lambda: download_silero(proxy=self._proxy)
+        if kind in (
+            "sensevoice",
+            "funasr-nano",
+            "funasr-mlt-nano",
+            "anime-whisper",
+            "gigaam",
+        ):
+            return lambda: download_asr(kind, hub=self._hub, proxy=self._proxy)
+        if kind.startswith("funasr:"):
+            model_key = kind.split(":", 1)[1]
+            return lambda: download_asr(
+                "funasr", model_size=model_key, hub=self._hub, proxy=self._proxy
+            )
+        if kind.startswith("whisper-"):
+            size = kind.replace("whisper-", "")
+            return lambda: download_asr(
+                "whisper", model_size=size, hub=self._hub, proxy=self._proxy
+            )
+        return lambda: log.warning("Unknown model type, skipping: %s", kind)
 
-        self._download_thread = threading.Thread(
-            target=self._download_worker, daemon=True
+    def _start_download(self):
+        self._capture.install()
+        self._download_thread = _DownloadThread(
+            [self._download_step(m) for m in self._missing], self
         )
+        self._download_thread.failed.connect(self._on_failed)
+        self._download_thread.succeeded.connect(self._on_succeeded)
+        self._download_thread.finished.connect(self._on_finished)
         self._download_thread.start()
 
-        self._poll_timer = QTimer()
-        self._poll_timer.setInterval(200)
-        self._poll_timer.timeout.connect(self._check_done)
-        self._poll_timer.start()
+    def _cancel_download(self):
+        if self._download_thread is not None and self._download_thread.isRunning():
+            self._cancel_btn.setEnabled(False)
+            self._append_log(t("download_cancelling"))
+            self._download_thread.cancel_event.set()
+        else:
+            self.reject()
 
-    def _download_worker(self):
-        try:
-            for m in self._missing:
-                if m["type"] == "silero-vad":
-                    download_silero(proxy=self._proxy)
-                elif m["type"] in (
-                    "sensevoice",
-                    "funasr-nano",
-                    "funasr-mlt-nano",
-                    "anime-whisper",
-                    "gigaam",
-                ):
-                    download_asr(m["type"], hub=self._hub, proxy=self._proxy)
-                elif m["type"].startswith("funasr:"):
-                    model_key = m["type"].split(":", 1)[1]
-                    download_asr(
-                        "funasr",
-                        model_size=model_key,
-                        hub=self._hub,
-                        proxy=self._proxy,
-                    )
-                elif m["type"].startswith("whisper-"):
-                    size = m["type"].replace("whisper-", "")
-                    download_asr(
-                        "whisper", model_size=size, hub=self._hub, proxy=self._proxy
-                    )
-        except Exception as e:
-            self._error = str(e)
-            log.error(f"Download failed: {e}", exc_info=True)
+    def _on_finished(self):
+        self._capture.restore()
+        self._cancel_btn.hide()
 
-    def _check_done(self):
-        if self._download_thread.is_alive():
-            return
-        self._poll_timer.stop()
-        sys.stderr = self._orig_stderr
-        logging.getLogger().removeHandler(self._log_handler)
+    def _on_failed(self, message):
+        self._error = message
+        self._append_log(f"\n{t('download_failed').format(error=message)}")
+        self._close_btn.show()
 
-        if self._error:
-            self._append_log(f"\n{t('download_failed').format(error=self._error)}")
-            self._close_btn.show()
-            return
-
+    def _on_succeeded(self):
         self._append_log(f"\n{t('download_complete')}")
         QTimer.singleShot(500, self.accept)
+
+    def closeEvent(self, event):
+        self._cancel_download()
+        self._capture.restore()
+        super().closeEvent(event)
+
+    def reject(self):
+        if self._download_thread is not None and self._download_thread.isRunning():
+            self._download_thread.cancel_event.set()
+        self._capture.restore()
+        super().reject()
 
 
 class ModelEditDialog(QDialog):
