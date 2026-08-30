@@ -246,6 +246,7 @@ class SettingsWidget:
     """SubtitleSettingsWidget's read/emit methods over stubbed controls."""
 
     _collect_settings = subtitle_settings.SubtitleSettingsWidget._collect_settings
+    _lines = subtitle_settings.SubtitleSettingsWidget._lines
     _emit_settings = subtitle_settings.SubtitleSettingsWidget._emit_settings
     get_settings = subtitle_settings.SubtitleSettingsWidget.get_settings
     emit_settings = subtitle_settings.SubtitleSettingsWidget.emit_settings
@@ -299,3 +300,123 @@ def test_the_emitted_object_does_not_share_state_with_the_controls():
 def test_the_dialog_exposes_both_operations():
     assert hasattr(subtitle_settings.SubtitleSettingsDialog, "get_settings")
     assert hasattr(subtitle_settings.SubtitleSettingsDialog, "emit_settings")
+
+
+# --- The line list must not disagree with itself ----------------------------
+
+
+class LinesWidget:
+    """SubtitleSettingsWidget's line-list operations over a bare settings dict."""
+
+    _lines = subtitle_settings.SubtitleSettingsWidget._lines
+
+    def __init__(self, settings):
+        self._settings = settings
+
+
+def test_a_missing_lines_key_yields_the_defaults_not_an_empty_list():
+    """The display fell back to the defaults while every mutation fell back to
+    [], so the widget showed rows no operation could act on."""
+    widget = LinesWidget({})
+    lines = widget._lines()
+    assert lines, "expected the default line set"
+    assert widget._settings["lines"] is lines, "must be written back, not a copy"
+
+
+def test_the_accessor_returns_the_live_list():
+    settings = {"lines": [{"type": "original"}]}
+    widget = LinesWidget(settings)
+    widget._lines().append({"type": "translation"})
+    assert len(settings["lines"]) == 2
+
+
+def test_a_non_list_lines_value_is_replaced():
+    widget = LinesWidget({"lines": "corrupted"})
+    assert isinstance(widget._lines(), list)
+    assert widget._lines(), "expected the defaults"
+
+
+def test_the_defaults_are_copied_not_shared():
+    a = LinesWidget({})._lines()
+    b = LinesWidget({})._lines()
+    assert a is not b
+    a[0]["enabled"] = not a[0].get("enabled", True)
+    assert b[0].get("enabled", True) != a[0]["enabled"] or len(a) != len(b)
+    # And the module default must be untouched.
+    assert (
+        subtitle_settings.DEFAULT_SUBTITLE_WIN_SETTINGS["lines"][0].get("enabled", True)
+        is True
+    )
+
+
+class MovableLines(LinesWidget):
+    """_move_line_up/_down over a stubbed list widget."""
+
+    _move_line_up = subtitle_settings.SubtitleSettingsWidget._move_line_up
+    _move_line_down = subtitle_settings.SubtitleSettingsWidget._move_line_down
+
+    class _List:
+        def __init__(self, row):
+            self._row = row
+
+        def currentRow(self):
+            return self._row
+
+        def setCurrentRow(self, row):
+            self._row = row
+
+    def __init__(self, settings, row):
+        super().__init__(settings)
+        self._lines_list = self._List(row)
+        self.emits = 0
+
+    def _refresh_lines_list(self):
+        pass
+
+    def _schedule_emit(self):
+        self.emits += 1
+
+
+def _named(*names):
+    return [{"type": "translation", "lang": n} for n in names]
+
+
+def test_moving_a_line_up_swaps_it_with_its_predecessor():
+    settings = {"lines": _named("a", "b", "c")}
+    widget = MovableLines(settings, row=2)
+    widget._move_line_up()
+    assert [ln["lang"] for ln in settings["lines"]] == ["a", "c", "b"]
+    assert widget._lines_list.currentRow() == 1
+
+
+def test_moving_the_first_line_up_does_nothing():
+    settings = {"lines": _named("a", "b")}
+    widget = MovableLines(settings, row=0)
+    widget._move_line_up()
+    assert [ln["lang"] for ln in settings["lines"]] == ["a", "b"]
+    assert widget.emits == 0
+
+
+def test_moving_up_a_row_past_the_end_does_not_raise():
+    """`row > 0` alone indexed past the end when the widget's row outran the
+    backing list."""
+    settings = {"lines": _named("a", "b")}
+    widget = MovableLines(settings, row=5)
+    widget._move_line_up()          # must not raise IndexError
+    assert [ln["lang"] for ln in settings["lines"]] == ["a", "b"]
+
+
+def test_moving_a_line_down_swaps_it_with_its_successor():
+    settings = {"lines": _named("a", "b", "c")}
+    widget = MovableLines(settings, row=0)
+    widget._move_line_down()
+    assert [ln["lang"] for ln in settings["lines"]] == ["b", "a", "c"]
+    assert widget._lines_list.currentRow() == 1
+
+
+def test_moving_the_last_line_down_does_nothing():
+    settings = {"lines": _named("a", "b")}
+    widget = MovableLines(settings, row=1)
+    widget._move_line_down()
+    assert [ln["lang"] for ln in settings["lines"]] == ["a", "b"]
+    assert widget.emits == 0

@@ -1,9 +1,12 @@
+import logging
 import statistics
 import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
 from translator import stream_option_errors, translator_from_model_config
+
+log = logging.getLogger("LiveTranslate.Benchmark")
 
 BENCH_SENTENCES = {
     "ja": [
@@ -78,7 +81,10 @@ def run_benchmark(models, source_lang, target_lang, timeout_s, prompt, result_ca
     )
 
     def _test_model(m):
-        name = m["name"]
+        # Inside no try of its own: a config entry without "name" raised here,
+        # the future re-raised it in _run_all, "__DONE__" was never sent and the
+        # Test button stayed disabled until the app was restarted.
+        name = m.get("name") or m.get("model") or "(unnamed)"
         lines = [f"Model: {name}", f"  {'─' * 50}"]
         try:
             bench_translator = build_bench_translator(
@@ -174,11 +180,31 @@ def run_benchmark(models, source_lang, target_lang, timeout_s, prompt, result_ca
             }
 
     def _run_all():
+        try:
+            _benchmark_all()
+        except Exception:
+            # The caller re-enables its button on "__DONE__", so anything that
+            # escapes here would disable it for the rest of the session.
+            log.error("Benchmark run failed", exc_info=True)
+            result_callback(f"\nBenchmark aborted: see the log for details")
+        finally:
+            result_callback("__DONE__")
+
+    def _benchmark_all():
         results = []
-        with ThreadPoolExecutor(max_workers=len(models)) as pool:
+        with ThreadPoolExecutor(max_workers=max(1, len(models))) as pool:
             futures = {pool.submit(_test_model, m): m for m in models}
             for fut in as_completed(futures):
-                results.append(fut.result())
+                try:
+                    results.append(fut.result())
+                except Exception as exc:
+                    log.error("Benchmark worker failed", exc_info=True)
+                    results.append({
+                        "name": (futures[fut] or {}).get("name", "?"),
+                        "avg_ttft": 0, "std_ttft": 0,
+                        "avg_total": 0, "std_total": 0,
+                        "error": str(exc).split("\n")[0][:120],
+                    })
 
         ok = [r for r in results if not r["error"]]
         ok.sort(key=lambda r: r["avg_ttft"])
@@ -193,6 +219,5 @@ def run_benchmark(models, source_lang, target_lang, timeout_s, prompt, result_ca
         failed = [r for r in results if r["error"]]
         for r in failed:
             result_callback(f"  FAIL  {r['name']}: {r['error']}")
-        result_callback("__DONE__")
 
     threading.Thread(target=_run_all, daemon=True).start()

@@ -232,19 +232,27 @@ class _CacheDeleteThread(QThread):
         self._paths = list(paths)
 
     def run(self):
-        import shutil
-
+        # The caller shows a modal progress dialog with no cancel button and
+        # closes it on `done`, so this signal has to be emitted on every path —
+        # otherwise the app is stuck behind that dialog with no way out.
         failures = []
-        for path in self._paths:
-            try:
-                shutil.rmtree(path)
-                log.info(f"Deleted: {path}")
-            except FileNotFoundError:
-                pass
-            except Exception as exc:
-                log.error(f"Failed to delete {path}: {exc}")
-                failures.append((str(path), str(exc)))
-        self.done.emit(failures)
+        try:
+            import shutil
+
+            for path in self._paths:
+                try:
+                    shutil.rmtree(path)
+                    log.info(f"Deleted: {path}")
+                except FileNotFoundError:
+                    pass
+                except Exception as exc:
+                    log.error(f"Failed to delete {path}: {exc}")
+                    failures.append((str(path), str(exc)))
+        except BaseException as exc:
+            log.error("Cache delete failed", exc_info=True)
+            failures.append(("(cache delete)", str(exc)))
+        finally:
+            self.done.emit(failures)
 
 
 def create_app_icon() -> QIcon:
@@ -771,11 +779,10 @@ class LiveTranslateApp:
         if self._translator:
             self._translator.set_target_language(lang)
         if self._panel:
-            settings = self._panel.get_settings()
-            settings["target_language"] = lang
-            from control_panel import _save_settings
-
-            _save_settings(settings)
+            # Through the panel, not a snapshot of it: writing to the dict
+            # get_settings() returns left the panel holding the old value, and
+            # its next auto-save wrote that back over this one.
+            self._panel.update_setting("target_language", lang)
 
     def _on_model_changed(self, model_config: dict):
         log.info(
@@ -1625,7 +1632,19 @@ class LiveTranslateApp:
             if not self._commit_translation_result(
                 msg_id, text, translated, generation
             ):
-                log.info("Discarding translation from superseded model: msg=%s", msg_id)
+                # The model changed while this was in flight, so it must not
+                # enter the new generation's history — but it is still a valid
+                # translation of this line, and the entry has to be closed out.
+                # Returning here left the overlay stuck on "translating" and,
+                # because the transcript releases entries in order, stalled the
+                # whole meeting record behind it for the rest of the session.
+                log.info("Translation superseded by a model switch: msg=%s", msg_id)
+                if translated:
+                    self._transcript.write_translation(msg_id, translated)
+                else:
+                    self._transcript.finalize_no_translation(msg_id)
+                if self._overlay:
+                    self._overlay.update_translation(msg_id, translated or "", 0)
                 return
             pt, ct = request_translator.last_usage
             with self._translation_stats_lock:
@@ -1671,6 +1690,12 @@ class LiveTranslateApp:
             else:
                 log.error(f"Translate error: {e}", exc_info=True)
             if not current:
+                # Failed *and* superseded. Same reasoning as above: it still has
+                # to be closed out or it blocks every later entry.
+                self._finalize_untranslated(
+                    msg_id, f"superseded during a failed translation: {e}",
+                    user_visible=True,
+                )
                 return
             self._transcript.finalize_no_translation(msg_id)
             if self._overlay:
@@ -1911,7 +1936,21 @@ class LiveTranslateApp:
 
     def pause(self):
         self._paused = True
-        self._reset_interim_state()
+        # Hand off whatever was mid-utterance. Leaving it in the buffer meant
+        # audio from after the resume was appended to it, so a pause taken in
+        # the middle of a sentence produced one line spliced across the gap —
+        # however long the gap was. flush()/force_flush() clear the buffer
+        # either way, so the next utterance starts clean.
+        with self._vad_lock:
+            remaining = (
+                self._vad.force_flush() if self._interim_active else self._vad.flush()
+            )
+        if remaining is not None and self._asr_ready:
+            # Queued for the ASR thread rather than transcribed here: this runs
+            # on the Qt thread. Its vad_flush handler resets the interim state.
+            self._enqueue_asr("vad_flush", remaining)
+        else:
+            self._reset_interim_state()
         if self._overlay:
             self._overlay.update_monitor(0.0, 0.0)
         log.info("Pipeline paused")
@@ -2080,22 +2119,91 @@ class LiveTranslateApp:
         alnum = sum(1 for c in text if c.isalnum())
         return alnum <= 8
 
+    # Punctuation and spacing that ends a committed sentence but never begins
+    # the next recognition.
+    _ECHO_BOUNDARY = " \t\n。．.!！?？,，、;；:：\"'）)》」』"
+    # Minimum overlap for a script that does not separate words with spaces.
+    _ECHO_MIN_UNSPACED = 6
+
     def _strip_committed_overlap(self, text: str) -> str:
-        """Remove text that overlaps with previously committed content."""
-        if not self._interim_committed_tail:
+        """Drop a re-recognized repeat of text already committed this utterance.
+
+        Two things shape this, and they pull in opposite directions:
+
+        * Committed text is always a complete sentence, so it always ends in
+          punctuation. Comparing it verbatim meant this never fired at all —
+          a new recognition never begins with a full stop. The tail is
+          therefore matched with its trailing punctuation removed.
+        * A lecturer opening the next sentence with the previous one's keyword
+          ("...производную функции. Функции бывают...") is common, and deleting
+          that word costs the sentence its subject. A genuine echo comes from
+          an under-trimmed buffer replaying audio already consumed, which
+          reproduces a phrase rather than a single word — so an overlap only
+          counts when it spans a word boundary, or is several characters long
+          in a script that has none.
+
+        Erring toward keeping text is deliberate: a duplicated word is easy to
+        read past, a deleted one is unrecoverable and mistranslates the line.
+        """
+        tail = self._interim_committed_tail
+        if not tail:
             return text
-        tail = self._interim_committed_tail.lower().rstrip()
-        text_lower = text.lower()
-        # Check if text starts with a suffix of the committed tail
-        max_check = min(len(tail), len(text_lower))
+        tail = tail.lower().rstrip(self._ECHO_BOUNDARY)
+        if not tail:
+            return text
+        lowered = text.lower()
+        max_check = min(len(tail), len(lowered))
         for overlap_len in range(max_check, 2, -1):
-            if text_lower[:overlap_len] == tail[-overlap_len:]:
-                stripped = text[overlap_len:].strip()
-                if stripped:
-                    log.debug(f"Stripped echo overlap ({overlap_len} chars): '{text[:overlap_len]}...'")
-                    return stripped
-                return ""
+            if lowered[:overlap_len] != tail[-overlap_len:]:
+                continue
+            # The longest match is found first; every shorter one is a prefix
+            # of it, so if this is not substantial none of them are either.
+            if not self._is_substantial_echo(lowered[:overlap_len]):
+                return text
+            stripped = text[overlap_len:].lstrip(self._ECHO_BOUNDARY)
+            log.debug(
+                f"Stripped echo overlap ({overlap_len} chars): "
+                f"'{text[:overlap_len]}'"
+            )
+            return stripped
         return text
+
+    @classmethod
+    def _is_substantial_echo(cls, overlap: str) -> bool:
+        """Whether an overlap is a replay rather than one repeated word.
+
+        A single-word overlap is genuinely ambiguous in a script that separates
+        words — "функции" could be a replay or the next sentence's subject — so
+        it is kept. The cost is a duplicated word when a replay happens to be
+        one word long; the alternative cost is deleting a real one.
+        """
+        if " " in overlap.strip():
+            return True
+        # No word boundary at all: only meaningful where the script has none.
+        return (
+            len(overlap) >= cls._ECHO_MIN_UNSPACED
+            and cls._is_unspaced_script(overlap)
+        )
+
+    @staticmethod
+    def _is_unspaced_script(text: str) -> bool:
+        """Han/Hiragana/Katakana, where a run of characters is several words.
+
+        Not `not text.isascii()`: Cyrillic and Greek are also non-ASCII but do
+        separate words with spaces, so that test wrongly treated a single
+        Russian word as a multi-word phrase.
+        """
+        letters = [ch for ch in text if ch.isalnum()]
+        if not letters:
+            return False
+        unspaced = sum(
+            1
+            for ch in letters
+            if "\u4e00" <= ch <= "\u9fff"      # CJK unified ideographs
+            or "\u3040" <= ch <= "\u309f"      # hiragana
+            or "\u30a0" <= ch <= "\u30ff"      # katakana
+        )
+        return unspaced >= len(letters) * 0.6
 
     def _do_interim_asr(self) -> bool:
         """Run ASR on current VAD buffer, output complete sentences, trim consumed audio.
@@ -2344,18 +2452,26 @@ class LiveTranslateApp:
         # Strip echo from previous commit's overlap
         original_text = self._strip_committed_overlap(original_text)
 
-        # Prepend any remaining pending short utterances
-        if self._interim_pending:
-            original_text = self._interim_pending + original_text
-            self._interim_pending = ""
+        # Take the buffered fragments now, but keep them separate: the noise
+        # filter below judges *this* segment's own recognition, and those
+        # fragments came from earlier audio that already passed it. Folding them
+        # in first meant a short reply ("да") followed by a quiet tail was
+        # discarded along with the noise — the user said something and nothing
+        # ever appeared.
+        pending = self._interim_pending
+        self._interim_pending = ""
 
+        if original_text:
+            alnum_chars = sum(1 for c in original_text if c.isalnum())
+            if seg_len >= 2.0 and alnum_chars <= 3:
+                log.debug(
+                    f"Noise filter: {seg_len:.1f}s segment produced only "
+                    f"'{original_text}', dropping it"
+                )
+                original_text = ""
+
+        original_text = pending + original_text
         if not original_text or not any(c.isalnum() for c in original_text):
-            return
-
-        # Apply noise filter like _process_segment
-        alnum_chars = sum(1 for c in original_text if c.isalnum())
-        if seg_len >= 2.0 and alnum_chars <= 3:
-            log.debug(f"Noise filter: {seg_len:.1f}s segment produced only '{original_text}', skipping")
             return
 
         if not result_lang:

@@ -299,16 +299,27 @@ class ASRClient:
                 self._set_status("exited")
                 raise ASRWorkerExited("ASR worker handles were closed")
 
+    # Statuses that mean the worker is gone for good. A request in this state is
+    # a worker death, not a usage error, and must reach _run_asr's recovery
+    # path — which only catches ASRWorkerExited/Timeout. Raising the base
+    # ASRClientError here made a killed worker permanently silent: every later
+    # segment hit the same error, none of them triggered a restart.
+    _DEAD_STATUSES = ("exited", "failed", "stopped", "stopping")
+
     def _ensure_started(self):
         with self._state_lock:
             if self._process is None or self._conn is None:
-                raise ASRClientError("ASR worker has not been started")
+                raise ASRWorkerExited("ASR worker has not been started")
 
     def _ensure_ready(self):
         self._ensure_started()
         current = self.status
-        if current != "ready":
-            raise ASRClientError(f"ASR worker is not ready: {current}")
+        if current == "ready":
+            return
+        if current in self._DEAD_STATUSES:
+            raise ASRWorkerExited(f"ASR worker is {current}")
+        # "starting"/"loading"/"busy": alive, just not usable right now.
+        raise ASRClientError(f"ASR worker is not ready: {current}")
 
     def _close_handles(self):
         if self._conn is not None:

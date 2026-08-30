@@ -235,3 +235,99 @@ def test_deleting_a_session_removes_all_of_its_files(tmp_path):
 
 def test_listing_an_absent_directory_is_empty(tmp_path):
     assert read_session_meta(tmp_path / "nope") == []
+
+
+# --- The invariant every producer must respect ------------------------------
+
+
+def test_one_unfinished_entry_stalls_every_later_one(tmp_path):
+    """Documents *why* the pipeline must close out every message it registers.
+
+    Because entries are released in order, a single one that never completes
+    holds back all of its successors. A path that returns without finalizing
+    (a translation discarded by a mid-session model switch, say) therefore
+    freezes the whole record, not just its own line.
+    """
+    writer = _writer(tmp_path)
+    writer.write_original(1, "00:00:01", "never finished")
+    writer.write_original(2, "00:00:02", "second")
+    writer.write_translation(2, "SECOND")
+    writer.write_original(3, "00:00:03", "third")
+    writer.write_translation(3, "THIRD")
+
+    path = tmp_path / f"livetrans_{writer._session_ts}_all.txt"
+    assert _entries(path) == []  # all three are stuck behind #1
+
+    writer.finalize_no_translation(1)
+    assert len(_entries(path)) == 3
+    writer.close()
+
+
+class _SupersededApp:
+    """Drives _translate_async down the "model switched mid-flight" path."""
+
+    _translate_async = None  # bound below, after main imports
+
+    def __init__(self, transcript, translated="TRANSLATED"):
+        self._transcript = transcript
+        self._overlay = None
+        self._subwin = None
+        self._translator_generation = 99          # newer than the request's
+        self._translated = translated
+        self.commits = []
+
+    # The request was snapshotted under an older generation.
+    def _commit_translation_result(self, msg_id, text, translated, generation):
+        self.commits.append((msg_id, generation))
+        return False                              # superseded
+
+    class _Stub:
+        def __init__(self, outer):
+            self._outer = outer
+            self.last_usage = (0, 0)
+
+        def translate_iter(self, text, source_lang):
+            yield self._outer._translated
+
+
+def test_a_superseded_translation_still_closes_out_its_entry(tmp_path):
+    """A mid-session model switch discards the result for history purposes, but
+    the entry must still be released or it stalls every later one."""
+    main = pytest.importorskip("main")
+    _SupersededApp._translate_async = main.LiveTranslateApp._translate_async
+
+    writer = _writer(tmp_path)
+    app = _SupersededApp(writer)
+    writer.write_original(1, "00:00:01", "in flight when the model changed")
+    writer.write_original(2, "00:00:02", "after")
+    writer.write_translation(2, "AFTER")
+
+    path = tmp_path / f"livetrans_{writer._session_ts}_all.txt"
+    assert _entries(path) == []                   # #2 waits behind #1
+
+    app._translate_async(
+        1, "in flight when the model changed", "en",
+        request_translator=_SupersededApp._Stub(app), generation=1,
+    )
+
+    assert app.commits == [(1, 1)]                # it did go through the guard
+    lines = _entries(path)
+    assert len(lines) == 2, "the superseded entry did not unblock the record"
+    assert lines[0].endswith("in flight when the model changed")
+    writer.close()
+
+
+def test_a_superseded_empty_translation_also_closes_out(tmp_path):
+    main = pytest.importorskip("main")
+    _SupersededApp._translate_async = main.LiveTranslateApp._translate_async
+
+    writer = _writer(tmp_path)
+    app = _SupersededApp(writer, translated="")
+    writer.write_original(1, "00:00:01", "empty result")
+    app._translate_async(
+        1, "empty result", "en",
+        request_translator=_SupersededApp._Stub(app), generation=1,
+    )
+    path = tmp_path / f"livetrans_{writer._session_ts}_all.txt"
+    assert len(_entries(path)) == 1
+    writer.close()

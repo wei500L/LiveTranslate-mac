@@ -981,6 +981,26 @@ class ModelEditDialog(QDialog):
         return True, data
 
     def _on_accept(self):
+        # Required fields are checked here, not by the caller: the model list
+        # used to drop a dialog with an empty name or model id on the floor,
+        # so the user filled it in, pressed OK, and nothing happened at all.
+        missing = [
+            label
+            for label, widget in (
+                (t("label_display_name"), self._name),
+                (t("label_model"), self._model),
+            )
+            if not widget.text().strip()
+        ]
+        if missing:
+            QMessageBox.warning(
+                self,
+                t("error_title"),
+                t("model_fields_required").format(
+                    fields=" / ".join(label.rstrip(":：") for label in missing)
+                ),
+            )
+            return
         ok, _ = self._parse_extra_body()
         if not ok:
             QMessageBox.warning(

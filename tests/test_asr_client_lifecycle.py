@@ -211,3 +211,46 @@ def test_remote_engine_stops_reporting_ready_once_unloaded():
 
     with pytest.raises(RemoteASRError):
         engine.transcribe(np.zeros(16, dtype=np.float32))
+
+
+# --- Worker death must reach the recovery path ------------------------------
+
+
+def test_a_dead_worker_raises_the_recoverable_exception():
+    """_run_asr only catches ASRWorkerExited/Timeout. _ensure_ready used to
+    raise the base ASRClientError for a worker that had exited, so a killed
+    worker went permanently silent: every later segment hit the same error and
+    none of them triggered a restart."""
+    for status in ("exited", "failed", "stopped", "stopping"):
+        client = _client(status=status)
+        with pytest.raises(ASRWorkerExited):
+            client._ensure_ready()
+
+
+def test_a_worker_that_is_merely_busy_is_not_treated_as_dead():
+    """Transient states must stay a plain ASRClientError — restarting a worker
+    that is only loading would throw away a model load in progress."""
+    from asr_client import ASRClientError
+
+    for status in ("starting", "loading", "busy"):
+        client = _client(status=status)
+        with pytest.raises(ASRClientError) as info:
+            client._ensure_ready()
+        assert not isinstance(info.value, ASRWorkerExited), status
+
+
+def test_an_unstarted_client_is_also_worker_death():
+    client = ASRClient({"engine_type": "test"})
+    with pytest.raises(ASRWorkerExited):
+        client._ensure_ready()
+
+
+def test_a_ready_worker_passes():
+    _client(status="ready")._ensure_ready()  # must not raise
+
+
+def test_the_recoverable_type_is_still_an_asr_client_error():
+    """Callers that catch the base class keep working."""
+    from asr_client import ASRClientError
+
+    assert issubclass(ASRWorkerExited, ASRClientError)

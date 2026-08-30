@@ -178,3 +178,81 @@ def test_a_failing_cleanup_step_does_not_skip_the_rest():
     app.stop()
     assert "asr_worker.shutdown" in app.calls
     assert "mlx.stop" in app.calls
+
+
+# --- Pause must not splice audio across the gap -----------------------------
+
+
+class PausableApp:
+    """pause() over stubs: it runs on the Qt thread and only touches VAD,
+    the ASR queue and the overlay."""
+
+    pause = main.LiveTranslateApp.pause
+    _enqueue_asr = main.LiveTranslateApp._enqueue_asr
+    _requeue_stop_sentinel = main.LiveTranslateApp._requeue_stop_sentinel
+
+    def __init__(self, buffered_segment, interim_active=False, asr_ready=True):
+        self._paused = False
+        self._asr_ready = asr_ready
+        self._interim_active = interim_active
+        self._interim_pending = "pending text"
+        self._overlay = None
+        self._asr_queue = queue.Queue(maxsize=8)
+        self._stop_event = threading.Event()
+        self._vad_lock = threading.RLock()
+        self._vad = self._FakeVAD(buffered_segment)
+
+    class _FakeVAD:
+        def __init__(self, segment):
+            self.segment = segment
+            self.flushed = None
+
+        def flush(self):
+            self.flushed = "flush"
+            segment, self.segment = self.segment, None
+            return segment
+
+        def force_flush(self):
+            self.flushed = "force_flush"
+            segment, self.segment = self.segment, None
+            return segment
+
+    def _reset_interim_state(self):
+        self._interim_active = False
+        self._interim_pending = ""
+
+
+def test_pause_hands_off_the_in_flight_utterance():
+    """Left in the buffer, it would be spliced onto whatever is said after the
+    resume — however long the pause lasted."""
+    app = PausableApp(buffered_segment="half a sentence")
+    app.pause()
+    assert app._paused is True
+    assert app._vad.flushed == "flush"
+    assert app._asr_queue.get_nowait() == ("vad_flush", "half a sentence")
+
+
+def test_pause_uses_force_flush_while_interim_is_active():
+    """A trimmed buffer is below min_speech_duration by construction, so a
+    plain flush would drop the remainder instead of emitting it."""
+    app = PausableApp(buffered_segment="remainder", interim_active=True)
+    app.pause()
+    assert app._vad.flushed == "force_flush"
+    assert app._asr_queue.get_nowait() == ("vad_flush", "remainder")
+
+
+def test_pause_with_an_empty_buffer_queues_nothing():
+    app = PausableApp(buffered_segment=None)
+    app.pause()
+    assert app._asr_queue.empty()
+    assert app._interim_pending == ""
+
+
+def test_pause_without_asr_still_clears_the_interim_state():
+    """No worker to send it to; the buffer is still cleared by flush()."""
+    app = PausableApp(buffered_segment="orphan", asr_ready=False)
+    app.pause()
+    assert app._asr_queue.empty()
+    assert app._interim_active is False
+    assert app._interim_pending == ""
+    assert app._vad.segment is None  # flush() emptied it regardless

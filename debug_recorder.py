@@ -146,21 +146,25 @@ class DiagnosticRecorder:
         self.summary = {
             "segments": len(observer.segments),
             "segment_seconds": round(sum(observer.segments), 1),
+            "asr_calls": len(getattr(observer, "probes", [])),
             "asr_results": observer.asr_results,
             "interim_results": observer.interim,
             "translations": observer.translations,
             "transcript_paths": transcript_paths,
             "log_counts": dict(self._collector.counts),
         }
-        if not observer.segments:
+        if not observer.segments and not observer.outputs:
+            # Incremental mode emits through interim commits without ever
+            # producing a "segment" ASR call, so an empty segment list alone is
+            # not evidence of failure.
             self.problem(
-                "VAD produced no speech segments — check the audio level, "
-                "vad_mode and vad_threshold"
+                "VAD produced no speech and the pipeline emitted nothing — "
+                "check the audio level, vad_mode and vad_threshold"
             )
-        elif not observer.asr_results:
+        elif not observer.outputs:
             self.problem(
-                f"{len(observer.segments)} segment(s) reached ASR but nothing was "
-                f"recognized — check the ASR language against the audio"
+                f"{len(observer.segments)} segment(s) reached ASR but the pipeline "
+                f"emitted nothing — check the ASR language against the audio"
             )
         elif expect_translation and not observer.translations:
             self.problem(
@@ -206,12 +210,15 @@ class DiagnosticRecorder:
                 f"  segments: {summary['segments']} "
                 f"({summary['segment_seconds']}s of speech)"
             )
+            write(f"  ASR calls: {summary.get('asr_calls', 0)}")
             asr = summary["asr_results"]
-            write(f"  recognized: {len(asr)}")
-            for text, language, ms in asr:
-                write(f"    [{language}] {ms:6.0f}ms  {text}")
+            # What the pipeline emitted, which in incremental mode is not the
+            # same as what each ASR call returned.
+            write(f"  emitted: {len(asr)}")
+            for text, language in asr:
+                write(f"    [{language}] {text}")
             if summary["interim_results"]:
-                write(f"  interim: {len(summary['interim_results'])}")
+                write(f"  interim probes: {len(summary['interim_results'])}")
                 for text, language, ms in summary["interim_results"]:
                     write(f"    [{language}] {ms:6.0f}ms  {text}")
 

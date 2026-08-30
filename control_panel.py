@@ -2204,7 +2204,20 @@ class ControlPanel(QWidget):
         self.settings_changed.emit(dict(self._current_settings))
 
     def get_settings(self):
+        """A snapshot. Mutating it does not change the panel — use update_setting()."""
         return dict(self._current_settings)
+
+    def update_setting(self, key: str, value):
+        """Record a setting changed outside the panel, and persist it.
+
+        Callers used to do `s = panel.get_settings(); s[k] = v; _save_settings(s)`.
+        That writes the file but leaves the panel's own copy stale, so the next
+        auto-save wrote the old value straight back over it.
+        """
+        if self._current_settings.get(key) == value:
+            return
+        self._current_settings[key] = value
+        _save_settings(self._current_settings)
 
     def get_active_model(self) -> dict | None:
         models = self._current_settings.get("models", [])

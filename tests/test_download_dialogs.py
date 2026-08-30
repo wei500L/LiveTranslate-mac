@@ -120,3 +120,88 @@ def test_wizard_defaults_come_from_config_yaml():
     config = yaml.safe_load(dialogs.CONFIG_FILE.read_text(encoding="utf-8"))
     assert defaults["vad_threshold"] == config["asr"]["vad_threshold"]
     assert defaults["min_speech_duration"] == config["asr"]["min_speech_duration"]
+
+
+# --- ModelEditDialog must not silently drop an incomplete entry --------------
+
+
+class _Line:
+    def __init__(self, value):
+        self._value = value
+
+    def text(self):
+        return self._value
+
+
+class _Plain:
+    def __init__(self, value):
+        self._value = value
+
+    def toPlainText(self):
+        return self._value
+
+
+class _EditableModelDialog:
+    """ModelEditDialog's accept path over stub widgets, no QApplication."""
+
+    _on_accept = dialogs.ModelEditDialog._on_accept
+    _parse_extra_body = dialogs.ModelEditDialog._parse_extra_body
+
+    def __init__(self, name="", model="", extra_body=""):
+        self._name = _Line(name)
+        self._model = _Line(model)
+        self._adv_extra_body = _Plain(extra_body)
+        self.accepted = False
+        self.warnings = []
+
+    def accept(self):
+        self.accepted = True
+
+
+def test_an_empty_name_is_refused_not_silently_dropped(monkeypatch):
+    """The model-list handler used to discard the dialog's data when name or
+    model id was blank, so the user filled everything in, pressed OK, and
+    nothing happened at all."""
+    warnings = []
+    monkeypatch.setattr(
+        dialogs.QMessageBox, "warning",
+        staticmethod(lambda *args: warnings.append(args)),
+    )
+    dlg = _EditableModelDialog(name="", model="gpt-4o")
+    dlg._on_accept()
+    assert dlg.accepted is False
+    assert len(warnings) == 1
+
+
+def test_an_empty_model_id_is_refused(monkeypatch):
+    warnings = []
+    monkeypatch.setattr(
+        dialogs.QMessageBox, "warning",
+        staticmethod(lambda *args: warnings.append(args)),
+    )
+    dlg = _EditableModelDialog(name="fast", model="")
+    dlg._on_accept()
+    assert dlg.accepted is False
+    assert len(warnings) == 1
+
+
+def test_a_complete_entry_is_accepted(monkeypatch):
+    monkeypatch.setattr(
+        dialogs.QMessageBox, "warning",
+        staticmethod(lambda *args: pytest.fail("no warning was expected")),
+    )
+    dlg = _EditableModelDialog(name="fast", model="gpt-4o", extra_body='{"a": 1}')
+    dlg._on_accept()
+    assert dlg.accepted is True
+
+
+def test_invalid_extra_body_still_blocks_accept(monkeypatch):
+    warnings = []
+    monkeypatch.setattr(
+        dialogs.QMessageBox, "warning",
+        staticmethod(lambda *args: warnings.append(args)),
+    )
+    dlg = _EditableModelDialog(name="fast", model="gpt-4o", extra_body="{nope")
+    dlg._on_accept()
+    assert dlg.accepted is False
+    assert len(warnings) == 1

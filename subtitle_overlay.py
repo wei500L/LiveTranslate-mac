@@ -931,6 +931,8 @@ class SubtitleOverlay(QWidget):
         self._monitor_timer.timeout.connect(self._flush_monitor)
         self._monitor_timer.start()
         self._streaming_updates = {}
+        # Last style actually rendered, so an unchanged one is a no-op.
+        self._applied_style = None
         self._streaming_timer = QTimer(self)
         self._streaming_timer.setInterval(50)
         self._streaming_timer.timeout.connect(self._flush_streaming)
@@ -1226,6 +1228,13 @@ class SubtitleOverlay(QWidget):
         if "font_family" in s and "original_font_family" not in style:
             s["original_font_family"] = s["font_family"]
             s["translation_font_family"] = s["font_family"]
+        # The control panel emits the *whole* settings dict on every auto-save,
+        # so this is called when the user changes a VAD slider or a checkbox
+        # too. Re-rendering every message costs ~59ms with a full 50-message
+        # buffer, on the Qt thread, for a style that did not change.
+        if s == self._applied_style:
+            return
+        self._applied_style = dict(s)
         # Container background
         bg_rgba = _hex_to_rgba(s["bg_color"], s["bg_opacity"])
         self._container.setStyleSheet(

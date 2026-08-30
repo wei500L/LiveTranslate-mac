@@ -5,6 +5,8 @@ crash in it (issue #38's content=None, a usage-only stream frame) costs exactly
 the diagnosis it exists to provide.
 """
 
+import threading
+
 import pytest
 
 import benchmark
@@ -182,3 +184,68 @@ def test_environment_overrides_apply_through_the_factory(monkeypatch):
         target_language="zh",
     )
     assert tr._model == "from-env"
+
+
+# --- The Test button must always come back ----------------------------------
+
+
+class _Collector:
+    """result_callback stand-in that flags the terminal "__DONE__" line."""
+
+    def __init__(self):
+        self.lines = []
+        self.done = threading.Event()
+
+    def __call__(self, text):
+        self.lines.append(text)
+        if text == "__DONE__":
+            self.done.set()
+
+
+def _run_benchmark(monkeypatch, models, **patch):
+    for attr, value in patch.items():
+        monkeypatch.setattr(benchmark, attr, value)
+
+    def _boom(*_args, **_kwargs):
+        raise ValueError("no translator for you")
+
+    monkeypatch.setattr(benchmark, "build_bench_translator", _boom)
+    collector = _Collector()
+    benchmark.run_benchmark(models, "en", "zh", 5, "prompt", collector)
+    assert collector.done.wait(10), (
+        f"__DONE__ never arrived; the Test button would stay disabled. "
+        f"Lines seen: {collector.lines}"
+    )
+    return collector
+
+
+def test_a_model_entry_without_a_name_still_finishes(monkeypatch):
+    """`m["name"]` used to sit outside every try: a config entry without one
+    raised KeyError in the worker, re-raised through future.result() and killed
+    _run_all before it could send "__DONE__" — so the Test button stayed
+    disabled until the app was restarted."""
+    collector = _run_benchmark(
+        monkeypatch, [{"api_base": "http://x/v1", "api_key": "k"}]
+    )
+    assert any("FAILED" in line for line in collector.lines)
+    assert any("(unnamed)" in line for line in collector.lines)
+
+
+def test_an_empty_model_list_still_finishes(monkeypatch):
+    collector = _run_benchmark(monkeypatch, [])
+    assert collector.done.is_set()
+
+
+def test_a_crash_while_aggregating_still_finishes(monkeypatch):
+    """as_completed is inside _benchmark_all's try scope only via _run_all's
+    handler: a crash there must surface as an aborted message, not a dead
+    thread that never re-enables the button."""
+
+    def _explode(_futures):
+        raise RuntimeError("aggregation exploded")
+
+    collector = _run_benchmark(
+        monkeypatch, [{"name": "m", "api_base": "http://x/v1"}],
+        as_completed=_explode,
+    )
+    assert any("aborted" in line.lower() for line in collector.lines)

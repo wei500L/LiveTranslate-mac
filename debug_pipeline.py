@@ -407,15 +407,28 @@ def _wait_for_completion(app, source, recorder, timeout: float):
 
 
 class PipelineObserver:
-    """Record what each stage actually produced, by wrapping the real methods."""
+    """Record what each stage actually produced, by wrapping the real methods.
+
+    Output is observed at ``transcript.write_original`` rather than at
+    ``_run_asr``, because those are not the same thing: an incremental commit
+    reaches the user through _process_segment_text and never calls _run_asr at
+    all. Watching the ASR call reported 2 lines for a run that actually emitted
+    5, which reads exactly like the pipeline losing speech.
+    """
 
     def __init__(self, app, recorder):
         self.app = app
         self.recorder = recorder
-        self.segments = []          # (seconds,)
-        self.asr_results = []       # (text, language, ms)
+        self.segments = []          # seconds of each VAD segment sent to ASR
+        self.probes = []            # (text, language, ms) per ASR call
+        self.interim = []           # the subset of probes that were interim
+        self.outputs = []           # (text, language) actually emitted
         self._by_id = {}            # msg_id -> (source, translated)
-        self.interim = []
+
+    @property
+    def asr_results(self):
+        """What the pipeline emitted, in utterance order."""
+        return self.outputs
 
     @property
     def translations(self):
@@ -426,6 +439,13 @@ class PipelineObserver:
         app = self.app
         original_run_asr = app._run_asr
         original_commit = app._commit_translation_result
+        original_write = app._transcript.write_original
+
+        def write_original(msg_id, timestamp, original, **kwargs):
+            self.outputs.append((original, kwargs.get("language") or "?"))
+            return original_write(msg_id, timestamp, original, **kwargs)
+
+        app._transcript.write_original = write_original
 
         def run_asr(audio, kind, **kwargs):
             if kind == "segment":
@@ -433,7 +453,9 @@ class PipelineObserver:
             result, ms = original_run_asr(audio, kind, **kwargs)
             if isinstance(result, dict) and result.get("text"):
                 entry = (result["text"], result.get("language", "?"), ms)
-                (self.interim if kind == "interim" else self.asr_results).append(entry)
+                self.probes.append(entry)
+                if kind == "interim":
+                    self.interim.append(entry)
             return result, ms
 
         def commit(msg_id, text, translated, generation):

@@ -502,9 +502,23 @@ class SubtitleSettingsWidget(QWidget):
         for ctrl in self._bg_color_controls:
             ctrl.setEnabled(not has_image)
 
+    def _lines(self) -> list:
+        """The live line list, created if absent.
+
+        Five call sites read this with three different fallbacks — the display
+        fell back to the defaults while every mutation fell back to an empty
+        list, so a settings dict without "lines" would show rows that no
+        operation could act on.
+        """
+        lines = self._settings.get("lines")
+        if not isinstance(lines, list):
+            lines = [dict(line) for line in DEFAULT_SUBTITLE_WIN_SETTINGS["lines"]]
+            self._settings["lines"] = lines
+        return lines
+
     def _refresh_lines_list(self):
         self._lines_list.clear()
-        lines = self._settings.get("lines", DEFAULT_SUBTITLE_WIN_SETTINGS["lines"])
+        lines = self._lines()
         for cfg in lines:
             line_type = cfg.get("type", "original")
             enabled = cfg.get("enabled", True)
@@ -539,7 +553,9 @@ class SubtitleSettingsWidget(QWidget):
         dlg = LineEditDialog(cfg, self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             new_cfg = dlg.get_config()
-            lines = self._settings.get("lines", [])[:]
+            lines = self._lines()[:]
+            if not 0 <= row < len(lines):
+                return
             lines[row] = new_cfg
             self._settings["lines"] = lines
             self._refresh_lines_list()
@@ -570,7 +586,7 @@ class SubtitleSettingsWidget(QWidget):
         }
         dlg = LineEditDialog(new_line, self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
-            lines = self._settings.get("lines", [])[:]
+            lines = self._lines()[:]
             lines.append(dlg.get_config())
             self._settings["lines"] = lines
             self._refresh_lines_list()
@@ -578,7 +594,7 @@ class SubtitleSettingsWidget(QWidget):
 
     def _remove_line(self):
         row = self._lines_list.currentRow()
-        lines = self._settings.get("lines", [])[:]
+        lines = self._lines()[:]
         if len(lines) > 1 and 0 <= row < len(lines):
             lines.pop(row)
             self._settings["lines"] = lines
@@ -587,8 +603,8 @@ class SubtitleSettingsWidget(QWidget):
 
     def _move_line_up(self):
         row = self._lines_list.currentRow()
-        lines = self._settings.get("lines", [])[:]
-        if row > 0:
+        lines = self._lines()[:]
+        if 0 < row < len(lines):
             lines[row], lines[row - 1] = lines[row - 1], lines[row]
             self._settings["lines"] = lines
             self._refresh_lines_list()
@@ -597,7 +613,7 @@ class SubtitleSettingsWidget(QWidget):
 
     def _move_line_down(self):
         row = self._lines_list.currentRow()
-        lines = self._settings.get("lines", [])[:]
+        lines = self._lines()[:]
         if 0 <= row < len(lines) - 1:
             lines[row], lines[row + 1] = lines[row + 1], lines[row]
             self._settings["lines"] = lines
@@ -630,11 +646,11 @@ class SubtitleSettingsWidget(QWidget):
             "auto_hide_animation": self._hide_anim_combo.currentData() or "fade",
             "auto_hide_duration": self._hide_duration_spin.value(),
             "click_through": self._click_through_check.isChecked(),
-            "lines": self._settings.get("lines", DEFAULT_SUBTITLE_WIN_SETTINGS["lines"]),
+            "lines": self._lines(),
         }
         self._settings.update(s)
         snapshot = dict(self._settings)
-        snapshot["lines"] = [dict(line) for line in self._settings.get("lines", [])]
+        snapshot["lines"] = [dict(line) for line in self._lines()]
         return snapshot
 
     def _emit_settings(self):

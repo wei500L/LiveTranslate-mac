@@ -140,8 +140,12 @@ class VADProcessor:
             self._silence_mode = settings["silence_mode"]
         if "silence_duration" in settings:
             self._fixed_silence_dur = settings["silence_duration"]
-            if self._silence_mode == "fixed":
-                self._silence_limit = self._seconds_to_chunks(self._fixed_silence_dur)
+        # Driven by the mode now in effect, not by silence_duration happening to
+        # be in the dict: switching auto -> fixed left the adaptive limit in
+        # place unless that unrelated key came along in the same update. In
+        # "auto" the limit belongs to _update_adaptive_limit and is left alone.
+        if self._silence_mode == "fixed":
+            self._silence_limit = self._seconds_to_chunks(self._fixed_silence_dur)
         log.info(
             f"VAD settings updated: mode={self.mode}, threshold={self.threshold}, "
             f"silence={self._silence_mode} "
