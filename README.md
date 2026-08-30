@@ -144,6 +144,17 @@ app after changing either permission. The SCK path captures the selected main di
 and does not expose Windows-style loopback device names. Faster-whisper/CTranslate2
 runs on CPU (int8); MPS is used by torch-based ASR engines when supported.
 
+To launch it like a native Mac app instead of from a terminal:
+
+```bash
+./build_mac_app.sh --install   # builds LiveTranslate.app into /Applications
+```
+
+It then starts from Launchpad or Spotlight (`open -a LiveTranslate`). The bundle's
+launcher is baked against the current project path — rerun the script after moving
+the project. The first .app launch asks for Microphone permission again, because
+macOS attributes the permission to the app bundle rather than to the terminal.
+
 ## First Launch
 
 1. Setup wizard appears — choose download source (ModelScope / HuggingFace) and cache path
