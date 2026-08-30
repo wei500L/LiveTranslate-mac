@@ -190,9 +190,17 @@ echo "Built $APP_DIR"
 
 if [[ "${1:-}" == "--install" ]]; then
   DEST="/Applications/$APP_NAME.app"
+  if pgrep -f "$ROOT_DIR/main.py" >/dev/null 2>&1; then
+    echo "warning: LiveTranslate is currently running; the new bundle takes" >&2
+    echo "         effect on the next launch (quit the app to replace it now)." >&2
+  fi
   echo "Installing to $DEST..."
   rm -rf "$DEST"
   cp -R "$APP_DIR" "$DEST"
+  # Refresh LaunchServices so Launchpad/Spotlight don't show a stale entry
+  # after the bundle was deleted and recreated
+  /System/Library/Frameworks/CoreServices.framework/Frameworks/LaunchServices.framework/Support/lsregister \
+    -f "$DEST" >/dev/null 2>&1 || true
   echo "Installed. Launch with:  open -a $APP_NAME   (or double-click in Launchpad)"
 else
   echo "To install into /Applications:  ./build_mac_app.sh --install"

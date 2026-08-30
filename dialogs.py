@@ -1,3 +1,4 @@
+import html
 import json
 import logging
 import re
@@ -87,9 +88,6 @@ def make_scroll_area(content: QWidget) -> QScrollArea:
     area.setFrameShape(QFrame.Shape.NoFrame)
     area.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
     return area
-
-SETTINGS_FILE = None  # set by control_panel on import
-_save_settings = None  # set by control_panel on import
 
 
 class _LogCapture(logging.Handler):
@@ -1068,23 +1066,29 @@ _I18N_DIR = Path(__file__).parent / "i18n"
 
 
 def _changelog_to_html(text: str) -> str:
-    """Convert CHANGELOG.md subset to HTML (headings, bold, lists)."""
+    """Convert CHANGELOG.md subset to HTML (headings, bold, lists).
+
+    Entry text is escaped before the bold/code spans are reintroduced:
+    changelog entries quote code and tags verbatim (`<think>…</think>`), and
+    Qt eats unknown tags as HTML — the very bug one of these entries
+    describes would otherwise reappear in the page describing it.
+    """
     lines = []
     for line in text.splitlines():
         stripped = line.strip()
         if stripped.startswith("### "):
-            lines.append(f"<h3>{stripped[4:]}</h3>")
+            lines.append(f"<h3>{html.escape(stripped[4:])}</h3>")
         elif stripped.startswith("## "):
-            lines.append(f"<h2>{stripped[3:]}</h2>")
+            lines.append(f"<h2>{html.escape(stripped[3:])}</h2>")
         elif stripped.startswith("# "):
             continue  # skip file title
         elif stripped.startswith("- "):
-            item = stripped[2:]
+            item = html.escape(stripped[2:])
             item = re.sub(r"\*\*(.+?)\*\*", r"<b>\1</b>", item)
             item = re.sub(r"`(.+?)`", r"<code>\1</code>", item)
             lines.append(f"<li>{item}</li>")
         elif stripped:
-            lines.append(f"<p>{stripped}</p>")
+            lines.append(f"<p>{html.escape(stripped)}</p>")
     return "\n".join(lines)
 
 

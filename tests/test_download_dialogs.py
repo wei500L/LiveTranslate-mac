@@ -205,3 +205,30 @@ def test_invalid_extra_body_still_blocks_accept(monkeypatch):
     dlg._on_accept()
     assert dlg.accepted is False
     assert len(warnings) == 1
+
+
+# --- changelog rendering (Settings → Changelog tab) ---------------------------
+
+
+def test_changelog_html_escapes_angle_bracket_content():
+    """Changelog entries quote code and tags verbatim — the 2026-09-01 entry
+    literally contains `<think>…</think>`. Without escaping, Qt eats it as an
+    unknown tag in the Changelog tab: the log-viewer bug reappearing inside the
+    entry that describes it."""
+    html_out = dialogs._changelog_to_html(
+        "- 修复日志查看器吞掉尖括号: Qt 会把 `<think>…</think>` 这类文本当标签吃掉"
+    )
+    assert "&lt;think&gt;" in html_out
+    # bold/code spans still work over the escaped text
+    assert "<code>" in html_out
+
+
+def test_changelog_html_keeps_bold_and_list_structure():
+    html_out = dialogs._changelog_to_html(
+        "## 2026-09-01\n- **bold** and `code` and plain\n\na paragraph"
+    )
+    assert "<h2>2026-09-01</h2>" in html_out
+    assert "<b>bold</b>" in html_out
+    assert "<code>code</code>" in html_out
+    assert "<li>" in html_out
+    assert "<p>a paragraph</p>" in html_out

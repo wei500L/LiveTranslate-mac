@@ -94,13 +94,19 @@ class LogWindow(QWidget):
             logging.CRITICAL: "#ff0000",
         }.get(level, "#d4d4d4")
 
-        # Highlight ASR and Translate lines
-        if "ASR [" in msg:
-            color = "#9caf91"
-        elif "Translate:" in msg:
-            color = "#9cdcfe"
-        elif "Speech segment" in msg:
-            color = "#ce9178"
+        # Highlight result lines — but only below WARNING, where the level
+        # color is the signal the reader is scanning for. And match the message
+        # shapes as they are actually logged ("Translate (410ms): ..."): every
+        # line from the root logger carries the prefix "LiveTranslate: ", so
+        # matching the bare word "Translate:" painted *all* of them — errors
+        # included — in the translate color.
+        if level < logging.WARNING:
+            if "ASR [" in msg:
+                color = "#9caf91"
+            elif "Translate (" in msg:
+                color = "#9cdcfe"
+            elif "Speech segment" in msg:
+                color = "#ce9178"
 
         # Escape the message: log lines are plain text, and model output in
         # particular is full of <think>-style tags that Qt would otherwise
