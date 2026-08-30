@@ -1,9 +1,11 @@
 import json
 import logging
 import os
+import shutil
 import subprocess
 import sys
 import threading
+from datetime import datetime
 from pathlib import Path
 
 from PyQt6.QtCore import QThread, Qt, QTimer, pyqtSignal
@@ -12,6 +14,7 @@ from PyQt6.QtWidgets import (
     QColorDialog,
     QComboBox,
     QDoubleSpinBox,
+    QFileDialog,
     QFontComboBox,
     QGridLayout,
     QGroupBox,
@@ -73,6 +76,7 @@ from mlx_service import (
 log = logging.getLogger("LiveTranslate.Panel")
 
 SETTINGS_FILE = Path(__file__).parent / "user_settings.json"
+TRANSCRIPTS_DIR = Path(__file__).parent / "transcripts"
 PERFORMANCE_PROFILE_VERSION = 1
 
 
@@ -195,6 +199,30 @@ def active_index_after_removal(removed: int, active: int, remaining: int) -> int
     else:
         index = active
     return max(0, min(index, remaining - 1))
+
+
+def _format_session_row(session: dict) -> str:
+    """One line per recorded session, for the transcripts list."""
+    started = session.get("started") or ""
+    try:
+        when = datetime.fromisoformat(started).strftime("%Y-%m-%d %H:%M")
+    except (TypeError, ValueError):
+        when = session.get("session", "?")
+
+    parts = [when]
+    entries = session.get("entries")
+    if entries is not None:
+        key = "transcript_entries_one" if entries == 1 else "transcript_entries"
+        parts.append(t(key).format(count=entries))
+    seconds = int(session.get("duration_seconds") or 0)
+    if seconds:
+        minutes, seconds = divmod(seconds, 60)
+        hours, minutes = divmod(minutes, 60)
+        parts.append(f"{hours}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes}:{seconds:02d}")
+    for key in ("asr_engine", "translation_model"):
+        if session.get(key):
+            parts.append(str(session[key]))
+    return "  ·  ".join(parts)
 
 
 def _open_folder(path):
@@ -375,13 +403,18 @@ class ControlPanel(QWidget):
             (t("tab_style"), make_scroll_area(self._create_style_tab())),
             (t("tab_subtitle"), make_scroll_area(self._create_subtitle_tab())),
             (t("tab_benchmark"), self._create_benchmark_tab()),
+            (t("tab_transcripts"), self._create_transcripts_tab()),
             (t("tab_cache"), make_scroll_area(self._create_cache_tab())),
             (t("tab_changelog"), self._create_changelog_tab()),
         ]
         for label, page in page_specs:
             self._nav.addItem(label)
             self._pages.addWidget(page)
-        self._cache_tab_index = 5
+        # Indices are derived rather than hardcoded: the previous literal 5 had
+        # to be found and corrected by hand every time a page was inserted.
+        page_index = {label: i for i, (label, _) in enumerate(page_specs)}
+        self._cache_tab_index = page_index[t("tab_cache")]
+        self._transcripts_tab_index = page_index[t("tab_transcripts")]
         self._nav.currentRowChanged.connect(self._pages.setCurrentIndex)
         self._pages.currentChanged.connect(self._on_tab_changed)
         self._nav.setCurrentRow(0)
@@ -841,6 +874,7 @@ class ControlPanel(QWidget):
         self._timeout_spin.setRange(1, 60)
         self._timeout_spin.setValue(s.get("timeout", 5))
         self._timeout_spin.setSuffix(" s")
+        self._timeout_spin.setToolTip(t("timeout_hint"))
         self._timeout_spin.valueChanged.connect(
             lambda v: self._current_settings.update({"timeout": v})
         )
@@ -1283,10 +1317,8 @@ class ControlPanel(QWidget):
         return widget
 
     def _open_transcripts_folder(self):
-        from pathlib import Path
-        ts_dir = Path(__file__).parent / "transcripts"
-        ts_dir.mkdir(parents=True, exist_ok=True)
-        _open_folder(ts_dir)
+        TRANSCRIPTS_DIR.mkdir(parents=True, exist_ok=True)
+        _open_folder(TRANSCRIPTS_DIR)
 
     def _open_models_folder(self):
         MODELS_DIR.mkdir(parents=True, exist_ok=True)
@@ -1295,6 +1327,164 @@ class ControlPanel(QWidget):
     def _on_tab_changed(self, index):
         if index == self._cache_tab_index:
             self._refresh_cache()
+        elif index == self._transcripts_tab_index:
+            self._refresh_transcripts()
+
+    # ── Transcripts / meeting records ──
+
+    def _create_transcripts_tab(self):
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+
+        top = QHBoxLayout()
+        self._transcript_summary = QLabel("")
+        self._transcript_summary.setFont(
+            QFont(default_mono_font_family(), 9, QFont.Weight.Bold)
+        )
+        top.addWidget(self._transcript_summary, 1)
+        refresh_btn = QPushButton(t("btn_refresh"))
+        refresh_btn.clicked.connect(self._refresh_transcripts)
+        top.addWidget(refresh_btn)
+        open_btn = QPushButton(t("btn_open_transcripts"))
+        open_btn.clicked.connect(self._open_transcripts_folder)
+        top.addWidget(open_btn)
+        layout.addLayout(top)
+
+        split = QHBoxLayout()
+        self._transcript_list = QListWidget()
+        self._transcript_list.setFont(QFont(default_mono_font_family(), 9))
+        self._transcript_list.setAlternatingRowColors(True)
+        self._transcript_list.setMinimumWidth(260)
+        self._transcript_list.currentRowChanged.connect(self._on_transcript_selected)
+        split.addWidget(self._transcript_list, 1)
+
+        self._transcript_preview = QTextEdit()
+        self._transcript_preview.setReadOnly(True)
+        self._transcript_preview.setFont(QFont(default_mono_font_family(), 9))
+        self._transcript_preview.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
+        split.addWidget(self._transcript_preview, 2)
+        layout.addLayout(split, 1)
+
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        self._transcript_export_btn = QPushButton(t("btn_export_record"))
+        self._transcript_export_btn.clicked.connect(self._export_transcript)
+        buttons.addWidget(self._transcript_export_btn)
+        self._transcript_delete_btn = QPushButton(t("btn_delete_record"))
+        self._transcript_delete_btn.clicked.connect(self._delete_transcript)
+        buttons.addWidget(self._transcript_delete_btn)
+        layout.addLayout(buttons)
+
+        self._transcript_sessions = []
+        self._set_transcript_buttons_enabled(False)
+        return widget
+
+    def _set_transcript_buttons_enabled(self, enabled: bool):
+        self._transcript_export_btn.setEnabled(enabled)
+        self._transcript_delete_btn.setEnabled(enabled)
+
+    def _refresh_transcripts(self):
+        from transcript_writer import read_session_meta
+
+        self._transcript_list.clear()
+        self._transcript_preview.clear()
+        self._set_transcript_buttons_enabled(False)
+        try:
+            sessions = read_session_meta(TRANSCRIPTS_DIR)
+        except Exception:
+            log.error("Could not list transcripts", exc_info=True)
+            sessions = []
+        self._transcript_sessions = sessions
+
+        if not sessions:
+            self._transcript_summary.setText(t("no_transcripts"))
+            return
+
+        total_entries = sum(int(s.get("entries") or 0) for s in sessions)
+        self._transcript_summary.setText(
+            t("transcript_total").format(count=len(sessions), entries=total_entries)
+        )
+        for session in sessions:
+            self._transcript_list.addItem(_format_session_row(session))
+        self._transcript_list.setCurrentRow(0)
+
+    def _selected_session(self):
+        row = self._transcript_list.currentRow()
+        if 0 <= row < len(self._transcript_sessions):
+            return self._transcript_sessions[row]
+        return None
+
+    def _on_transcript_selected(self, _row):
+        session = self._selected_session()
+        self._set_transcript_buttons_enabled(session is not None)
+        if session is None:
+            self._transcript_preview.clear()
+            return
+        files = session.get("files") or {}
+        # The Markdown record is the readable one; fall back to the combined
+        # text file for sessions recorded before it existed.
+        path = files.get("meeting") or files.get("all") or files.get("original")
+        if not path:
+            self._transcript_preview.setPlainText(t("transcript_files_missing"))
+            return
+        try:
+            text = Path(path).read_text(encoding="utf-8", errors="replace")
+        except OSError as exc:
+            self._transcript_preview.setPlainText(str(exc))
+            return
+        # Previewing a multi-hour session should not freeze the panel.
+        if len(text) > 200_000:
+            text = text[:200_000] + "\n\n…"
+        self._transcript_preview.setPlainText(text)
+
+    def _export_transcript(self):
+        session = self._selected_session()
+        if session is None:
+            return
+        files = session.get("files") or {}
+        source = files.get("meeting") or files.get("all")
+        if not source:
+            QMessageBox.warning(self, t("error_title"), t("transcript_files_missing"))
+            return
+        suffix = Path(source).suffix
+        target, _ = QFileDialog.getSaveFileName(
+            self,
+            t("btn_export_record"),
+            f"meeting_{session['session']}{suffix}",
+            t("export_filter"),
+        )
+        if not target:
+            return
+        try:
+            shutil.copyfile(source, target)
+        except OSError as exc:
+            QMessageBox.critical(
+                self, t("error_title"), t("export_failed").format(error=str(exc))
+            )
+
+    def _delete_transcript(self):
+        from transcript_writer import delete_session
+
+        session = self._selected_session()
+        if session is None:
+            return
+        confirm = QMessageBox.warning(
+            self,
+            t("btn_delete_record"),
+            t("dialog_delete_record").format(session=session["session"]),
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No,
+        )
+        if confirm != QMessageBox.StandardButton.Yes:
+            return
+        failures = delete_session(TRANSCRIPTS_DIR, session["session"])
+        if failures:
+            QMessageBox.critical(
+                self,
+                t("error_title"),
+                t("cache_delete_failed").format(paths="\n".join(failures)),
+            )
+        self._refresh_transcripts()
 
     def _refresh_cache(self):
         if self._cache_task is not None and self._cache_task.isRunning():
@@ -1700,6 +1890,27 @@ class ControlPanel(QWidget):
         if task is not None:
             task.deleteLater()
         self._maybe_close_after_mlx_tasks()
+
+    def stop_background_tasks(self, timeout_ms: int = 3000):
+        """Cancel and join the panel's QThreads before the app tears down.
+
+        Qt deletes child QThreads with their parent; one still running at that
+        moment prints "Destroyed while thread is still running" and can abort
+        the process. The cache scan is the likely one — it starts at panel
+        construction and walks multi-GB model directories.
+        """
+        tasks = [self._mlx_task, self._mlx_health_task, self._cache_task]
+        for task in tasks:
+            if task is None:
+                continue
+            cancel = getattr(task, "cancel_event", None)
+            if cancel is not None:
+                cancel.set()
+        for task in tasks:
+            if task is None or not task.isRunning():
+                continue
+            if not task.wait(timeout_ms):
+                log.warning("Background task %s did not finish in time", type(task).__name__)
 
     def _maybe_close_after_mlx_tasks(self):
         if not getattr(self, "_close_after_mlx_task", False):

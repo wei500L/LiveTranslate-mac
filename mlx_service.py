@@ -40,6 +40,12 @@ HY_MT_MODEL_NAME = "HY-MT1.5-7B (MLX 4-bit)"
 HY_MT_REPO = "Tencent-Hunyuan/HY-MT1.5-7B"
 MLX_VERSION = "0.29.4"
 MLX_LM_VERSION = "0.29.1"
+# mlx_lm.server does not handle SIGTERM: a direct SIGTERM leaves it running past
+# 20s (measured). Every quit therefore burned the whole grace period before
+# escalating. Keep a short one in case a future build starts handling it, then
+# escalate — the server holds no state worth a graceful shutdown, just a
+# read-only model in memory.
+MLX_STOP_GRACE_SECONDS = 1.5
 
 
 class MLXServiceError(RuntimeError):
@@ -57,27 +63,42 @@ def hy_mt_model_config() -> dict[str, Any]:
         "streaming": True,
         "no_system_role": True,
         "thinking_style": "off",
+        # HY-MT is a translation-specialized model, not an instruction-following
+        # chat model: given a multi-line instruction block it continues the block
+        # instead of translating it, burning the whole max_tokens budget. Measured
+        # on this exact 4-bit build: the long classroom prompt failed 3/3 (~2.5s,
+        # 128 tokens of regurgitated prompt), a one-line directive succeeded 4/4
+        # (~0.3s, ~9 tokens).
+        #
+        # context_turns must stay 0 for the same reason. With no_system_role the
+        # only way context reaches this model is the {context} placeholder, and a
+        # context block re-triggers the runaway (0/3 with it, 3/3 without).
+        # Two turns of real conversation context. Measured on this build: it
+        # resolves pronouns the isolated sentence cannot ("find it" -> "find the
+        # derivative of the function"), stays 8/8 stable across a lecture, and
+        # costs ~60 extra prompt tokens. This works only as *turns* — the same
+        # history pasted into the prompt as a text block makes the model
+        # continue the block instead of translating (0/3).
         "context_turns": 2,
+        # English, matching both HY-MT's documented prompt format and the
+        # English language names LANGUAGE_DISPLAY substitutes in.
         "system_prompt": (
-            "你是俄语课堂的实时翻译助手。请将课堂中的{source_lang}内容翻译成{target_lang}。\n"
-            "场景：学校或大学课堂，内容可能包括教师讲解、学生提问、课堂讨论、例句、术语、板书和作业要求。\n"
-            "规则：\n"
-            "- 只输出一条准确、自然的{target_lang}译文，不要解释、分析、前缀、引号或多个候选。\n"
-            "- 保持教师讲解或学生发言的逻辑、语气、否定、条件、因果、时间和指代关系，不擅自补充未说内容。\n"
-            "- 课程术语、人名、地名、书名、课程名、缩写、数字、公式和符号使用目标语言通行表达；没有把握时保留原文，不要臆造。\n"
-            "- 结合课堂语境和近期上下文纠正俄语 ASR 的错词、同音词和断句；无法确定时忠实翻译，不要编造。\n"
-            "- 可适度压缩口语重复和填充词，但不要省略定义、例子、数字、公式、作业要求或关键限定。\n"
-            "- 保持适合实时字幕的简洁长度；原句未完时翻译当前可确定的内容，不添加说明。\n"
-            "近期课堂上下文：\n"
-            "{context}"
+            "Translate the following university classroom {source_lang} into "
+            "{target_lang}. Keep terminology, numbers and formulas accurate. "
+            "Output only the translation.\n\n"
         ),
+        # Greedy decoding. Translation wants the single best rendering, not a
+        # sample: measured 4/4 identical outputs for a repeated sentence versus
+        # 2/4 at temperature 0.7, with equal quality and lower latency (0.39s vs
+        # 0.49s average). A subtitle for the same sentence should not change
+        # between one utterance and the next. repetition_penalty stays as the
+        # runaway guard — greedy decoding is if anything more loop-prone.
         "overrides": {
-            "temperature": 0.7,
-            "top_p": 0.6,
+            "temperature": 0.0,
+            "top_p": 1.0,
             "max_tokens": 128,
         },
         "extra_body": {
-            "top_k": 20,
             "repetition_penalty": 1.05,
         },
         "managed_service": {
@@ -87,6 +108,29 @@ def hy_mt_model_config() -> dict[str, Any]:
             "port": MLX_PORT,
         },
     }
+
+
+# Prompts this project has shipped for the managed model and has since replaced.
+# A config still carrying one verbatim is migrated to the current preset; an
+# edited prompt belongs to the user and is left alone. Each entry is the set of
+# markers identifying one generation of the prompt.
+_SUPERSEDED_HY_MT_PROMPTS = (
+    # The original long classroom prompt. This model continues a multi-line
+    # instruction block instead of following it (3/3 failures when measured).
+    ("你是俄语课堂的实时翻译助手", "近期课堂上下文"),
+    # A one-line Chinese directive; correct, but it substituted the English
+    # language names LANGUAGE_DISPLAY provides into a Chinese sentence.
+    ("把大学课堂上的{source_lang}内容翻译成{target_lang}",),
+)
+
+
+def _is_superseded_hy_mt_prompt(prompt: Any) -> bool:
+    if not isinstance(prompt, str):
+        return False
+    return any(
+        all(marker in prompt for marker in markers)
+        for markers in _SUPERSEDED_HY_MT_PROMPTS
+    )
 
 
 def is_hy_mt_model(model: dict[str, Any] | None) -> bool:
@@ -116,6 +160,12 @@ def ensure_hy_mt_model(settings: dict[str, Any] | None, activate_if_ready: bool 
             if key not in target:
                 target[key] = value
                 changed = True
+        # Replace the previous preset prompt, which this model cannot follow.
+        # Only when it is still verbatim the one we shipped — a prompt the user
+        # has edited is theirs to keep.
+        if _is_superseded_hy_mt_prompt(target.get("system_prompt")):
+            target["system_prompt"] = preset["system_prompt"]
+            changed = True
         # The local model is deliberately kept on a low-latency profile. These
         # controls are operational safeguards rather than user prompt content.
         for key in ("streaming", "no_system_role", "thinking_style", "context_turns"):
@@ -127,6 +177,12 @@ def ensure_hy_mt_model(settings: dict[str, Any] | None, activate_if_ready: bool 
             if overrides.get(key) != preset["overrides"][key]:
                 overrides[key] = preset["overrides"][key]
                 changed = True
+        # extra_body is operational too, and replaced wholesale so a key the
+        # preset has dropped goes away (top_k was meaningless once decoding
+        # became greedy) rather than lingering forever.
+        if target.get("extra_body") != preset["extra_body"]:
+            target["extra_body"] = dict(preset["extra_body"])
+            changed = True
         # The managed endpoint follows the active local service port. This
         # also migrates older settings when LIVETRANSLATE_MLX_PORT changes.
         if target.get("api_base") != preset["api_base"]:
@@ -562,12 +618,10 @@ class MLXServiceManager:
             str(MLX_PORT),
             "--log-level",
             "INFO",
+            # Fallbacks for a request that omits them; the app always sends its
+            # own. Kept aligned with the preset so both paths behave the same.
             "--temp",
-            "0.7",
-            "--top-p",
-            "0.6",
-            "--top-k",
-            "20",
+            "0.0",
         ]
         log.info("Starting managed MLX service: %s", " ".join(command))
         output = log_path.open("ab")
@@ -633,13 +687,43 @@ class MLXServiceManager:
         # aboutToQuit on every platform: an AttributeError here would escape
         # into Qt's shutdown rather than falling back to terminate().
         self._signal_pid(pid, "SIGTERM")
-        deadline = time.monotonic() + 5
-        while self._pid_is_alive(pid) and time.monotonic() < deadline:
-            time.sleep(0.1)
-        if self._pid_is_alive(pid):
+        if not self._await_exit(pid, MLX_STOP_GRACE_SECONDS):
+            log.info("MLX service ignored SIGTERM; killing pid=%s", pid)
             self._signal_pid(pid, "SIGKILL")
+            if not self._await_exit(pid, 2.0):
+                log.error("MLX service pid=%s could not be killed", pid)
         self.pid_file.unlink(missing_ok=True)
         self.process = None
+
+    def _await_exit(self, pid: int, timeout: float) -> bool:
+        """Wait for the service to die, reaping it when it is our own child.
+
+        os.kill(pid, 0) succeeds for a zombie, so polling alone reported a
+        killed-but-unreaped child as still alive and logged a false failure.
+        """
+        if self.process is not None and self.process.pid == pid:
+            try:
+                self.process.wait(timeout=timeout)
+                return True
+            except subprocess.TimeoutExpired:
+                return False
+            except OSError:
+                return True
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            if not self._pid_is_alive(pid):
+                return True
+            # A killed child stays a zombie until someone waits on it, and
+            # os.kill(pid, 0) keeps succeeding until then. If it is a child of
+            # this process, reaping it settles the question.
+            try:
+                reaped, _ = os.waitpid(pid, os.WNOHANG)
+                if reaped == pid:
+                    return True
+            except (ChildProcessError, OSError):
+                pass
+            time.sleep(0.05)
+        return not self._pid_is_alive(pid)
 
     def _signal_pid(self, pid: int, name: str) -> None:
         """Signal a process group, falling back to the process, then to Popen."""

@@ -170,6 +170,12 @@ btn_apply_prompt: "应用提示词"
 group_timeout: "模型连接超时"
 group_network: "网络配置"
 label_timeout: "模型连接超时"
+timeout_hint: >-
+  单次翻译请求的总超时。超时的那一句会显示为错误。
+
+  注意首次请求通常明显更慢：云端服务冷启动可能超过 10 秒，本地模型要先载入权重。
+
+  如果每场会议的第一句总是失败，调大这个值。
 label_translation_workers: "翻译并发数:"
 translation_workers_hint: "同时处理的翻译请求数，范围 4-16。"
 
@@ -191,6 +197,16 @@ whisper_local_prefix: "本地"
 whisper_local_ready: "本地模型"
 whisper_missing_local: "缺失"
 whisper_invalid_local: "本地模型不可用"
+tab_transcripts: "会议记录"
+no_transcripts: "暂无会议记录"
+transcript_total: "共 {count} 场会议 · {entries} 条记录"
+transcript_entries: "{count} 条"
+transcript_entries_one: "1 条"
+transcript_files_missing: "该会议的记录文件已不存在"
+btn_refresh: "刷新"
+btn_export_record: "导出这场会议"
+btn_delete_record: "删除这场会议"
+dialog_delete_record: "将删除会议 {session} 的全部记录文件（原文、译文、合并、Markdown）。是否继续？"
 btn_open_folder: "打开模型文件夹"
 btn_delete_all_exit: "删除全部并退出"
 scanning: "扫描中..."
@@ -267,7 +283,14 @@ streaming_hint: "启用后翻译结果逐字返回，延迟更低。关闭则等
 json_response: "结构化输出 (JSON 模式)"
 json_response_hint: "启用后要求 API 以 JSON 格式返回翻译结果，减少多余解释文字。需要 API 支持 json_object 模式。"
 label_context_turns: "上下文数:"
-context_turns_hint: "携带最近 N 条翻译历史作为上下文，提高术语一致性和指代理解。0 = 不携带上下文。"
+context_turns_hint: >-
+  携带最近 N 条翻译历史作为上下文，提高术语一致性和指代理解。0 = 不携带。
+
+  历史以真正的多轮消息发送（勾选「不使用 system 角色」时同样生效）。
+
+  两点注意：系统提示词里若含 {context} 占位符，历史会改为嵌入提示词、不再发送多轮；
+
+  翻译专用模型（如本地 HY-MT）对多轮兼容，但对提示词内的上下文块可能失效。
 changelog_title: "更新日志 - {version}"
 asr_fast: "快速"
 asr_accurate: "准确"

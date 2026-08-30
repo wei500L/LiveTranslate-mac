@@ -59,14 +59,12 @@ from connection_config import (
     DEFAULT_REMOTE_ASR_URL,
     DEFAULT_TRANSLATION_API_BASE,
     normalize_remote_asr_url,
-    translation_api_base,
     translation_api_key,
-    translation_model,
 )
 from vad_processor import VADProcessor
 from asr_client import ASRClient, ASRWorkerError, ASRWorkerExited, ASRWorkerTimeout
 from asr_remote import RemoteASRError
-from translator import Translator, RepetitionError
+from translator import RepetitionError, translator_from_model_config
 from mlx_service import MLXServiceManager, is_hy_mt_model
 from transcript_writer import TranscriptWriter
 
@@ -338,15 +336,23 @@ class LiveTranslateApp:
         self._target_language = config["translation"]["target_language"]
         self._mlx_service = MLXServiceManager()
         self._mlx_service.translate = t
-        self._translator = Translator(
-            api_base=translation_api_base(config["translation"].get("api_base")),
-            api_key=translation_api_key(config["translation"].get("api_key")),
-            model=translation_model(config["translation"].get("model")),
+        # Bootstrap translator from config.yaml, replaced by the active model as
+        # soon as the panel applies its settings. Built through the same factory
+        # so it cannot drift from the runtime one. thinking_style is explicit
+        # rather than inherited: config.yaml's default endpoint is a local
+        # server, and those reject the unknown parameters "auto" would send.
+        self._translator = translator_from_model_config(
+            {
+                "api_base": config["translation"].get("api_base"),
+                "api_key": config["translation"].get("api_key"),
+                "model": config["translation"].get("model"),
+                "streaming": config["translation"]["streaming"],
+                "system_prompt": config["translation"].get("system_prompt"),
+                "thinking_style": "off",
+            },
             target_language=self._target_language,
             max_tokens=config["translation"]["max_tokens"],
             temperature=config["translation"]["temperature"],
-            streaming=config["translation"]["streaming"],
-            system_prompt=config["translation"].get("system_prompt"),
         )
         self._translator.set_context_turns(
             config["translation"].get("context_window", 0)
@@ -419,6 +425,24 @@ class LiveTranslateApp:
         self._overlay = overlay
         self._publish_transcript_paths()
 
+    def _record_session_info(self):
+        """Tell the transcript what produced it, for the meeting record header."""
+        model = None
+        if self._panel:
+            try:
+                active = self._panel.get_active_model()
+                model = (active or {}).get("name")
+            except Exception:
+                model = None
+        if model is None and self._translator is not None:
+            model = self._translator._model
+        self._transcript.set_session_info(
+            asr_engine=self._asr_config.get("display_name") if self._asr_config else None,
+            translation_model=model,
+            source_language=self._get_asr_language_setting(),
+            target_language=self._target_language,
+        )
+
     def _publish_transcript_paths(self):
         """Tell the overlay where the complete session log is.
 
@@ -437,6 +461,12 @@ class LiveTranslateApp:
 
     def set_panel(self, panel: ControlPanel):
         self._panel = panel
+        # One manager, not two. The panel starts the service and the app stops
+        # it, so separate instances meant the stopping one had never spawned the
+        # process: it could not reap its own child, held a stale version cache,
+        # and knew the pid only through the pid file.
+        self._mlx_service = panel._mlx_manager
+        self._mlx_service.translate = t
         panel.settings_changed.connect(self._on_settings_changed)
         panel.model_changed.connect(self._on_model_changed)
         panel.mlx_service_state_changed.connect(self._on_mlx_service_state_changed)
@@ -515,7 +545,12 @@ class LiveTranslateApp:
         if running:
             self._mlx_available = True
             self._mlx_restart_count = 0
-            self._on_model_changed(active)
+            # Only when the translator actually needs building. The panel emits
+            # model_changed and mlx_service_state_changed for the same start,
+            # and both landing here built two Translators, bumped the generation
+            # twice and cleared the context history twice.
+            if self._translator is None:
+                self._on_model_changed(active)
         elif self._mlx_available is not False:
             self._mlx_available = False
             self._disable_translator()
@@ -774,23 +809,16 @@ class LiveTranslateApp:
             overrides.update({"max_tokens": 128})
             model_config["overrides"] = overrides
 
-        new_translator = Translator(
-            api_base=translation_api_base(model_config.get("api_base")),
-            api_key=translation_api_key(model_config.get("api_key")),
-            model=translation_model(model_config.get("model")),
+        # Shared with the benchmark, so both issue the same request for the
+        # same model. Two copies of this argument list is how they came to
+        # resolve different thinking styles.
+        new_translator = translator_from_model_config(
+            model_config,
             target_language=self._target_language,
+            system_prompt=prompt,
+            timeout=timeout,
             max_tokens=self._config["translation"]["max_tokens"],
             temperature=self._config["translation"]["temperature"],
-            streaming=model_config.get("streaming", True),
-            system_prompt=prompt,
-            proxy=model_config.get("proxy", "none"),
-            no_system_role=model_config.get("no_system_role", False),
-            no_think=model_config.get("no_think", True),
-            thinking_style=model_config.get("thinking_style"),
-            json_response=model_config.get("json_response", False),
-            timeout=timeout,
-            overrides=model_config.get("overrides"),
-            extra_body=model_config.get("extra_body"),
         )
         context_turns = model_config.get(
             "context_turns", self._config["translation"].get("context_window", 0)
@@ -814,6 +842,8 @@ class LiveTranslateApp:
             )
         self._input_price = model_config.get("input_price", 0)
         self._output_price = model_config.get("output_price", 0)
+        if self._running:
+            self._record_session_info()
 
     def _disable_translator(self):
         """Disable translation until the selected local service is available."""
@@ -1162,6 +1192,8 @@ class LiveTranslateApp:
                 self._asr_restart_count = 0
                 self._asr_worker_baseline_mb = None
                 self._asr_generation += 1
+            if self._running:
+                self._record_session_info()
 
         if new_asr[0] is not None:
             _activate_asr(new_asr[0], target_state)
@@ -1335,7 +1367,10 @@ class LiveTranslateApp:
             return False
         stale = None
         with self._asr_lock:
-            if self._asr_generation != expected_gen or not self._running:
+            # _stop_event, not `not self._running`: the latter is also false
+            # before the first start(), so a worker loaded ahead of the pipeline
+            # was discarded as "superseded". The event is set only by stop().
+            if self._asr_generation != expected_gen or self._stop_event.is_set():
                 stale = client
             else:
                 self._asr = client
@@ -1358,6 +1393,8 @@ class LiveTranslateApp:
                 pass
             return False
         name = state.get("display_name") or state.get("type")
+        if self._running:
+            self._record_session_info()
         if self._overlay:
             self._overlay.update_asr_device(
                 f"{name} [{state.get('device_label', state['device'])}]"
@@ -1738,6 +1775,7 @@ class LiveTranslateApp:
             f"(baseline for delta tracking)"
         )
         self._publish_transcript_paths()
+        self._record_session_info()
         log.info("Pipeline started (capture + ASR threads)")
 
     def stop(self):
@@ -1811,7 +1849,10 @@ class LiveTranslateApp:
 
         self._stop_step("ASR worker", self._shutdown_asr_worker)
         self._stop_step("MLX service", self._mlx_service.stop)
-        log.info("Pipeline stopped")
+        if first_call:
+            log.info("Pipeline stopped")
+        else:
+            log.debug("Pipeline stop: residual cleanup only")
 
     def _stop_step(self, what: str, action):
         """Run one cleanup step; log and continue so later steps still run."""
@@ -1929,7 +1970,10 @@ class LiveTranslateApp:
             self._overlay.add_message(
                 msg_id, timestamp, original_text, source_lang, asr_ms
             )
-        self._transcript.write_original(msg_id, timestamp, original_text)
+        self._transcript.write_original(
+            msg_id, timestamp, original_text,
+            language=source_lang, duration=seg_len,
+        )
 
         # Store for subtitle window (translation will be added later)
         self._last_original = original_text
@@ -2227,7 +2271,9 @@ class LiveTranslateApp:
 
         if self._overlay:
             self._overlay.add_message(msg_id, timestamp, original_text, source_lang, asr_ms)
-        self._transcript.write_original(msg_id, timestamp, original_text)
+        self._transcript.write_original(
+            msg_id, timestamp, original_text, language=source_lang
+        )
 
         self._last_original = original_text
         self._last_msg_id = msg_id
@@ -3159,6 +3205,10 @@ def main():
             live_trans.stop()
         except Exception:
             log.error("Pipeline stop failed during quit", exc_info=True)
+        try:
+            panel.stop_background_tasks()
+        except Exception:
+            log.error("Panel task cleanup failed during quit", exc_info=True)
         app.quit()
 
     def on_delete_cache_and_quit(entries):

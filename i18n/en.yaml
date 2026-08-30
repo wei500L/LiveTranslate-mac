@@ -170,6 +170,16 @@ btn_apply_prompt: "Apply Prompt"
 group_timeout: "Model Connect Timeout"
 group_network: "Network"
 label_timeout: "Model Connect Timeout"
+timeout_hint: >-
+  Total timeout for one translation request. A sentence that times out is
+
+  shown as an error.
+
+  The first request of a session is usually much slower: a cloud endpoint
+
+  cold-starts (over 10s is common) and a local model loads its weights.
+
+  Raise this if the first sentence of every meeting fails.
 label_translation_workers: "Translation workers:"
 translation_workers_hint: "Concurrent translation requests, from 4 to 16."
 
@@ -191,6 +201,16 @@ whisper_local_prefix: "Local"
 whisper_local_ready: "Local model"
 whisper_missing_local: "Missing"
 whisper_invalid_local: "Local model unavailable"
+tab_transcripts: "Meeting Records"
+no_transcripts: "No meeting records yet"
+transcript_total: "{count} meetings · {entries} entries"
+transcript_entries: "{count} entries"
+transcript_entries_one: "1 entry"
+transcript_files_missing: "The files for this meeting no longer exist"
+btn_refresh: "Refresh"
+btn_export_record: "Export this meeting"
+btn_delete_record: "Delete this meeting"
+dialog_delete_record: "This deletes every record file for meeting {session} (original, translation, combined, Markdown). Continue?"
 btn_open_folder: "Open Models Folder"
 btn_delete_all_exit: "Delete All && Exit"
 scanning: "Scanning..."
@@ -268,7 +288,22 @@ streaming_hint: "When enabled, translation results are returned incrementally fo
 json_response: "Structured Output (JSON mode)"
 json_response_hint: "Requests the API to return results in JSON format, reducing extraneous text. Requires API support for json_object mode."
 label_context_turns: "Context:"
-context_turns_hint: "Include the last N translation pairs as context for better term consistency and reference resolution. 0 = no context."
+context_turns_hint: >-
+  Include the last N translation pairs as context, for better term
+
+  consistency and pronoun resolution. 0 = none.
+
+  History is sent as real conversation turns, including when "no system
+
+  role" is checked.
+
+  Two caveats: if the system prompt contains a {context} placeholder the
+
+  history is embedded there instead and no turns are sent; and
+
+  translation-specialized models (such as the local HY-MT) handle turns
+
+  well but can break on a context block inside the prompt.
 changelog_title: "What's New - {version}"
 asr_fast: "Fast"
 asr_accurate: "Accurate"

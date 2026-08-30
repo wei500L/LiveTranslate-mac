@@ -3,7 +3,7 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor, as_completed
 
-from translator import Translator, stream_option_errors
+from translator import stream_option_errors, translator_from_model_config
 
 BENCH_SENTENCES = {
     "ja": [
@@ -58,22 +58,11 @@ def build_bench_translator(model: dict, prompt: str, target_lang: str, timeout_s
     a benchmark must measure the real request shape without writing history or
     changing what the pipeline is using.
     """
-    return Translator(
-        api_base=model["api_base"],
-        api_key=model["api_key"],
-        model=model["model"],
+    return translator_from_model_config(
+        model,
         target_language=target_lang,
-        max_tokens=model.get("overrides", {}).get("max_tokens", 256),
-        temperature=model.get("overrides", {}).get("temperature", 0.3),
-        streaming=model.get("streaming", True),
         system_prompt=model.get("system_prompt") or prompt,
-        proxy=model.get("proxy", "none"),
-        no_system_role=model.get("no_system_role", False),
-        json_response=model.get("json_response", False),
         timeout=timeout_s,
-        overrides=model.get("overrides"),
-        extra_body=model.get("extra_body"),
-        thinking_style=model.get("thinking_style"),
     )
 
 

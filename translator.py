@@ -104,6 +104,11 @@ PROMPT_PRESETS = {
 }
 
 
+# Sent when no key is configured. Local OpenAI-compatible servers ignore the
+# value; a real provider will reject it with a clear 401 rather than a crash.
+LOCAL_API_KEY_PLACEHOLDER = "local"
+
+
 def make_openai_client(
     api_base: str, api_key: str, proxy: str = "none", timeout=None
 ) -> "OpenAI":
@@ -113,7 +118,15 @@ def make_openai_client(
     import httpx
     from openai import OpenAI
 
-    kwargs = {"base_url": normalize_api_base(api_base), "api_key": api_key}
+    # A blank key means "a local server that does not check it" — LM Studio,
+    # Ollama's /v1 and the managed mlx_lm.server all ignore it, and config.yaml
+    # ships api_key: "". Recent openai SDKs reject an empty key in the
+    # constructor, which turned that default into a crash before any window
+    # appeared, so substitute the same placeholder the HY-MT preset uses.
+    kwargs = {
+        "base_url": normalize_api_base(api_base),
+        "api_key": api_key or LOCAL_API_KEY_PLACEHOLDER,
+    }
     if timeout is not None:
         kwargs["timeout"] = httpx.Timeout(timeout, connect=5.0)
     if proxy == "system":
@@ -123,6 +136,54 @@ def make_openai_client(
     else:
         kwargs["http_client"] = httpx.Client(proxy=proxy)
     return OpenAI(**kwargs)
+
+
+def translator_from_model_config(
+    model: dict,
+    *,
+    target_language: str,
+    system_prompt: str | None = None,
+    timeout: float = 10,
+    max_tokens: int = 256,
+    temperature: float = 0.3,
+) -> "Translator":
+    """Build a Translator from a persisted model entry.
+
+    The single place model settings become a Translator. Keeping two copies of
+    this argument list is how the benchmark and the runtime came to resolve
+    different thinking styles for the same model — the exact parameter the
+    benchmark exists to diagnose (issue #38).
+
+    ``max_tokens``/``temperature`` are only the fallbacks for a model whose
+    ``overrides`` omit them; the overrides themselves are applied per request.
+    """
+    # Through the env-aware resolvers, so LIVETRANSLATE_API_BASE / _API_KEY /
+    # _MODEL keep working for every caller rather than only the app's.
+    from connection_config import (
+        translation_api_base,
+        translation_api_key,
+        translation_model,
+    )
+
+    overrides = model.get("overrides") or {}
+    return Translator(
+        api_base=translation_api_base(model.get("api_base")),
+        api_key=translation_api_key(model.get("api_key")),
+        model=translation_model(model.get("model")),
+        target_language=target_language,
+        max_tokens=overrides.get("max_tokens", max_tokens),
+        temperature=overrides.get("temperature", temperature),
+        streaming=model.get("streaming", True),
+        system_prompt=system_prompt or model.get("system_prompt"),
+        proxy=model.get("proxy", "none"),
+        no_system_role=model.get("no_system_role", False),
+        no_think=model.get("no_think", True),
+        thinking_style=model.get("thinking_style"),
+        json_response=model.get("json_response", False),
+        timeout=timeout,
+        overrides=model.get("overrides"),
+        extra_body=model.get("extra_body"),
+    )
 
 
 class RepetitionError(Exception):
@@ -231,7 +292,13 @@ class Translator:
         system_prompt=None,
         proxy="none",
         no_system_role=False,
-        no_think=False,
+        # True, matching every caller and the documented default of "auto".
+        # It was False here while main.py and the model dialog both passed True,
+        # so anything constructing a Translator directly silently got "off" —
+        # no thinking-disable parameter at all — for a config that omits
+        # thinking_style. Use translator_from_model_config() instead of
+        # rebuilding this argument list.
+        no_think=True,
         json_response=False,
         timeout=10,
         overrides=None,
@@ -350,21 +417,47 @@ class Translator:
             prompt += '\nRespond in JSON format: {"t": "translated text"}'
         return prompt
 
+    def _wants_turn_context(self) -> bool:
+        """Whether recent pairs should be sent as real conversation turns.
+
+        Not when the template carries a {context} placeholder — that prompt
+        already embeds the history itself, and sending it twice is both
+        wasteful and confusing to the model.
+        """
+        return (
+            self._context_turns > 0
+            and bool(self._history)
+            and "{context}" not in self._system_prompt_template
+        )
+
+    def _history_turns(self):
+        for src, tgt in self._history[-self._context_turns:]:
+            yield {"role": "user", "content": src}
+            yield {"role": "assistant", "content": tgt}
+
     def _build_messages(self, system_prompt, text):
         if self._no_system_role:
-            msgs = [{"role": "user", "content": f"{system_prompt}\n{text}"}]
-        else:
-            msgs = [{"role": "system", "content": system_prompt}]
-            # Append recent history as context
-            if (
-                self._context_turns > 0
-                and self._history
-                and "{context}" not in self._system_prompt_template
-            ):
-                for src, tgt in self._history[-self._context_turns:]:
-                    msgs.append({"role": "user", "content": src})
-                    msgs.append({"role": "assistant", "content": tgt})
+            # Providers that reject a system role still support multi-turn, and
+            # the history is what lets the model resolve pronouns and keep
+            # terminology consistent. Dropping it here (as this branch used to)
+            # made context_turns silently do nothing for these models.
+            #
+            # The instruction rides on the first message only: repeating it on
+            # every turn measured no better and costs ~50% more prompt tokens.
+            if not self._wants_turn_context():
+                return [{"role": "user", "content": f"{system_prompt}\n{text}"}]
+            msgs = list(self._history_turns())
+            msgs[0] = {
+                "role": "user",
+                "content": f"{system_prompt}\n{msgs[0]['content']}",
+            }
             msgs.append({"role": "user", "content": text})
+            return msgs
+
+        msgs = [{"role": "system", "content": system_prompt}]
+        if self._wants_turn_context():
+            msgs.extend(self._history_turns())
+        msgs.append({"role": "user", "content": text})
         return msgs
 
     def _append_history(self, text, result):

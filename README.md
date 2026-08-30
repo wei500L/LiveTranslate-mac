@@ -182,10 +182,27 @@ main.py                 Entry point & pipeline
 ├── translator.py       OpenAI-compatible client (streaming, JSON schema, context)
 ├── model_manager.py    Model download & cache
 ├── subtitle_overlay.py PyQt6 overlay
-├── control_panel.py    Settings UI (7 tabs)
+├── control_panel.py    Settings UI (8 pages, incl. Meeting Records)
+├── transcript_writer.py Meeting record: text + Markdown + metadata per session
 ├── dialogs.py          Wizard, download & model config dialogs
-└── benchmark.py        Translation benchmark
+├── benchmark.py        Translation benchmark
+└── debug_pipeline.py   Diagnostic: replay a file through the real pipeline
 ```
+
+### Troubleshooting
+
+If subtitles or translations stop appearing, replay an audio file through the
+real pipeline instead of guessing:
+
+```bash
+.venv/bin/python debug_pipeline.py --audio sample.mp3              # both chains
+.venv/bin/python debug_pipeline.py --audio sample.mp3 --no-translate  # ASR only
+```
+
+It uses your actual settings, ASR worker and translation model, prints what each
+stage produced, and fails the run if a stage was asked to do work and produced
+nothing. The full DEBUG log lands in `logs/diagnostic_*.log`, and its transcripts
+go to `transcripts/diagnostic/` so they stay out of your meeting records.
 
 ## Acknowledgements
 

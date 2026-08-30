@@ -23,7 +23,8 @@ asr:
   device: "auto"
   # Compute type: float16, int8_float16, int8
   compute_type: "float16"
-  # Language: auto, en, ja, zh, ko, etc.
+  # Language: auto, en, ja, zh, ko, etc. Ignored by fixed-language engines
+  # (GigaAM is Russian-only and always reports "ru").
   language: "auto"
   # Minimum speech duration (seconds) before sending to ASR
   min_speech_duration: 1.0
@@ -37,24 +38,42 @@ asr:
   whisper_pad_seconds: 0.5
 
 translation:
-  # OpenAI-compatible API settings
+  # OpenAI-compatible API settings. These are only the bootstrap values: the
+  # models list in user_settings.json takes over as soon as the control panel
+  # applies its settings, and each entry there can override every field below.
   # Override with LIVETRANSLATE_API_BASE / LIVETRANSLATE_API_KEY when desired.
   api_base: "http://127.0.0.1:1234/v1"
+  # Empty means "a local server that does not check the key" — LM Studio,
+  # Ollama's /v1 and the managed MLX service all ignore it. A placeholder is
+  # substituted before the request, because recent OpenAI SDKs refuse to
+  # construct a client with an empty key at all.
   api_key: ""
   model: "hunyuan-mt-chimera-7b"
   # Target language for translation
   target_language: "zh"
   # Source language hint (auto = detect from ASR)
   source_language: "auto"
-  # Context window size (number of recent translations to include)
+  # How many recent (source, translation) pairs to give the model as context.
+  # They are sent as real conversation turns, which is what lets it resolve
+  # pronouns and keep terminology consistent across a session. Two caveats:
+  #   * if the system prompt below contains {context}, the history is embedded
+  #     there instead and no turns are sent (one mechanism, never both);
+  #   * translation-specialized models can be sensitive to how context arrives.
+  #     The managed HY-MT model works with turns but breaks on a {context}
+  #     block — see the comments on hy_mt_model_config() in mlx_service.py.
   context_window: 10
-  # Max tokens for translation response
+  # Max tokens for one translation. Also the ceiling that stops a runaway
+  # generation; a subtitle-length reply uses well under 50.
   max_tokens: 512
-  # Temperature
+  # Sampling temperature. 0.0 is greedy: the same sentence always gets the same
+  # subtitle, which is usually what you want for translation.
   temperature: 0.3
   # Enable streaming output
   streaming: true
-  # System prompt template ({source_lang}, {target_lang}, {context} will be replaced)
+  # System prompt template ({source_lang}, {target_lang}, {context} will be
+  # replaced; {source_lang}/{target_lang} become English names like "Russian").
+  # A long, multi-line instruction block is fine for general chat models, but
+  # translation-specialized ones may continue it instead of following it.
   system_prompt: |
     你是俄语课堂的实时翻译助手。请将课堂中的{source_lang}内容翻译成{target_lang}。
     场景：学校或大学课堂，内容可能包括教师讲解、学生提问、课堂讨论、例句、术语、板书和作业要求。

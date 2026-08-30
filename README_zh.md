@@ -171,10 +171,25 @@ main.py                 主入口，管线编排
 ├── translator.py       OpenAI 兼容翻译客户端 (流式/JSON/上下文)
 ├── model_manager.py    模型下载与缓存管理
 ├── subtitle_overlay.py PyQt6 透明悬浮窗
-├── control_panel.py    设置面板 UI (7 个标签页)
+├── control_panel.py    设置面板 UI (8 个页面，含会议记录)
+├── transcript_writer.py 会议记录：每场生成文本 + Markdown + 元数据
 ├── dialogs.py          设置向导、下载、模型配置对话框
-└── benchmark.py        翻译基准测试
+├── benchmark.py        翻译基准测试
+└── debug_pipeline.py   诊断工具：把音频文件喂进真实管线
 ```
+
+### 排查问题
+
+字幕或翻译不出来时，不要靠猜 —— 用真实管线回放一个音频文件：
+
+```bash
+.venv/bin/python debug_pipeline.py --audio sample.mp3              # 两条链路
+.venv/bin/python debug_pipeline.py --audio sample.mp3 --no-translate  # 只测识别
+```
+
+它用你实际的设置、ASR worker 和翻译模型，逐阶段打印产出；**某一环节被要求工作
+却什么都没产出会判定为失败**，而不是安静通过。完整 DEBUG 日志在
+`logs/diagnostic_*.log`，诊断转录写到 `transcripts/diagnostic/`，不会混进你的会议记录。
 
 ## 致谢
 
