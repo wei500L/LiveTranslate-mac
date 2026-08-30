@@ -1,3 +1,4 @@
+import queue
 import threading
 from types import SimpleNamespace
 
@@ -238,3 +239,64 @@ def test_set_device_reports_stopped_when_recovery_also_fails(monkeypatch):
     assert cap.set_device("B") is False
     assert cap._running is False
     assert "restore failed" in cap._metrics.last_error
+
+
+# --- A permanently undecodable stream must be terminal, not silence ------------
+
+
+def _capture_with_queue(buffers):
+    """A capture whose worker is driven by hand over a prefilled queue."""
+    capture = SCKAudioCapture(require_permission=False)
+    # The real callback queue is bounded at 16; the escalation test needs more
+    # bad buffers than that, and put() on a full queue blocks forever.
+    capture._callback_queue = queue.Queue()
+    for buffer in buffers:
+        capture._callback_queue.put(buffer)
+    capture._running = False  # drain the queue and exit, like a real stop
+    return capture
+
+
+def test_consecutive_decode_failures_escalate_to_a_terminal_error(monkeypatch):
+    """The pyaudio and WASAPI backends escalate after N consecutive read
+    failures; the SCK worker used to swallow every decode exception with a
+    warning, so a stream delivering a format it could not decode produced
+    permanent silence while the UI kept saying "Running"."""
+    import audio_capture_sck
+
+    def boom(_sample):
+        raise RuntimeError("cannot decode this format")
+
+    monkeypatch.setattr(audio_capture_sck, "sample_buffer_to_float32", boom)
+    capture = _capture_with_queue([object() for _ in range(25)])
+    capture._worker()
+
+    with pytest.raises(CaptureRuntimeError, match="decode"):
+        capture.get_audio(timeout=0)
+
+
+def test_intermittent_decode_failures_do_not_escalate(monkeypatch):
+    """A single odd buffer between good ones is ordinary; only a run of them
+    is terminal."""
+    import audio_capture_sck
+
+    calls = iter([
+        RuntimeError("odd buffer"),                     # failure 1
+        (np.ones(512, dtype=np.float32), 16000),        # success resets
+        RuntimeError("odd buffer"),                     # failure 1 again
+        (np.ones(512, dtype=np.float32), 16000),
+    ])
+
+    def decode(_sample):
+        outcome = next(calls)
+        if isinstance(outcome, Exception):
+            raise outcome
+        return outcome
+
+    monkeypatch.setattr(audio_capture_sck, "sample_buffer_to_float32", decode)
+    capture = _capture_with_queue([object() for _ in range(4)])
+    capture._worker()
+
+    assert capture._terminal_error is None
+    assert capture.get_audio(timeout=0) is not None or capture.metrics()[
+        "output_blocks"
+    ] > 0

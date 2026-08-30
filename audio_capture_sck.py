@@ -24,6 +24,13 @@ from platform_permissions import (
 
 log = logging.getLogger("LiveTranslate.Audio.ScreenCaptureKit")
 
+# Consecutive undecodable buffers before the stream is declared dead. The
+# pyaudio and WASAPI backends escalate the same way (READ_MAX_FAILURES); the
+# SCK worker used to swallow every decode exception, so a stream delivering a
+# format this decoder cannot read produced permanent silence while the UI kept
+# saying "Running" — exactly the failure mode the get_audio() contract forbids.
+_DECODE_MAX_FAILURES = 20
+
 try:  # NSObject is required by Objective-C delegate dispatch on real macOS.
     from Foundation import NSObject as _NSObject
     import objc as _objc
@@ -347,6 +354,7 @@ class SCKAudioCapture(AudioCaptureBase):
         return mic
 
     def _worker(self):
+        failures = 0
         while self._running or not self._callback_queue.empty():
             try:
                 sample = self._callback_queue.get(timeout=0.1)
@@ -364,9 +372,25 @@ class SCKAudioCapture(AudioCaptureBase):
                         mic_native_channels=1,
                         mic_native_rate=self.sample_rate,
                     )
+                    failures = 0
             except Exception as exc:
+                failures += 1
                 self._metrics.last_error = str(exc)
-                log.warning("ScreenCaptureKit audio callback failed: %s", exc)
+                log.warning(
+                    "ScreenCaptureKit audio callback failed (%s/%s): %s",
+                    failures, _DECODE_MAX_FAILURES, exc,
+                )
+                if failures >= _DECODE_MAX_FAILURES:
+                    # A stream whose buffers keep failing to decode is
+                    # terminally broken, not flaky: surface it through
+                    # get_audio() so the pipeline stops instead of feeding on
+                    # silence. _capture_loop calls stop() on this error, which
+                    # tears the native stream down.
+                    self.fail_terminally(
+                        f"ScreenCaptureKit audio decode keeps failing: {exc}"
+                    )
+                    self._running = False
+                    return
 
     @staticmethod
     def _async_result(call, timeout=10.0):

@@ -1,3 +1,4 @@
+import html
 import logging
 from PyQt6.QtWidgets import (
     QWidget,
@@ -101,7 +102,11 @@ class LogWindow(QWidget):
         elif "Speech segment" in msg:
             color = "#ce9178"
 
-        self._text.append(f'<span style="color:{color}">{msg}</span>')
+        # Escape the message: log lines are plain text, and model output in
+        # particular is full of <think>-style tags that Qt would otherwise
+        # swallow as HTML — hiding exactly the lines someone opens this window
+        # to read.
+        self._text.append(f'<span style="color:{color}">{html.escape(msg)}</span>')
 
         if self._auto_scroll.isChecked():
             self._text.moveCursor(QTextCursor.MoveOperation.End)
