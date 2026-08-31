@@ -80,3 +80,50 @@ def get_click_through(window) -> bool | None:
 # feature as one word while keeping the readable canonical API above.
 set_window_clickthrough = set_click_through
 get_window_clickthrough = get_click_through
+
+
+# AppKit window levels: Qt's WindowStaysOnTopHint maps to the floating level
+# (3), which still sinks behind other floating panels. The modal-panel level
+# (8) stays above those while staying below the menu bar (24) and the Dock.
+_NS_MODAL_PANEL_WINDOW_LEVEL = 8
+_NS_NORMAL_WINDOW_LEVEL = 0
+_NS_WINDOW_COLLECTION_BEHAVIOR_CAN_JOIN_ALL_SPACES = 1 << 0
+_NS_WINDOW_COLLECTION_BEHAVIOR_FULLSCREEN_AUXILIARY = 1 << 8
+
+
+def set_always_on_top(window, enabled: bool) -> bool:
+    """Pin a window above other applications' windows; return whether applied.
+
+    On Windows Qt's WindowStaysOnTopHint is honored natively, so this is a
+    no-op. On macOS the hint alone leaves two holes a subtitle overlay falls
+    through during a meeting: a fullscreen app (Zoom, browsers) owns a
+    separate Space the window never appears on, and an NSPanel can hide when
+    the app deactivates. Joining all Spaces with the auxiliary fullscreen
+    behavior, a level above floating, and hidesOnDeactivate=False restores
+    the Windows-style always-on-top.
+    """
+    if sys.platform != "darwin":
+        return False
+    try:
+        ns_window = _mac_ns_window(window)
+    except Exception:
+        # No native window yet (created lazily), or PyObjC missing: the Qt
+        # hint still applies, just without the Space pinning.
+        return False
+    spaces = (
+        _NS_WINDOW_COLLECTION_BEHAVIOR_CAN_JOIN_ALL_SPACES
+        | _NS_WINDOW_COLLECTION_BEHAVIOR_FULLSCREEN_AUXILIARY
+    )
+    try:
+        behavior = int(ns_window.collectionBehavior())
+        if enabled:
+            ns_window.setLevel_(_NS_MODAL_PANEL_WINDOW_LEVEL)
+            if hasattr(ns_window, "setHidesOnDeactivate_"):
+                ns_window.setHidesOnDeactivate_(False)
+            ns_window.setCollectionBehavior_(behavior | spaces)
+        else:
+            ns_window.setLevel_(_NS_NORMAL_WINDOW_LEVEL)
+            ns_window.setCollectionBehavior_(behavior & ~spaces)
+    except Exception:
+        return False
+    return True

@@ -605,9 +605,23 @@ class LiveTranslateApp:
                 switched = self._audio.set_device(new_device)
                 if switched is False:
                     log.warning(
-                        "Audio device switch to %r failed; keeping the previous device",
+                        "Audio device switch to %r failed (%s); keeping the previous device",
                         new_device,
+                        self._audio.metrics().get("last_error") or "unknown error",
                     )
+                    # A denied Screen Recording grant looks exactly like
+                    # permanent silence otherwise: the pipeline keeps
+                    # "Running" on the restored mic-only backend with no
+                    # user-visible hint. Surface the typed cause.
+                    switch_error = getattr(self._audio, "_switch_error", None)
+                    if self._panel and isinstance(switch_error, BaseException):
+                        QMessageBox.warning(
+                            self._panel,
+                            t("error_title"),
+                            t("error_audio_switch").format(
+                                error=_audio_start_error(switch_error)
+                            ),
+                        )
                     # set_device restores the old stream when it can. If that
                     # recovery also failed the backend is stopped, so stop the
                     # pipeline instead of reporting a running state with no audio.

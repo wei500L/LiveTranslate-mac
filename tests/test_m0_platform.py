@@ -177,6 +177,63 @@ def test_macos_clickthrough_uses_native_window_without_win32(monkeypatch):
     assert platform_clickthrough.get_click_through(window) is True
 
 
+class _FakePinnableWindow:
+    """Records the AppKit calls set_always_on_top() is expected to make."""
+
+    def __init__(self):
+        self.level = 0
+        self.spaces_behavior = 0
+        self.hides_on_deactivate = None
+
+    def setIgnoresMouseEvents_(self, enabled):
+        self.click_through = enabled
+
+    def setLevel_(self, level):
+        self.level = level
+
+    def collectionBehavior(self):
+        return self.spaces_behavior
+
+    def setCollectionBehavior_(self, behavior):
+        self.spaces_behavior = behavior
+
+    def setHidesOnDeactivate_(self, hides):
+        self.hides_on_deactivate = hides
+
+
+def test_macos_always_on_top_joins_all_spaces_and_rises_above_floating(monkeypatch):
+    """Qt's StaysOnTopHint maps to the floating level and a single Space, so
+    the overlay vanishes behind a fullscreen Zoom/browser Space and can hide
+    with its NSPanel. Pinning must fix level, Spaces and deactivation."""
+    native = _FakePinnableWindow()
+    window = SimpleNamespace(windowHandle=lambda: native)
+    monkeypatch.setattr(platform_clickthrough.sys, "platform", "darwin")
+
+    assert platform_clickthrough.set_always_on_top(window, True)
+    assert native.level > 3  # above NSFloatingWindowLevel
+    assert native.level < 24  # still below the menu bar
+    assert native.spaces_behavior & (1 << 0)  # can join all Spaces
+    assert native.spaces_behavior & (1 << 8)  # visible over fullscreen apps
+    assert native.hides_on_deactivate is False
+
+    # Toggling top-most off must restore a plain, single-Space window.
+    assert platform_clickthrough.set_always_on_top(window, False)
+    assert native.level == 0
+    assert native.spaces_behavior & ((1 << 0) | (1 << 8)) == 0
+
+
+def test_always_on_top_is_a_noop_off_macos(monkeypatch):
+    monkeypatch.setattr(platform_clickthrough.sys, "platform", "win32")
+    window = SimpleNamespace(windowHandle=lambda: None, winId=lambda: 1)
+    assert platform_clickthrough.set_always_on_top(window, True) is False
+
+
+def test_macos_always_on_top_survives_missing_native_window(monkeypatch):
+    monkeypatch.setattr(platform_clickthrough.sys, "platform", "darwin")
+    window = SimpleNamespace(windowHandle=lambda: None)
+    assert platform_clickthrough.set_always_on_top(window, True) is False
+
+
 def test_fake_torch_reports_mps_memory_and_never_enables_fp16(monkeypatch):
     fake_torch = SimpleNamespace(
         backends=SimpleNamespace(

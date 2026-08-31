@@ -22,7 +22,7 @@ from PyQt6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
-from platform_clickthrough import set_click_through
+from platform_clickthrough import set_always_on_top, set_click_through
 from platform_fonts import default_cjk_font_family, default_mono_font_family
 from torch_backend import accelerator_memory
 
@@ -925,6 +925,9 @@ class SubtitleOverlay(QWidget):
     def __init__(self, config):
         super().__init__()
         self._config = config
+        # Mirrors the header checkbox (default on) so showEvent can re-pin
+        # the native always-on-top state without reading UI widgets.
+        self._topmost_enabled = True
         self._messages = {}
         self._max_messages = 50
         # Messages rotated out of the view. The cap is deliberate (memory and
@@ -1080,6 +1083,7 @@ class SubtitleOverlay(QWidget):
         self._handle.set_running(running)
 
     def _set_topmost(self, enabled: bool):
+        self._topmost_enabled = enabled
         flags = self.windowFlags()
         if enabled:
             flags |= Qt.WindowType.WindowStaysOnTopHint
@@ -1087,6 +1091,9 @@ class SubtitleOverlay(QWidget):
             flags &= ~Qt.WindowType.WindowStaysOnTopHint
         self.setWindowFlags(flags)
         self.show()
+        # setWindowFlags() recreates the native window on macOS, dropping the
+        # Space-pinning this re-asserts (see set_always_on_top).
+        set_always_on_top(self, enabled)
 
     def _set_taskbar(self, enabled: bool):
         flags = self.windowFlags()
@@ -1119,6 +1126,11 @@ class SubtitleOverlay(QWidget):
 
     def showEvent(self, event):
         super().showEvent(event)
+        # Every show is a chance for macOS to hand back a fresh native window
+        # (taskbar/top-most toggles, tray "Show Overlay"), so re-assert the
+        # native pin along with click-through.
+        if self._topmost_enabled:
+            QTimer.singleShot(0, lambda: set_always_on_top(self, True))
         if self._click_through:
             QTimer.singleShot(0, self._check_click_through)
         else:

@@ -7,7 +7,11 @@ import pytest
 
 import audio_capture_sck
 from audio_capture_sck import SCKAudioCapture, sample_buffer_to_float32
-from platform_permissions import CaptureRuntimeError, PlatformUnavailableError
+from platform_permissions import (
+    CaptureRuntimeError,
+    PermissionDeniedError,
+    PlatformUnavailableError,
+)
 
 
 def test_sample_buffer_fixture_interleaved_int16_is_mono_float32():
@@ -300,3 +304,190 @@ def test_intermittent_decode_failures_do_not_escalate(monkeypatch):
     assert capture.get_audio(timeout=0) is not None or capture.metrics()[
         "output_blocks"
     ] > 0
+
+
+class FakeMicBackend:
+    """Stands in for PyAudioCapture: records lifecycle, needs no hardware."""
+
+    def __init__(
+        self,
+        device=None,
+        mic_device=None,
+        sample_rate=16000,
+        chunk_duration=0.032,
+        require_permission=True,
+        system_audio="disabled",
+    ):
+        self.sample_rate = sample_rate
+        self.chunk_duration = chunk_duration
+        self._device_name = device
+        self._mic_device_name = mic_device
+        self._running = False
+        self.start_calls = 0
+        self.stop_calls = 0
+
+    def start(self):
+        self.start_calls += 1
+        self._running = True
+
+    def stop(self):
+        self.stop_calls += 1
+        self._running = False
+
+    def set_device(self, device_name):
+        self._device_name = device_name
+        return True
+
+    def set_mic_device(self, device_name):
+        self._mic_device_name = device_name
+        return True
+
+
+def _mic_class(monkeypatch):
+    import audio_capture_pyaudio
+
+    monkeypatch.setattr(audio_capture_pyaudio, "PyAudioCapture", FakeMicBackend)
+    return FakeMicBackend
+
+
+def test_mac_facade_switches_mic_only_and_system_audio(monkeypatch):
+    """None = ScreenCaptureKit system audio, "__disabled__" = mic only; a mode
+    flip rebuilds the backend and carries the mic selection across."""
+    _mic_class(monkeypatch)
+    capture = audio_capture_sck.MacAudioCapture(
+        system_audio="disabled", mic_device="__default__"
+    )
+    assert isinstance(capture._backend, FakeMicBackend)
+
+    # Same mode: passthrough, no rebuild.
+    assert capture.set_device("__disabled__") is True
+    assert isinstance(capture._backend, FakeMicBackend)
+
+    # Mic only -> system audio (pipeline not running: swap without start).
+    assert capture.set_device(None) is True
+    assert isinstance(capture._backend, SCKAudioCapture)
+    assert capture._backend._mic_device_name == "__default__"
+
+    # System audio -> mic only: mic selection survives the rebuild.
+    assert capture.set_device("__disabled__") is True
+    assert isinstance(capture._backend, FakeMicBackend)
+    assert capture._backend._mic_device_name == "__default__"
+
+
+def test_mac_facade_mode_flip_round_trip_is_visible_to_change_detection(monkeypatch):
+    """main.py decides whether to call set_device() by comparing the stored
+    audio_device against the backend's _device_name.  A mic-only backend built
+    by a mode flip must therefore carry the "__disabled__" sentinel — with
+    device=None it would equal the SCK backend's value and flipping back to
+    system audio became a silent no-op while the UI showed the new mode."""
+    _mic_class(monkeypatch)
+    # Constructed the way main.py does: the mic-only path always receives the
+    # device sentinel alongside system_audio="disabled".
+    capture = audio_capture_sck.MacAudioCapture(
+        device="__disabled__", system_audio="disabled", mic_device="__default__"
+    )
+
+    for stored in (None, "__disabled__", None, "__disabled__"):
+        old = capture._device_name  # exactly main.py's guard read
+        assert old != stored, "mode flip would be invisible to main.py's guard"
+        assert capture.set_device(stored) is True
+    assert isinstance(capture._backend, FakeMicBackend)
+    assert capture._backend._device_name == "__disabled__"
+
+
+def test_mac_facade_running_switch_starts_new_backend_and_stops_old(monkeypatch):
+    class FakeSCK:
+        def __init__(self, mic_device=None, sample_rate=16000, chunk_duration=0.032):
+            self._mic_device_name = mic_device
+            self._running = False
+            self.start_calls = 0
+
+        def start(self):
+            self.start_calls += 1
+            self._running = True
+
+        def stop(self):
+            self._running = False
+
+    monkeypatch.setattr(audio_capture_sck, "SCKAudioCapture", FakeSCK)
+    _mic_class(monkeypatch)
+    capture = audio_capture_sck.MacAudioCapture(
+        system_audio="disabled", mic_device="__default__"
+    )
+    capture._backend._running = True  # pretend the pipeline is live
+    old_backend = capture._backend
+
+    assert capture.set_device(None) is True
+    assert isinstance(capture._backend, FakeSCK)
+    assert capture._backend.start_calls == 1
+    assert old_backend.stop_calls == 1
+
+
+def test_mac_facade_failed_switch_restores_previous_backend(monkeypatch):
+    """A switch whose new backend cannot start must leave the previous mode
+    running, not a stopped capture behind a UI that says otherwise."""
+
+    class FailingSCK:
+        def __init__(self, **kwargs):
+            self._mic_device_name = kwargs.get("mic_device")
+
+        def start(self):
+            raise PermissionDeniedError("Screen Recording access is denied")
+
+        def stop(self):
+            pass
+
+    monkeypatch.setattr(audio_capture_sck, "SCKAudioCapture", FailingSCK)
+    _mic_class(monkeypatch)
+    capture = audio_capture_sck.MacAudioCapture(
+        system_audio="disabled", mic_device="__default__"
+    )
+    capture._backend._running = True
+    previous = capture._backend
+
+    assert capture.set_device(None) is False
+    assert capture._backend is previous
+    assert previous.stop_calls == 1
+    assert previous.start_calls == 1  # restarted after the failed switch
+    # The typed cause is retained so the UI can show permission guidance
+    # instead of a silent mic-only capture behind a "Running" indicator.
+    assert isinstance(capture._switch_error, PermissionDeniedError)
+
+
+def test_mac_facade_switch_error_is_cleared_on_success(monkeypatch):
+    class FakeSCK:
+        def __init__(self, mic_device=None, sample_rate=16000, chunk_duration=0.032):
+            self._mic_device_name = mic_device
+            self._running = False
+            self._device_name = None
+
+        def start(self):
+            self._running = True
+
+        def stop(self):
+            self._running = False
+
+        def set_device(self, device_name):
+            self._device_name = device_name
+            return True
+
+    monkeypatch.setattr(audio_capture_sck, "SCKAudioCapture", FakeSCK)
+    _mic_class(monkeypatch)
+    capture = audio_capture_sck.MacAudioCapture(
+        device="__disabled__", system_audio="disabled", mic_device="__default__"
+    )
+    capture._switch_error = RuntimeError("stale failure")
+
+    assert capture.set_device(None) is True
+    assert capture._switch_error is None
+
+
+def test_mac_facade_same_mode_device_name_is_passthrough(monkeypatch):
+    """Auto-save calls set_device with the whole settings dict after every
+    unrelated change; same-mode calls must not tear the SCK stream down."""
+    monkeypatch.setattr(
+        audio_capture_sck, "ensure_screen_capture_permission", lambda request: None
+    )
+    capture = audio_capture_sck.MacAudioCapture(system_audio="enabled", mic_device="__default__")
+    assert capture.set_device(None) is True
+    assert isinstance(capture._backend, SCKAudioCapture)

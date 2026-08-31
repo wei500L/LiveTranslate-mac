@@ -562,6 +562,12 @@ class ControlPanel(QWidget):
                     self._audio_device.addItem(name)
             except Exception:
                 pass
+        else:
+            # macOS: index 0 = mic only, index 1 = ScreenCaptureKit system
+            # audio (Zoom/browser/player sound). Saved as audio_device
+            # "__disabled__"/None; MacAudioCapture.set_device rebuilds the
+            # backend when the mode flips.
+            self._audio_device.addItem(t("audio_system_sck"))
         saved_audio = s.get("audio_device")
         if saved_audio == "__disabled__":
             self._audio_device.setCurrentIndex(0)
@@ -569,13 +575,18 @@ class ControlPanel(QWidget):
             idx = self._audio_device.findText(saved_audio)
             if idx >= 0:
                 self._audio_device.setCurrentIndex(idx)
+            elif sys.platform == "darwin":
+                self._audio_device.setCurrentIndex(1)
         elif sys.platform != "darwin":
             self._audio_device.setCurrentIndex(1)  # system default
         else:
-            self._audio_device.setCurrentIndex(0)
-            self._audio_device.setEnabled(False)
+            # No stored preference yet: capturing player/meeting audio is the
+            # common case on macOS, so default to system audio.
+            self._audio_device.setCurrentIndex(1)
         asr_layout.addWidget(QLabel(t("label_audio")), 6, 0)
         asr_layout.addWidget(self._audio_device, 6, 1)
+        if sys.platform == "darwin":
+            self._audio_device.setToolTip(t("audio_system_sck_tooltip"))
         self._audio_device.currentIndexChanged.connect(self._auto_save)
 
         self._mic_device = QComboBox()

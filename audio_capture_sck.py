@@ -235,12 +235,22 @@ def sample_buffer_to_float32(sample_buffer):
         asbd = CoreMedia.CMAudioFormatDescriptionGetStreamBasicDescription(desc)
         if hasattr(asbd, "contents"):
             asbd = asbd.contents
-        rate = int(round(float(asbd.mSampleRate)))
-        channels = int(asbd.mChannelsPerFrame)
-        flags = int(asbd.mFormatFlags)
+        if isinstance(asbd, tuple):
+            # Current PyObjC releases return the AudioStreamBasicDescription
+            # struct as a plain tuple in field order rather than an object
+            # with named attributes.
+            sample_rate, _fmt_id, format_flags, _bpp, _fpp, _bpf, channels, bits = asbd[:8]
+        else:
+            sample_rate = asbd.mSampleRate
+            channels = asbd.mChannelsPerFrame
+            format_flags = asbd.mFormatFlags
+            bits = getattr(asbd, "mBitsPerChannel", 32)
+        rate = int(round(float(sample_rate)))
+        channels = int(channels)
+        flags = int(format_flags)
         non_interleaved = bool(flags & (1 << 5))
         is_float = bool(flags & 1)
-        bits = int(getattr(asbd, "mBitsPerChannel", 32) or 32)
+        bits = int(bits or 32)
         fmt = "float32" if is_float and bits <= 32 else ("int16" if bits <= 16 else "int32")
 
         if non_interleaved:
@@ -275,12 +285,24 @@ class _SCKStreamDelegate(_NSObject):
             self.owner = owner
         return self
 
-    def stream_didOutputSampleBuffer_ofType_(self, stream, sample_buffer, output_type):
+    def _did_output_sample(self, stream, sample_buffer, output_type):
         self.owner._sample_callback(sample_buffer, output_type)
 
-    # Some PyObjC versions expose the selector with a colon spelling in Python.
-    def stream_didOutputSampleBuffer_ofType(self, stream, sample_buffer, output_type):
-        self.owner._sample_callback(sample_buffer, output_type)
+    if _objc is not None:
+        # PyObjC has no metadata for stream:didOutputSampleBuffer:ofType: (it
+        # is absent from the SCStreamDelegate protocol listing on current
+        # builds), so the inferred signature is "v@:@@@": the SCFrameOutputType
+        # enum argument is then bridged as an object pointer, and the first
+        # delivered audio buffer segfaults the whole process. Registering the
+        # real signature pins the selector spelling too, which is why no
+        # colon-less fallback method is needed anymore.
+        stream_didOutputSampleBuffer_ofType_ = _objc.selector(
+            _did_output_sample,
+            selector=b"stream:didOutputSampleBuffer:ofType:",
+            signature=b"v36@0:8@16@24i32",
+        )
+    else:  # pragma: no cover - non-macOS fallback without Objective-C
+        stream_didOutputSampleBuffer_ofType_ = _did_output_sample
 
     def stream_didStopWithError_(self, stream, error):
         self.owner._stream_error(error)
@@ -440,7 +462,11 @@ class SCKAudioCapture(AudioCaptureBase):
         filt = SCK.SCContentFilter.alloc().initWithDisplay_excludingApplications_exceptingWindows_(display, [], [])
         config = SCK.SCStreamConfiguration.alloc().init()
         config.setCapturesAudio_(True)
-        config.setExclusivelyCapturesSystemAudio_(True)
+        # Removed from newer ScreenCaptureKit headers: on those systems
+        # audio-only capture is expressed by attaching only the audio output
+        # below, so the flag is simply unavailable and skipped.
+        if hasattr(config, "setExclusivelyCapturesSystemAudio_"):
+            config.setExclusivelyCapturesSystemAudio_(True)
         if hasattr(config, "setShowsCursor_"):
             config.setShowsCursor_(False)
         self._native_rate = 48000
@@ -460,7 +486,8 @@ class SCKAudioCapture(AudioCaptureBase):
         try:
             import dispatch
             create_queue = getattr(dispatch, "dispatch_queue_create")
-            callback_queue = create_queue("LiveTranslate.ScreenCaptureKit", None)
+            # PyObjC's dispatch binding wants a C string: bytes, not str.
+            callback_queue = create_queue(b"LiveTranslate.ScreenCaptureKit", None)
             if callback_queue is None:
                 raise RuntimeError("dispatch_queue_create returned nil")
             return callback_queue
@@ -608,6 +635,9 @@ class MacAudioCapture:
     """Stable macOS facade selecting SCK system audio or the M0 mic backend."""
 
     def __init__(self, *args, system_audio="enabled", **kwargs):
+        # Typed error from the last failed mode switch, so callers can show an
+        # actionable dialog (permission guidance) instead of parsing strings.
+        self._switch_error = None
         if system_audio == "disabled":
             from audio_capture_pyaudio import PyAudioCapture
 
@@ -632,7 +662,66 @@ class MacAudioCapture:
         return self._backend.get_audio(timeout)
 
     def set_device(self, device_name):
-        return self._backend.set_device(device_name)
+        # The macOS settings UI only ever stores "__disabled__" (mic only) or
+        # None (ScreenCaptureKit system audio).  A mode flip is a backend
+        # rebuild, not a device rename.
+        want_sck = device_name != "__disabled__"
+        if want_sck == isinstance(self._backend, SCKAudioCapture):
+            return self._backend.set_device(device_name)
+        self._switch_error = None
+        return self._switch_backend(want_sck)
+
+    def _switch_backend(self, want_sck):
+        """Rebuild the backing capture, preserving mic and running state.
+
+        A failed switch restores the previous backend so the app never ends up
+        with a stopped capture while the UI still advertises the new mode.
+        """
+        previous = self._backend
+        running = bool(getattr(previous, "_running", False))
+        mic_device = getattr(previous, "_mic_device_name", None)
+        if running:
+            previous.stop()
+        try:
+            if want_sck:
+                self._backend = SCKAudioCapture(
+                    mic_device=mic_device,
+                    sample_rate=previous.sample_rate,
+                    chunk_duration=previous.chunk_duration,
+                )
+            else:
+                from audio_capture_pyaudio import PyAudioCapture
+
+                # The "__disabled__" sentinel matters: main.py detects mode
+                # changes by comparing _device_name against the stored
+                # setting, and the SCK backend carries None. A mic backend
+                # built with device=None would make flipping back to system
+                # audio a silent no-op.
+                self._backend = PyAudioCapture(
+                    device="__disabled__",
+                    system_audio="disabled",
+                    mic_device=mic_device,
+                    sample_rate=previous.sample_rate,
+                    chunk_duration=previous.chunk_duration,
+                )
+            if running:
+                self._backend.start()
+            self._switch_error = None
+            return True
+        except Exception as exc:
+            log.error("macOS audio mode switch failed: %s", exc)
+            self._switch_error = exc
+            metrics = getattr(previous, "_metrics", None)
+            if metrics is not None:
+                metrics.last_error = str(exc)
+            self._backend = previous
+            try:
+                if running:
+                    previous.start()
+            except Exception as restore_exc:
+                log.error("Restoring the previous audio backend also failed: %s", restore_exc)
+                return False
+            return False
 
     def set_mic_device(self, device_name):
         return self._backend.set_mic_device(device_name)

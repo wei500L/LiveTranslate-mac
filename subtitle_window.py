@@ -28,7 +28,7 @@ from PyQt6.QtGui import (
     QPixmap,
 )
 from PyQt6.QtWidgets import QApplication, QWidget, QVBoxLayout
-from platform_clickthrough import set_click_through
+from platform_clickthrough import set_always_on_top, set_click_through
 from platform_fonts import default_cjk_font_family
 from platform_app import is_macos, position_is_visible
 
@@ -780,6 +780,10 @@ class SubtitleWindow(QWidget):
         super().showEvent(event)
         # Qt resets the extended style across hide/show, so re-assert it here.
         self._apply_click_through()
+        # Same for the macOS native always-on-top pin: without this the
+        # window sinks behind fullscreen Spaces (Zoom, browsers) after a
+        # hide/show cycle. No-op on Windows.
+        QTimer.singleShot(0, lambda: set_always_on_top(self, True))
 
     # --- Middle-click drag ---
     def mousePressEvent(self, event):

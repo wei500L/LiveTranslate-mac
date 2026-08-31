@@ -99,6 +99,15 @@ one 512-sample block, and a raised `CaptureRuntimeError` = terminally dead.
 Blurring the first and third is how a capture failure turns into permanent
 silence with the UI still saying "Running".
 
+On macOS the settings panel's Audio combo stores the capture mode in
+`user_settings.json`'s `audio_device`: `"__disabled__"` = mic only, `null` =
+ScreenCaptureKit system audio. `MacAudioCapture.set_device()` treats a mode
+flip as a backend rebuild (restoring the previous backend if the new one
+fails to start); SCK needs Screen Recording TCC permission. The SCK delegate
+method `stream:didOutputSampleBuffer:ofType:` must be registered with an
+explicit `objc.selector` signature — PyObjC has no metadata for it and infers
+an all-object signature that segfaults on the first buffer.
+
 Additional ASR backends and the remote path:
 
 ```
