@@ -39,13 +39,14 @@ def test_entries_are_written_in_utterance_order_not_completion_order(tmp_path):
     writer.write_translation(3, "THIRD")
     writer.write_translation(2, "SECOND")
     writer.write_translation(1, "FIRST")
+    stamp = stamp  # saved: close clears it
     writer.close()
 
-    all_lines = _entries(tmp_path / f"livetrans_{writer._session_ts}_all.txt")
+    all_lines = _entries(tmp_path / f"livetrans_{stamp}_all.txt")
     assert [line.split("] ", 1)[1] for line in all_lines] == [
         "first", "second", "third"
     ]
-    tl_lines = _entries(tmp_path / f"livetrans_{writer._session_ts}_translation.txt")
+    tl_lines = _entries(tmp_path / f"livetrans_{stamp}_translation.txt")
     assert [line.split("] ", 1)[1] for line in tl_lines] == [
         "FIRST", "SECOND", "THIRD"
     ]
@@ -79,9 +80,10 @@ def test_close_flushes_entries_whose_translation_never_arrived(tmp_path):
     writer.write_original(1, "00:00:01", "answered")
     writer.write_original(2, "00:00:02", "abandoned")
     writer.write_translation(1, "ANSWERED")
+    stamp = stamp  # saved: close clears it
     writer.close()
 
-    text = (tmp_path / f"livetrans_{writer._session_ts}_all.txt").read_text("utf-8")
+    text = (tmp_path / f"livetrans_{stamp}_all.txt").read_text("utf-8")
     assert "answered" in text
     assert "abandoned" in text  # would otherwise be lost with the process
 
@@ -94,9 +96,10 @@ def test_an_untranslated_entry_keeps_its_place(tmp_path):
     writer.write_translation(3, "THREE")
     writer.finalize_no_translation(2)  # same language, no translation needed
     writer.write_translation(1, "ONE")
+    stamp = stamp  # saved: close clears it
     writer.close()
 
-    lines = _entries(tmp_path / f"livetrans_{writer._session_ts}_all.txt")
+    lines = _entries(tmp_path / f"livetrans_{stamp}_all.txt")
     assert [line.split("] ", 1)[1] for line in lines] == ["one", "two", "three"]
 
 
@@ -105,17 +108,24 @@ def test_no_entry_is_registered_twice(tmp_path):
     writer.write_original(1, "00:00:01", "first")
     writer.write_original(1, "00:00:02", "corrected")
     writer.write_translation(1, "FIRST")
+    stamp = stamp  # saved: close clears it
     writer.close()
-    lines = _entries(tmp_path / f"livetrans_{writer._session_ts}_all.txt")
+    lines = _entries(tmp_path / f"livetrans_{stamp}_all.txt")
     assert len(lines) == 1
 
 
-def test_a_translation_without_an_original_is_still_recorded(tmp_path):
+def test_a_translation_without_an_original_is_discarded(tmp_path):
+    """A translation whose original was never recorded has no session to
+    belong to. The old behavior wrote an orphan "no original" line into
+    whatever session was open — the exact channel through which a refused
+    entry's late translation could land in the *next* meeting's files."""
     writer = _writer(tmp_path)
-    writer.write_translation(99, "orphan")
+    stamp = writer._session_ts
+    result = writer.write_translation(99, "orphan")
     writer.close()
-    text = (tmp_path / f"livetrans_{writer._session_ts}_all.txt").read_text("utf-8")
-    assert "orphan" in text
+    assert result == TranscriptWriter.WRITE_SKIPPED
+    text = (tmp_path / f"livetrans_{stamp}_all.txt").read_text("utf-8")
+    assert "orphan" not in text
 
 
 # --- meeting record content ------------------------------------------------
@@ -133,10 +143,11 @@ def test_the_meeting_record_carries_language_duration_and_provenance(tmp_path):
         1, "09:15:00", "Здравствуйте", language="ru", duration=2.5
     )
     writer.write_translation(1, "你好")
+    stamp = stamp  # saved: close clears it
     writer.close()
 
     text = (
-        tmp_path / f"livetrans_{writer._session_ts}_meeting.md"
+        tmp_path / f"livetrans_{stamp}_meeting.md"
     ).read_text(encoding="utf-8")
     assert "# Meeting record" in text
     assert "**09:15:00** · ru · 2.5s" in text
@@ -151,9 +162,10 @@ def test_the_plain_text_files_end_with_a_session_summary(tmp_path):
     writer = _writer(tmp_path)
     writer.write_original(1, "09:15:00", "hello")
     writer.write_translation(1, "hola")
+    stamp = stamp  # saved: close clears it
     writer.close()
     for kind in TranscriptWriter.KINDS:
-        text = (tmp_path / f"livetrans_{writer._session_ts}_{kind}.txt").read_text("utf-8")
+        text = (tmp_path / f"livetrans_{stamp}_{kind}.txt").read_text("utf-8")
         assert "# Session ended at" in text
         assert "1 entries" in text
 
@@ -165,10 +177,11 @@ def test_the_metadata_sidecar_describes_the_session(tmp_path):
     writer.write_translation(1, "hola")
     writer.write_original(2, "09:15:10", "again", duration=1.0)
     writer.finalize_no_translation(2)
+    stamp = stamp  # saved: close clears it
     writer.close()
 
     meta = json.loads(
-        (tmp_path / f"livetrans_{writer._session_ts}_meta.json").read_text("utf-8")
+        (tmp_path / f"livetrans_{stamp}_meta.json").read_text("utf-8")
     )
     assert meta["entries"] == 2
     assert meta["translated"] == 1
@@ -271,18 +284,20 @@ def test_live_session_sidecar_has_no_ended_and_seal_writes_it_once(tmp_path):
     writer = _writer(tmp_path)
     writer.write_original(1, "09:00:00", "hello")
     writer.write_translation(1, "hola")
+    # Saved before the seal: end_session clears the writer's session state.
+    stamp = writer._session_ts
 
-    live_meta = (tmp_path / f"livetrans_{writer._session_ts}_meta.json").read_text(
+    live_meta = (tmp_path / f"livetrans_{stamp}_meta.json").read_text(
         "utf-8"
     )
     assert '"ended": null' in live_meta
 
     summary = writer.end_session()
     sealed = json.loads(
-        (tmp_path / f"livetrans_{writer._session_ts}_meta.json").read_text("utf-8")
+        (tmp_path / f"livetrans_{stamp}_meta.json").read_text("utf-8")
     )
     footer = (
-        tmp_path / f"livetrans_{writer._session_ts}_all.txt"
+        tmp_path / f"livetrans_{stamp}_all.txt"
     ).read_text("utf-8")
     assert sealed["ended"] is not None
     assert sealed["ended"] == summary["ended"]
@@ -491,3 +506,122 @@ def test_a_superseded_empty_translation_also_closes_out(tmp_path):
     path = tmp_path / f"livetrans_{writer._session_ts}_all.txt"
     assert len(_entries(path)) == 1
     writer.close()
+
+
+def test_late_translation_of_a_refused_original_never_enters_new_session(tmp_path):
+    """End+begin raced the queue: the original was refused (its session had
+    already closed) and a *new* session is open when its translation
+    returns. Neither the original nor the translation may land in the new
+    meeting's files."""
+    writer = _writer(tmp_path)
+    stamp_a = writer.begin_session()
+    writer.write_original(1, "09:00:00", "belongs to A")
+    writer.end_session()
+
+    stamp_b = writer.begin_session()
+    # The straggler original (refused) and then its late translation.
+    original_result = writer.write_original(
+        2, "09:00:05", "stale from A", session=stamp_a
+    )
+    assert original_result == TranscriptWriter.WRITE_SESSION_MISMATCH
+    translation_result = writer.write_translation(
+        2, "late translation of stale audio", session=stamp_a
+    )
+    assert translation_result == TranscriptWriter.WRITE_SESSION_MISMATCH
+    writer.end_session()
+
+    for kind in ("all", "translation", "original"):
+        text = (
+            tmp_path / f"livetrans_{stamp_b}_{kind}.txt"
+        ).read_text("utf-8")
+        assert "stale from A" not in text, kind
+        assert "late translation" not in text, kind
+
+
+def test_meta_create_failure_rolls_back_the_whole_file_set(tmp_path, monkeypatch):
+    """The initial sidecar is part of the transaction: when it cannot be
+    created (here: the exclusive create collides with a pre-existing file),
+    the text files and the Markdown record roll back and begin_session
+    reports failure — no phantom session, no stray files."""
+    import transcript_writer as tw
+    from datetime import datetime as real_datetime
+
+    writer = TranscriptWriter(tmp_path)
+    writer.set_enabled(True)
+    # Pre-seed a colliding stamp on disk (an interrupted earlier attempt).
+    base = real_datetime.now().strftime("%Y%m%d_%H%M%S")
+    (tmp_path / f"livetrans_{base}_meta.json").write_text("{}", encoding="utf-8")
+
+    # Freeze the clock so the new session picks the same base stamp; the
+    # suffixed probe then finds a free _01 stamp whose meta does not exist,
+    # so instead sabotage the exclusive create itself.
+    class FrozenDatetime(real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return real_datetime.strptime(base, "%Y%m%d_%H%M%S")
+
+    monkeypatch.setattr(tw, "datetime", FrozenDatetime)
+
+    real_open = tw.os.open
+
+    def failing_open(path, flags, *args, **kwargs):
+        if str(path).endswith("_meta.json"):
+            raise FileExistsError(path)
+        return real_open(path, flags, *args, **kwargs)
+
+    monkeypatch.setattr(tw.os, "open", failing_open)
+
+    result = writer.begin_session()
+    assert result is None
+    assert writer.has_active_session() is False
+    # The bare stamp's meta is the pre-seeded file; the attempt's suffixed
+    # text/Markdown files must not linger anywhere.
+    leftovers = sorted(p.name for p in tmp_path.glob("livetrans_*"))
+    assert leftovers == [f"livetrans_{base}_meta.json"], leftovers
+
+
+def test_abort_session_after_failed_close_keeps_files_and_clears_state(tmp_path):
+    """A close that raises mid-seal must leave the record as written (no
+    extra footer/ended invented afterwards) and clear every piece of
+    in-memory session state, so the next begin starts clean and the records
+    layer classifies the meeting as interrupted (no footer)."""
+    writer = _writer(tmp_path)
+    stamp = writer._session_ts
+    writer.write_original(1, "09:00:00", "kept line")
+
+    # Force the seal to fail after the state has been written to.
+    import transcript_writer as tw
+
+    def failing_footer():
+        raise OSError("disk full")
+
+    monkeypatch_footer = failing_footer
+    original_footer = writer._write_summary_footer_locked
+    writer._write_summary_footer_locked = monkeypatch_footer
+    try:
+        raised = False
+        try:
+            writer.end_session()
+        except OSError:
+            raised = True
+        assert raised, "the seal failure must propagate to the caller"
+    finally:
+        writer._write_summary_footer_locked = original_footer
+
+    summary = writer.abort_session()
+    # The aborted session's snapshot describes the session that was.
+    assert summary is not None and summary["session"] == stamp
+    assert writer.has_active_session() is False
+    assert writer.active_session() is None
+    # Files survive exactly as far as they got: no footer was appended.
+    all_text = (tmp_path / f"livetrans_{stamp}_all.txt").read_text("utf-8")
+    assert "kept line" in all_text
+    assert "# Session ended" not in all_text
+
+    # The writer is reusable: a fresh session starts from a clean slate.
+    stamp2 = writer.begin_session()
+    assert stamp2 is not None
+    assert writer.write_original(1, "10:00:00", "new session") == (
+        TranscriptWriter.WRITE_RECORDED
+    )
+    writer.end_session()

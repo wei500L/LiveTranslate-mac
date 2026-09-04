@@ -15,6 +15,7 @@ the one to tail while a session runs.
 
 import json
 import logging
+import os
 import re
 import threading
 from collections import deque
@@ -22,6 +23,14 @@ from datetime import datetime
 from pathlib import Path
 
 log = logging.getLogger("LiveTranslate.Transcript")
+
+
+def _discard_quietly(path: Path) -> None:
+    """Best-effort unlink used by roll-back paths."""
+    try:
+        Path(path).unlink()
+    except OSError:
+        pass
 
 # Session stamps are "YYYYmmdd_HHMMSS" plus an optional "_NN" suffix used only
 # when two sessions begin within the same second (end one meeting, start the
@@ -277,12 +286,14 @@ class TranscriptWriter:
     def _open_session_locked(self):
         """Open one session's file set, all-or-nothing.
 
-        Failure rolls back: any file that could not be created exclusively is
-        closed and unlinked, no half-open session is reported, and an
-        existing session's meta is never overwritten. ``_session_open`` is
-        set only when every required file (the three text kinds + the
-        Markdown record) was created; the meta sidecar is written last via
-        the exclusive-create path too.
+        Every file is created exclusively ("x") and its header written before
+        it counts: a file whose header write fails is closed and unlinked by
+        the create step itself, so no half-written file survives. The initial
+        meta sidecar is part of the success condition — if its exclusive
+        create fails (collision, permission, disk), the whole file set rolls
+        back. ``_session_open`` is set only when the text files, the Markdown
+        record and the meta all exist; any failure leaves no session and no
+        stray files behind.
         """
         try:
             self._base_dir.mkdir(parents=True, exist_ok=True)
@@ -296,22 +307,30 @@ class TranscriptWriter:
 
         opened = {}
         paths = {}
-        failures = []
 
         def _create(kind: str, path: Path, header: str):
+            """Create one file exclusively and write its header. On any
+            failure the file this call created is closed and unlinked, so
+            the caller only ever sees fully-written files in ``opened``."""
+            fp = None
             try:
                 # "x" (exclusive create): a stamp collision must refuse a
                 # fresh file set, never append to another meeting's files.
                 fp = open(path, "x", encoding="utf-8", buffering=1)
                 fp.write(header)
-                opened[kind] = fp
-                paths[kind] = str(path)
-                return None
-            except FileExistsError:
-                return f"{path}: exists"
-            except OSError as e:
+            except Exception as e:
+                if fp is not None:
+                    try:
+                        fp.close()
+                    except Exception:
+                        pass
+                _discard_quietly(path)
                 return f"{path}: {e}"
+            opened[kind] = fp
+            paths[kind] = str(path)
+            return None
 
+        failures = []
         for kind in self.KINDS:
             path = self._base_dir / f"livetrans_{self._session_ts}_{kind}.txt"
             err = _create(kind, path, f"# Session started at {header_ts}\n")
@@ -326,47 +345,60 @@ class TranscriptWriter:
         )
         if err:
             failures.append(err)
-        self._markdown_header_open = self.MARKDOWN_KIND in opened
+
+        if not failures:
+            # The initial meta is part of the transaction: without it the
+            # listing layer cannot see the session, so a session whose
+            # sidecar cannot be created is no session.
+            self._files = opened
+            self._paths = paths
+            self._paths[self.META_KIND] = str(
+                self._base_dir / f"livetrans_{self._session_ts}_{self.META_KIND}.json"
+            )
+            if not self._write_meta_locked(create_only=True):
+                failures.append(f"{self._paths[self.META_KIND]}: create failed")
 
         if failures:
-            # Roll back what did open: a partial file set would present a
-            # "successful" session whose entries silently vanish into closed
-            # or missing files. Unlink only what this call created ("x"
-            # guarantees nothing pre-existing is touched).
+            # Roll back everything this call created: a partial file set
+            # would present a "successful" session whose entries silently
+            # vanish into closed or missing files. "x" guarantees nothing
+            # pre-existing was touched, so unlinking is safe. The meta needs
+            # no handling here: _write_meta_locked(create_only=True) cleans
+            # up its own partial file, and on an O_EXCL collision the file
+            # on disk belongs to another session and must stay.
             for kind, fp in opened.items():
                 try:
                     fp.close()
                 except Exception:
                     pass
-                try:
-                    Path(paths[kind]).unlink()
-                except OSError:
-                    log.debug(
-                        "Could not unlink %s during session rollback",
-                        paths[kind], exc_info=True,
-                    )
+                _discard_quietly(Path(paths[kind]))
             log.error(
                 "Could not open the full file set for session %s; no session "
                 "started: %s", self._session_ts, "; ".join(failures),
             )
             # Leave any previous session's state untouched; a caller that
             # relied on a stamp must observe None, not a phantom session.
+            self._files = {}
+            self._paths = {}
             self._session_ts = None
             self._session_started = None
             self._markdown_header_open = False
             return
 
-        self._files = opened
-        self._paths = paths
-        self._paths[self.META_KIND] = str(
-            self._base_dir / f"livetrans_{self._session_ts}_{self.META_KIND}.json"
-        )
+        self._markdown_header_open = True
         self._opened = True
         self._session_open = True
-        self._write_meta_locked(create_only=True)
         log.info(f"Transcripts -> {self._base_dir} (session {self._session_ts})")
 
     # --- entry recording -----------------------------------------------
+
+    # write_original result states, consumed by the caller to decide what
+    # happens to this segment's translation.
+    WRITE_RECORDED = "recorded"          # entry is in the session's files
+    WRITE_SKIPPED = "skipped"            # nothing recorded (disabled, closed,
+                                         # auto-open refused): subtitle-only
+    WRITE_SESSION_MISMATCH = "mismatch"  # entry's session is not the open one
+    WRITE_FAILED = "failed"              # the file write itself errored
 
     def write_original(
         self,
@@ -377,7 +409,7 @@ class TranscriptWriter:
         language: str | None = None,
         duration: float | None = None,
         session: str | None = None,
-    ):
+    ) -> str:
         """Record an original line, for the session it belongs to.
 
         ``session`` is the caller's expected session stamp (snapshotted when
@@ -388,19 +420,24 @@ class TranscriptWriter:
         new meeting's files. ``None`` means "no expectation" (the legacy
         auto-open path, where the session is opened by this very call), and
         is always accepted.
+
+        Returns one of the WRITE_* states. Callers must not submit the
+        entry's translation into the session on anything but WRITE_RECORDED;
+        WRITE_SESSION_MISMATCH additionally means the entry's *late
+        translation* must be dropped outright, not merely left unwritten.
         """
         if not original:
-            return
+            return self.WRITE_SKIPPED
         with self._lock:
             if not self._enabled:
-                return
+                return self.WRITE_SKIPPED
             if session is not None and self._session_open:
                 if session != self._session_ts:
                     log.info(
                         "Refusing entry for session %s: the open session is %s "
                         "(msg %s)", session, self._session_ts, msg_id,
                     )
-                    return
+                    return self.WRITE_SESSION_MISMATCH
             if not self._session_open:
                 if (
                     self._ending
@@ -412,10 +449,10 @@ class TranscriptWriter:
                     # silently start a ghost session — only begin_session()
                     # (the user's "Start new recording") or a fresh pipeline
                     # start re-arms auto-open.
-                    return
+                    return self.WRITE_SKIPPED
                 self._open_session_locked()
             if not self._session_open:
-                return
+                return self.WRITE_SKIPPED
             if session is not None and session != self._session_ts:
                 # The auto-open above created a *different* session than the
                 # one the caller expected (an end+begin raced the entry):
@@ -424,7 +461,7 @@ class TranscriptWriter:
                     "Refusing entry for session %s: auto-open created session "
                     "%s (msg %s)", session, self._session_ts, msg_id,
                 )
-                return
+                return self.WRITE_SESSION_MISMATCH
             current = self._session_ts
             if msg_id not in self._pending:
                 self._order.append(msg_id)
@@ -437,47 +474,70 @@ class TranscriptWriter:
             self._entry_sessions[msg_id] = current
             if duration:
                 self._speech_seconds += float(duration)
-            self._write_locked("original", f"[{timestamp}] {original}\n")
+            wrote = self._write_locked(
+                "original", f"[{timestamp}] {original}\n"
+            )
+            return self.WRITE_RECORDED if wrote else self.WRITE_FAILED
 
-    def write_translation(self, msg_id: int, translation: str):
+    def write_translation(self, msg_id: int, translation: str,
+                          session: str | None = None) -> str:
+        """Record a translation for an entry. Returns the WRITE_* state.
+
+        ``session`` is the same expected-session stamp the entry's original
+        carried: a translation for a session that is not the open one is
+        discarded (a late straggler after an end+begin race), never written
+        into whichever session happens to be open now."""
         if not translation:
-            return
-        self._complete(msg_id, translation)
+            return self.WRITE_SKIPPED
+        return self._complete(msg_id, translation, session)
 
-    def finalize_no_translation(self, msg_id: int):
-        """Mark a message complete without a translation (same-language or error)."""
-        self._complete(msg_id, None)
+    def finalize_no_translation(self, msg_id: int,
+                                session: str | None = None) -> str:
+        """Mark a message complete without a translation (same-language or
+        error). Same session semantics as write_translation."""
+        return self._complete(msg_id, None, session)
 
-    def _complete(self, msg_id: int, translation: str | None):
+    def _complete(self, msg_id: int, translation: str | None,
+                  session: str | None = None) -> str:
+        """Complete one entry. Only entries whose original was recorded in
+        the currently-open session are completed; everything else is
+        discarded:
+
+        * no pending original — the original was refused (session mismatch,
+          closed session, subtitle-only) or already flushed by the seal. The
+          old behavior wrote an orphan "no original" line into the open
+          session; that is precisely how a refused entry's late translation
+          could land in the *next* meeting's files, so the orphan path is
+          gone;
+        * pending original from a different session than the one the caller
+          expects, or from a session that is no longer open — the ENDING
+          wait timed out and the seal flushed it, or a new session began.
+          Completed meetings are immutable.
+        """
         with self._lock:
             if not self._enabled:
                 self._forget_locked(msg_id)
-                return
+                return self.WRITE_SKIPPED
             entry_session = self._entry_sessions.get(msg_id)
             if entry_session is None:
-                # No original in any remembered session — written before this
-                # writer's first session, or dropped. Emit standalone while a
-                # session is open; after the session closed there is no file
-                # to attach it to.
-                if not self._session_open or self._ending:
-                    self._forget_locked(msg_id)
-                    return
-                if translation:
-                    ts = datetime.now().strftime("%H:%M:%S")
-                    self._write_locked("translation", f"[{ts}] {translation}\n")
-                    self._write_locked("all", f"[{ts}] -> {translation}\n\n")
-                    self._write_locked(
-                        self.MARKDOWN_KIND, f"\n**{ts}** — _(no original)_\n\n> {translation}\n"
-                    )
-                return
+                log.info(
+                    "Discarding translation with no recorded original (msg %s)",
+                    msg_id,
+                )
+                return self.WRITE_SKIPPED
+            if session is not None and session != entry_session:
+                # The caller expected this entry in another session: a
+                # straggler from before an end+begin race.
+                log.info(
+                    "Discarding translation for session %s on entry of "
+                    "session %s (msg %s)", session, entry_session, msg_id,
+                )
+                return self.WRITE_SESSION_MISMATCH
             if entry_session != self._session_ts or not self._session_open:
                 # A result for a session that is already closed — the ENDING
                 # wait timed out and end_session() flushed the entry, or the
-                # next session has since begun. Completed meetings are
-                # immutable: late results are discarded rather than appended
-                # after the Summary footer (which would corrupt the record's
-                # order, counts and source_hash). The entry is already on
-                # disk as an untranslated original; if the user wants it
+                # next session has since begun. The entry is already on disk
+                # as an untranslated original; if the user wants it
                 # translated, that is a future "retranslate history" feature,
                 # not this path.
                 log.info(
@@ -485,9 +545,10 @@ class TranscriptWriter:
                     entry_session, msg_id,
                 )
                 self._forget_session_entry(msg_id)
-                return
+                return self.WRITE_SESSION_MISMATCH
             self._done[msg_id] = translation
             self._drain_locked()
+            return self.WRITE_RECORDED
 
     def _forget_session_entry(self, msg_id: int):
         self._pending.pop(msg_id, None)
@@ -539,14 +600,16 @@ class TranscriptWriter:
         except ValueError:
             pass
 
-    def _write_locked(self, kind: str, text: str):
+    def _write_locked(self, kind: str, text: str) -> bool:
         fp = self._files.get(kind)
         if fp is None:
-            return
+            return False
         try:
             fp.write(text)
+            return True
         except OSError as e:
             log.warning(f"Transcript write failed ({kind}): {e}")
+            return False
 
     # --- summary and close ---------------------------------------------
 
@@ -555,7 +618,6 @@ class TranscriptWriter:
             return self._summary_locked()
 
     def _summary_locked(self) -> dict:
-        def _summary_locked(self) -> dict:
         """Session summary. ``ended`` is None while the session is live and is
         fixed once, at the seal, so the footer, the meta sidecar and the
         returned summary all carry the *same* end timestamp — a live
@@ -592,12 +654,52 @@ class TranscriptWriter:
     # smuggle arbitrary keys back into a freshly written sidecar.
     _USER_META_FIELDS = ("title", "title_set_at")
 
-    def _write_meta_locked(self, create_only: bool = False):
+    def _write_meta_locked(self, create_only: bool = False) -> bool:
+        """Write the sidecar. Returns True on success.
+
+        ``create_only`` (first write of a session) uses a real exclusive
+        create — ``open(path, "x")`` — so a stamp collision or a leftover
+        file can never be overwritten, closing the exists-check→replace
+        race the staged-replace path would leave. Regular rewrites (live
+        updates, the seal) keep the atomic staged replace, merging the
+        whitelisted user fields from the file on disk.
+        """
         path = self._paths.get(self.META_KIND)
         if not path:
-            return
+            return False
         meta = self._summary_locked()
         try:
+            if create_only:
+                # Write the staged copy first (so encoding/serialization
+                # failures never create a half-written sidecar), then give
+                # it the final name exclusively. A failure *after* the
+                # exclusive open unlinks the file this call created; an
+                # O_EXCL collision leaves the other session's file alone.
+                tmp = Path(path).with_name(Path(path).name + ".tmp")
+                try:
+                    tmp.write_text(
+                        json.dumps(meta, ensure_ascii=False, indent=2),
+                        encoding="utf-8",
+                    )
+                    try:
+                        fd = os.open(
+                            path, os.O_CREAT | os.O_EXCL | os.O_WRONLY
+                        )
+                    except FileExistsError:
+                        log.error(
+                            "Metadata for session %s already exists; refusing "
+                            "to overwrite it", self._session_ts,
+                        )
+                        return False
+                    try:
+                        with os.fdopen(fd, "w", encoding="utf-8") as fp:
+                            fp.write(tmp.read_text(encoding="utf-8"))
+                    except OSError:
+                        _discard_quietly(path)
+                        raise
+                    return True
+                finally:
+                    _discard_quietly(tmp)
             old = {}
             if Path(path).is_file():
                 try:
@@ -606,12 +708,6 @@ class TranscriptWriter:
                         old = loaded
                 except (OSError, ValueError):
                     old = {}
-            if create_only and Path(path).exists():
-                log.error(
-                    "Metadata for session %s already exists; refusing to "
-                    "overwrite it", self._session_ts,
-                )
-                return
             for key in self._USER_META_FIELDS:
                 if key in old:
                     meta[key] = old[key]
@@ -621,8 +717,10 @@ class TranscriptWriter:
                 encoding="utf-8",
             )
             tmp.replace(path)
+            return True
         except OSError as e:
             log.warning(f"Could not write transcript metadata: {e}")
+            return False
 
     def close(self):
         """Close the writer outright (app stop / shutdown).
@@ -650,8 +748,8 @@ class TranscriptWriter:
         The seal timestamp is fixed exactly once, *before* the footer and
         sidecar are written, so every artifact (txt footers, Markdown
         Summary, meta ``ended``, the returned summary) reports the same
-        moment. All per-session state is reset in one place, including the
-        ended timestamp, so nothing leaks into the next session.
+        moment. All per-session state is reset in one place
+        (_reset_session_state_locked), shared with abort_session().
         """
         if not self._opened:
             return None
@@ -669,6 +767,38 @@ class TranscriptWriter:
         self._write_summary_footer_locked()
         self._write_meta_locked()
         summary = self._summary_locked()
+        self._reset_session_state_locked()
+        return summary
+
+    def abort_session(self) -> dict | None:
+        """Best-effort abort of a session whose close failed.
+
+        Used when ``end_session``/``close`` raised mid-seal: the record is
+        kept exactly as far as it got (nothing new is written — a seal that
+        did not complete leaves no footer and no final ``ended``, so the
+        records layer classifies the meeting as interrupted rather than
+        cleanly ended), file handles are released, and every piece of
+        in-memory session state is cleared by the same reset the normal
+        close uses. Returns the last known summary snapshot, or None when
+        there was no session.
+        """
+        with self._lock:
+            if not self._session_open and not self._opened:
+                return None
+            summary = self._summary_locked() if self._session_ts else None
+            log.error(
+                "Aborting session %s after a failed close; the record stays "
+                "as written and will be classified as interrupted",
+                self._session_ts,
+            )
+            self._reset_session_state_locked()
+            return summary
+
+    def _reset_session_state_locked(self):
+        """The single tail for every close path (seal, pipeline close,
+        abort): close handles, clear paths/timestamps/entries and the
+        per-session counters. Must leave the writer indistinguishable from
+        "no session ever opened" so the next begin starts clean."""
         for fp in self._files.values():
             if fp is None:
                 continue
@@ -687,13 +817,15 @@ class TranscriptWriter:
         self._session_started = None
         self._ended_at = None
         self._markdown_header_open = False
+        self._opened = False
+        self._session_open = False
+        self._ending = False
         # The writer outlives the session (the app stops and restarts with
         # the same instance), so per-session state must not leak into the
         # next one's counts, footer or sidecar.
         self._counts = {"entries": 0, "translated": 0, "untranslated": 0}
         self._speech_seconds = 0.0
         self._info = {}
-        return summary
 
     def _write_summary_footer_locked(self):
         summary = self._summary_locked()

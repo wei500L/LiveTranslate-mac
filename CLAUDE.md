@@ -360,28 +360,51 @@ linearized lifecycle inside one lock/Condition —
    TranslationUnavailable / executor-shutdown excepts in
    `_process_segment`/`_process_segment_text`.
 
-Stale-segment guard, two layers: `_process_segment`/
+Producer fence (`_session_boundary_lock`, an RLock): the capture thread
+holds it across "gate check → VAD `process_chunk` → enqueue", and the end
+thread holds it across "gate up → `start_closing`". Speech the VAD accepted
+before the end is therefore enqueued and counted under the still-OPEN
+generation — the last utterance is kept, never silently dropped; audio
+after the end never reaches the VAD. `_session_snapshot()` reads the
+generation and the writer's session stamp together under the same lock, and
+every writer of `_session_generation` (begin, adoption, the end's bump,
+`stop()`) holds it, so a queue item's identity pair can never straddle a
+boundary.
+
+Stale-segment guard, three layers: `_process_segment`/
 `_process_segment_text` drop any queue item whose generation is no longer
-current (an end+begin raced the queue) before writing — the old audio
-cannot land in the new meeting's files — and every queue item carries the
-writer session stamp it was enqueued under (snapshotted with the
-generation), which `write_original(session=...)` re-verifies inside the
-writer's lock as the final authority. A requeue failure in
-`_drain_interim_duplicates` releases the displaced item's work count (an
-unreleased item would hold an ENDING wait until timeout). Legacy auto-open
-adoption (`_process_segment`/`_process_segment_text` IDLE branch) calls
-`tracker.begin()` for the adopted generation and re-registers the adopting
-msg, so an adopted session's work is counted the same as an explicit one.
+current (an end+begin raced the queue) before writing; every queue item
+carries the writer session stamp it was enqueued under, which
+`write_original(session=...)` re-verifies inside the writer's lock as the
+final authority; and the writer returns an explicit WRITE_* state
+(`recorded` / `skipped` / `mismatch` / `failed`) that the caller uses to
+decide the entry's translation — only a `recorded` entry registers a
+translation count and submits a job, a `mismatch` closes the overlay entry
+as untranslated and drops the translation outright (its late result could
+not be written anywhere). `write_translation`/`finalize_no_translation`
+take the same `session=` argument; `_complete` has **no orphan-write path**
+(a translation without a recorded original is discarded — that path was how
+a refused entry's late translation could land in the next meeting's files).
+A requeue failure in `_drain_interim_duplicates` releases the displaced
+item's work count. Legacy auto-open adoption (the IDLE branch in
+`_process_segment`/`_process_segment_text`) runs under the boundary lock,
+calls `tracker.begin()` for the adopted generation and re-registers the
+adopting msg, so an adopted session's work is counted the same as an
+explicit one.
 
 End-thread fault tolerance: `_run_session_end` is wrapped by its caller —
-a failure anywhere (flush, wait, `end_session`) is logged, the record is
-kept as-is, and the state still advances through IDLE (an ENDING that
-parks forever locks out every button). The `finally` sets `_paused=True`
-*before* lifting the capture gate, so there is no re-listen window between
-"gate open" and "capture observes paused". After the end lands the session
-generation is bumped, so any work the close missed fails the identity
-checks unambiguously. `end_session()` returning None (no open session) is
-handled without touching the summary dict.
+a failure anywhere (flush, wait, `end_session`) is logged, the writer is
+**aborted** (`TranscriptWriter.abort_session()`: handles released, memory
+cleared, nothing further written — the records layer classifies the meeting
+as interrupted), and the state still advances through IDLE (an ENDING that
+parks forever locks out every button). The IDLE notification is sent only
+after the writer has sealed *or* aborted, so the state machine can never
+claim idle while a writer session is still open. The `finally` sets
+`_paused=True` *before* lifting the capture gate, so there is no re-listen
+window between "gate open" and "capture observes paused". After the end
+lands the session generation is bumped, so any work the close missed fails
+the identity checks unambiguously. `end_session()` returning None (no open
+session) is handled without touching the summary dict.
 
 Both releases are idempotent (no-op on absent ids), so a timeout that
 superseded the generation cannot be double-released by the straggler's late

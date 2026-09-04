@@ -735,10 +735,21 @@ class LiveTranslateApp:
         # segment may yield no message at all, or several interim ones).
         self._session_work_seq = 0
         self._session_work_lock = threading.Lock()
+        # Producer fence for the session boundary: linearizes, under one
+        # lock, the capture thread's "gate check → VAD → enqueue" against
+        # the end thread's "gate → CLOSING" (and the begin thread's
+        # generation bump + session open). Speech the VAD accepted before
+        # the end is therefore enqueued *before* CLOSING flips and is kept;
+        # audio after the end never reaches the VAD. The generation and the
+        # writer's session stamp are snapshotted together under this lock,
+        # so a queue item's identity pair can never straddle a boundary.
+        # RLock: enqueueing holds it and re-enters via the snapshot helper.
+        self._session_boundary_lock = threading.RLock()
         self._ending_thread = None
         self._session_ui_callback = None      # Qt-thread notifier set by main()
         # Capture-loop gate during ENDING: True means feed VAD no new audio
         # (the session is completing; the pipeline itself is not paused).
+        # Written and read only under _session_boundary_lock.
         self._session_end_gating = False
 
     def set_overlay(self, overlay: SubtitleOverlay):
@@ -826,19 +837,26 @@ class LiveTranslateApp:
             return None
         # Session first, pipeline second: create the writer session *before*
         # resuming capture, so nothing can be recorded into a session that
-        # failed to open (no empty active meeting on a start failure).
-        session_id = self._transcript.begin_session()
-        if session_id is None:
-            # Auto-save disabled or the writer could not open files. Without
-            # a session there is nothing to track; stay IDLE and keep the
-            # pipeline paused — resuming it here would recognise and call the
-            # translation API while nothing is being recorded.
-            log.info("begin_recording_session: writer has no session (disabled?)")
-            return None
-        self._session_generation += 1
-        self._session_work.begin(self._session_generation)
-        self._record_session_info()
-        self._publish_transcript_paths()
+        # failed to open (no empty active meeting on a start failure). The
+        # whole open+bump runs under the session boundary lock (the producer
+        # fence), so a capture-thread snapshot can never observe the new
+        # generation with the old session or vice versa.
+        with self._session_boundary_lock:
+            session_id = self._transcript.begin_session()
+            if session_id is None:
+                # Auto-save disabled or the writer could not open files (the
+                # open is all-or-nothing). Without a session there is nothing
+                # to track; stay IDLE and keep the pipeline paused — resuming
+                # it here would recognise and call the translation API while
+                # nothing is being recorded.
+                log.info(
+                    "begin_recording_session: writer has no session (disabled?)"
+                )
+                return None
+            self._session_generation += 1
+            self._session_work.begin(self._session_generation)
+            self._record_session_info()
+            self._publish_transcript_paths()
         if not self._running:
             # A recording session requires a live pipeline; the app-level
             # start (main()'s handler) refuses earlier, this guard covers
@@ -846,8 +864,9 @@ class LiveTranslateApp:
             log.warning(
                 "begin_recording_session: pipeline not running; closing the session"
             )
-            self._transcript.end_session()
-            self._session_work.supersede(self._session_generation)
+            with self._session_boundary_lock:
+                self._transcript.end_session()
+                self._session_work.supersede(self._session_generation)
             return None
         if self._paused:
             self.resume()
@@ -883,31 +902,45 @@ class LiveTranslateApp:
                 summary = self._run_session_end(generation)
             except Exception:
                 # The close itself failed (I/O error in the flush, the seal,
-                # anywhere). Keep whatever of the meeting is already on disk
-                # — end_session is written so its partial failure cannot
-                # destroy it — and still leave ENDING: a state machine that
-                # parks in ENDING forever locks out every button.
+                # anywhere). Keep whatever of the meeting is already on disk,
+                # abort the writer's session (handles released, memory
+                # cleared, nothing further written — the records layer will
+                # classify the meeting as interrupted), and still leave
+                # ENDING: a state machine that parks in ENDING forever locks
+                # out every button.
                 log.error(
-                    "Session end failed; record kept as-is, state -> IDLE",
+                    "Session end failed; aborting the session, record kept "
+                    "as-is, state -> IDLE",
                     exc_info=True,
                 )
+                try:
+                    summary = self._transcript.abort_session() or summary
+                except Exception:
+                    log.error(
+                        "Session abort also failed; writer state unknown",
+                        exc_info=True,
+                    )
                 # _run_session_end's supersede never ran; retire the
                 # generation here so the tracker drops its CLOSING entry
-                # (the writer may or may not have sealed — either way the
-                # state below makes the generation invalid).
+                # (either way the state below makes the generation invalid).
                 self._session_work.supersede(generation)
-            if generation != self._session_generation:
-                # Superseded by a quit (the generation moved under us). The
-                # stop() path owns the final close.
-                return
-            self._ending_session_id = None
-            # Advance the generation so any work the close missed (a timed-
-            # out translation straggler, an ASR result still on the worker)
-            # is unambiguously invalid for the *next* session: the tracker
-            # already superseded this generation, and the bumped generation
-            # means a straggler carrying the old one fails the
-            # identity check at write time.
-            self._session_generation += 1
+            # Invariant: from here the writer has either sealed
+            # (_run_session_end's end_session completed) or aborted
+            # (abort_session ran), so announcing IDLE can never leave a live
+            # writer session behind the state machine.
+            with self._session_boundary_lock:
+                if generation != self._session_generation:
+                    # Superseded by a quit (the generation moved under us).
+                    # The stop() path owns the final close.
+                    return
+                self._ending_session_id = None
+                # Advance the generation so any work the close missed (a
+                # timed-out translation straggler, an ASR result still on the
+                # worker) is unambiguously invalid for the *next* session:
+                # the tracker already superseded this generation, and the
+                # bumped generation means a straggler carrying the old one
+                # fails the identity check at write time.
+                self._session_generation += 1
             # end_session returns None when there was no open session (the
             # close raced a stop, or a legacy auto session never opened):
             # there is no summary to announce, only the state change.
@@ -937,18 +970,21 @@ class LiveTranslateApp:
         contents, or None when superseded (app quit / generation moved)."""
         if generation != self._session_generation:
             return None
-        # 1) Stop accepting new content for this session. Two gates, in a
-        #    defined order:
-        #    * tracker: OPEN→CLOSING under the tracker's lock — from here on
-        #      the capture thread's ordinary registrations are refused under
-        #      that same lock, so a segment produced-but-not-yet-enqueued at
-        #      the moment the user clicked "end" is either already counted
-        #      (waited on) or is dropped (it belongs to a meeting the user
-        #      ended; its write would be refused by the writer anyway);
-        #    * capture loop: _session_end_gating stops new audio entering
-        #      VAD, so the flush below sees a stable buffer.
-        self._session_work.start_closing(generation)
-        self.pause_for_session_end()
+        # 1) Stop accepting new content for this session, atomically under
+        #    the session boundary lock (the producer fence). The capture
+        #    thread holds the same lock across "gate check → VAD → enqueue",
+        #    so one of two orders holds:
+        #    * the fence ran first: any segment the VAD produced is already
+        #      enqueued and counted under the still-OPEN generation — the
+        #      end waits for it (the last utterance is kept, never dropped);
+        #    * the end ran first: the gate is up, the capture thread feeds
+        #      the VAD nothing, and the flush below drains what the VAD had
+        #      already accepted before the fence.
+        #    start_closing (OPEN→CLOSING) flips inside the same lock, so no
+        #    ordinary registration can slip between the two.
+        with self._session_boundary_lock:
+            self._session_work.start_closing(generation)
+            self._session_end_gating = True
         try:
             # 2) Flush the last VAD buffer into the ASR queue through the
             #    controlled final-registration entry (the only new work
@@ -992,16 +1028,8 @@ class LiveTranslateApp:
             # _paused set first, the capture loop's own pause check drops
             # every chunk before the gate is even consulted.
             self._paused = True
-            self.resume_after_session_end()
-
-    def pause_for_session_end(self):
-        """Gate the capture loop's VAD feed during ENDING without touching
-        the user-facing pause state (the overlay keeps showing what it
-        showed; only the recording session is completing)."""
-        self._session_end_gating = True
-
-    def resume_after_session_end(self):
-        self._session_end_gating = False
+            with self._session_boundary_lock:
+                self._session_end_gating = False
 
     def _flush_for_session_end(self, generation: int):
         """Hand the last VAD buffer to the ASR thread, as pause() does.
@@ -1040,19 +1068,24 @@ class LiveTranslateApp:
         """
         if self._stop_event.is_set():
             return
-        work_id = self._next_session_work_id()
-        if not self._session_work.register_final(generation, work_id):
-            log.debug("Dropping ENDING flush for superseded generation")
-            return
-        item = (
-            "vad_flush", segment, work_id, generation,
-            self._transcript.active_session(),
-        )
-        try:
-            self._asr_queue.put_nowait(item)
-            return
-        except queue.Full:
-            pass
+        # Snapshot under the boundary fence like the ordinary producer, so
+        # the item's identity pair is consistent (ENDing state blocks a
+        # concurrent begin, but the fence keeps the invariant uniform).
+        with self._session_boundary_lock:
+            expected_session = self._transcript.active_session()
+            work_id = self._next_session_work_id()
+            if not self._session_work.register_final(generation, work_id):
+                log.debug("Dropping ENDING flush for superseded generation")
+                return
+            item = (
+                "vad_flush", segment, work_id, generation,
+                expected_session,
+            )
+            try:
+                self._asr_queue.put_nowait(item)
+                return
+            except queue.Full:
+                pass
         try:
             dropped = self._asr_queue.get_nowait()
         except queue.Empty:
@@ -1075,6 +1108,18 @@ class LiveTranslateApp:
         with self._session_work_lock:
             self._session_work_seq += 1
             return self._session_work_seq
+
+    def _session_snapshot(self) -> tuple:
+        """(generation, session stamp) read together under the boundary lock.
+
+        Must be called with ``_session_boundary_lock`` held (RLock — the
+        fence makes a begin/end and this snapshot linear), so the pair can
+        never straddle a session boundary — the generation and the stamp
+        describe the same meeting by construction. Every writer of
+        _session_generation holds the boundary lock, so a plain read here is
+        safe.
+        """
+        return self._session_generation, self._transcript.active_session()
 
     def _on_session_state_ui(self, state: str, session_id: str | None,
                              summary: dict | None):
@@ -1589,7 +1634,7 @@ class LiveTranslateApp:
             )
 
     def _submit_translation(self, msg_id, text, source_lang, extra_langs=None,
-                            session_generation=None):
+                            session_generation=None, expected_session=None):
         request_translator, generation = self._snapshot_translation_request(
             msg_id, text
         )
@@ -1603,6 +1648,7 @@ class LiveTranslateApp:
                 request_translator,
                 generation,
                 session_generation,
+                expected_session,
             )
         except RuntimeError:
             self._commit_translation_result(msg_id, text, None, generation)
@@ -2278,6 +2324,7 @@ class LiveTranslateApp:
         request_translator=None,
         generation=None,
         session_generation=None,
+        expected_session=None,
     ):
         """Translate text and update UI with streaming display.
 
@@ -2286,12 +2333,15 @@ class LiveTranslateApp:
         one). It keys the release in the finally: a session begin/end racing
         the translation must not make the release land on the *new* session
         (a no-op there, leaving the old one's wait hanging on a count that
-        will never be released).
+        will never be released). ``expected_session`` is the entry's session
+        stamp, threaded through to the writer so the completion is
+        identity-checked like the original write.
         """
         try:
             self._translate_async_inner(
                 msg_id, text, source_lang, extra_langs,
                 request_translator, generation,
+                expected_session,
             )
         finally:
             gen = (
@@ -2309,6 +2359,7 @@ class LiveTranslateApp:
         extra_langs=None,
         request_translator=None,
         generation=None,
+        expected_session=None,
     ):
         if request_translator is None:
             request_translator, generation = self._snapshot_translation_request(
@@ -2333,9 +2384,13 @@ class LiveTranslateApp:
                 # whole meeting record behind it for the rest of the session.
                 log.info("Translation superseded by a model switch: msg=%s", msg_id)
                 if translated:
-                    self._transcript.write_translation(msg_id, translated)
+                    self._transcript.write_translation(
+                        msg_id, translated, session=expected_session
+                    )
                 else:
-                    self._transcript.finalize_no_translation(msg_id)
+                    self._transcript.finalize_no_translation(
+                        msg_id, session=expected_session
+                    )
                 if self._overlay:
                     self._overlay.update_translation(msg_id, translated or "", 0)
                 return
@@ -2348,9 +2403,13 @@ class LiveTranslateApp:
             self._record_latency("translation", tl_ms)
             log.info(f"Translate ({tl_ms:.0f}ms): {translated}")
             if translated:
-                self._transcript.write_translation(msg_id, translated)
+                self._transcript.write_translation(
+                    msg_id, translated, session=expected_session
+                )
             else:
-                self._transcript.finalize_no_translation(msg_id)
+                self._transcript.finalize_no_translation(
+                    msg_id, session=expected_session
+                )
             if self._overlay:
                 self._overlay.update_translation(msg_id, translated, tl_ms)
                 self._overlay.update_stats(
@@ -2368,7 +2427,9 @@ class LiveTranslateApp:
         except RepetitionError:
             self._commit_translation_result(msg_id, text, None, generation)
             log.warning("Repetition loop detected, model may not support structured output well")
-            self._transcript.finalize_no_translation(msg_id)
+            self._transcript.finalize_no_translation(
+                msg_id, session=expected_session
+            )
             if self._overlay:
                 self._overlay.update_translation(
                     msg_id, f"[{t('error_repetition')}]", 0
@@ -2390,7 +2451,9 @@ class LiveTranslateApp:
                     user_visible=True,
                 )
                 return
-            self._transcript.finalize_no_translation(msg_id)
+            self._transcript.finalize_no_translation(
+                msg_id, session=expected_session
+            )
             if self._overlay:
                 self._overlay.update_translation(msg_id, f"[error: {e}]", 0)
 
@@ -2513,10 +2576,13 @@ class LiveTranslateApp:
         self._stop_event.set()
         # App quit: any open meeting ends here as part of the shutdown. The
         # session state machine goes to IDLE through the same notifier so the
-        # UI is not left claiming a recording exists.
-        if self._session_state != SessionState.IDLE:
-            self._session_generation += 1  # supersedes any in-flight ENDING
-            self._notify_session_state(SessionState.IDLE)
+        # UI is not left claiming a recording exists. The generation bump
+        # runs under the boundary lock like every other generation write.
+        with self._session_boundary_lock:
+            if self._session_state != SessionState.IDLE:
+                self._session_generation += 1  # supersedes any in-flight ENDING
+                self._notify_session_state(SessionState.IDLE)
+            self._session_end_gating = False
         self._transcript.set_recording(False)
         # Nothing is waited on anymore; late releases for the old
         # generations are no-ops by design.
@@ -2655,7 +2721,9 @@ class LiveTranslateApp:
         if remaining is not None and self._asr_ready:
             # Queued for the ASR thread rather than transcribed here: this runs
             # on the Qt thread. Its vad_flush handler resets the interim state.
-            self._enqueue_asr("vad_flush", remaining)
+            # The boundary lock is the producer fence _enqueue_asr expects.
+            with self._session_boundary_lock:
+                self._enqueue_asr("vad_flush", remaining)
         else:
             self._reset_interim_state()
         if self._overlay:
@@ -2738,7 +2806,6 @@ class LiveTranslateApp:
         # is released separately by the ASR loop's finally; both releases
         # are idempotent, so the pair is exactly-once.
         msg_generation = generation if generation is not None else self._session_generation
-        self._session_work.register_msg(msg_generation, msg_id)
         if self._overlay:
             self._overlay.add_message(
                 msg_id, timestamp, original_text, source_lang, asr_ms
@@ -2746,32 +2813,59 @@ class LiveTranslateApp:
         # expected_session (from the queue item) is the write-time identity
         # check: the writer refuses the entry inside its own lock when the
         # session that is open now is not the one this audio belongs to.
-        self._transcript.write_original(
+        # The result decides the entry's fate:
+        #   recorded  — the translation is counted and submitted;
+        #   mismatch  — the audio belongs to a closed/replaced session: no
+        #               translation is submitted (its late result could not
+        #               be written anywhere) and the overlay entry is closed
+        #               out as untranslated;
+        #   skipped/failed — subtitle-only (nothing recorded) or a file
+        #               error: recognition is displayed, the translation may
+        #               still run for display, and the writer's _complete
+        #               drops the file write because no original is pending.
+        result = self._transcript.write_original(
             msg_id, timestamp, original_text,
             language=source_lang, duration=seg_len,
             session=expected_session,
         )
+        if result == TranscriptWriter.WRITE_SESSION_MISMATCH:
+            self._finalize_untranslated(
+                msg_id, "segment belongs to a closed session",
+                user_visible=False,
+            )
+            return
+        recorded = result == TranscriptWriter.WRITE_RECORDED
+        if recorded:
+            # The translation job gets its own count, registered only now
+            # that the original is actually in the session's files (a count
+            # for a refused entry would hold an ENDING wait for nothing).
+            # The queue item's work_id still holds the item's count, so the
+            # ENDING wait cannot pass between the write and this
+            # registration — the loop's finally releases it only after this
+            # whole processing returns.
+            self._session_work.register_msg(msg_generation, msg_id)
         # Legacy auto-open path: the writer just opened a session because an
         # entry arrived while none was begun explicitly. Adopt it into the
         # state machine so the UI (button, records page, AI-minutes gate)
         # tracks the same session the writer is writing — including the work
-        # tracker: without the begin() below, this msg's count was refused
-        # (no OPEN generation) and every later segment of this adopted
-        # session would run uncounted, so ending the meeting would not wait
-        # for anything.
-        if self._session_state == SessionState.IDLE:
-            adopted = self._transcript.active_session()
-            if adopted:
-                self._session_generation += 1
-                self._session_work.begin(self._session_generation)
-                # This very msg was registered under the pre-adoption
-                # generation (refused — nothing was open); re-register under
-                # the adopted session so its translation is waited on.
-                self._session_work.register_msg(
-                    self._session_generation, msg_id
-                )
-                msg_generation = self._session_generation
-                self._notify_session_state(SessionState.ACTIVE, adopted)
+        # tracker: without the begin() below, every later segment of this
+        # adopted session would run uncounted, so ending the meeting would
+        # not wait for anything.
+        if recorded and self._session_state == SessionState.IDLE:
+            with self._session_boundary_lock:
+                adopted = self._transcript.active_session()
+                if adopted:
+                    self._session_generation += 1
+                    self._session_work.begin(self._session_generation)
+                    # This very msg was registered under the pre-adoption
+                    # generation (refused — nothing was open); re-register
+                    # under the adopted session so its translation is
+                    # waited on.
+                    self._session_work.register_msg(
+                        self._session_generation, msg_id
+                    )
+                    msg_generation = self._session_generation
+                    self._notify_session_state(SessionState.ACTIVE, adopted)
 
         # Store for subtitle window (translation will be added later)
         self._last_original = original_text
@@ -2791,9 +2885,12 @@ class LiveTranslateApp:
             # No translation job will exist, so the msg count registered
             # above is released here (the _translate_async finally that
             # normally owns it never runs on this path), under the same
-            # generation it was registered in.
+            # generation it was registered in. The session argument keeps
+            # the completion identity-checked like every other path.
             self._session_work.release_msg(msg_generation, msg_id)
-            self._transcript.finalize_no_translation(msg_id)
+            self._transcript.finalize_no_translation(
+                msg_id, session=expected_session
+            )
             if self._overlay:
                 self._overlay.update_translation(msg_id, "", 0)
                 self._overlay.update_stats(
@@ -2819,6 +2916,7 @@ class LiveTranslateApp:
                 self._submit_translation(
                     msg_id, original_text, source_lang, extra_langs or None,
                     session_generation=msg_generation,
+                    expected_session=expected_session,
                 )
             except TranslationUnavailable as exc:
                 # No job was submitted: release the msg count here.
@@ -3162,30 +3260,38 @@ class LiveTranslateApp:
         timestamp = datetime.now().strftime("%H:%M:%S")
         log.info(f"ASR [{source_lang}] ({asr_ms:.0f}ms, interim): {original_text}")
 
-        # (Session-work bookkeeping: see _process_segment — the translation
-        # job registers its own count under the segment's generation; the
-        # queue item's work_id is released by the ASR loop's finally.)
+        # (Session-work bookkeeping mirrors _process_segment: the write comes
+        # first, and only a recorded entry registers a translation count.)
         msg_generation = generation if generation is not None else self._session_generation
-        self._session_work.register_msg(msg_generation, msg_id)
         if self._overlay:
             self._overlay.add_message(msg_id, timestamp, original_text, source_lang, asr_ms)
-        self._transcript.write_original(
+        result = self._transcript.write_original(
             msg_id, timestamp, original_text, language=source_lang,
             session=expected_session,
         )
+        if result == TranscriptWriter.WRITE_SESSION_MISMATCH:
+            self._finalize_untranslated(
+                msg_id, "interim text belongs to a closed session",
+                user_visible=False,
+            )
+            return
+        recorded = result == TranscriptWriter.WRITE_RECORDED
+        if recorded:
+            self._session_work.register_msg(msg_generation, msg_id)
         # Legacy auto-open adoption (see _process_segment): begin() the
         # tracker for the adopted generation and re-register this msg, so
         # ending the meeting later waits for this translation.
-        if self._session_state == SessionState.IDLE:
-            adopted = self._transcript.active_session()
-            if adopted:
-                self._session_generation += 1
-                self._session_work.begin(self._session_generation)
-                self._session_work.register_msg(
-                    self._session_generation, msg_id
-                )
-                msg_generation = self._session_generation
-                self._notify_session_state(SessionState.ACTIVE, adopted)
+        if recorded and self._session_state == SessionState.IDLE:
+            with self._session_boundary_lock:
+                adopted = self._transcript.active_session()
+                if adopted:
+                    self._session_generation += 1
+                    self._session_work.begin(self._session_generation)
+                    self._session_work.register_msg(
+                        self._session_generation, msg_id
+                    )
+                    msg_generation = self._session_generation
+                    self._notify_session_state(SessionState.ACTIVE, adopted)
 
         self._last_original = original_text
         self._last_msg_id = msg_id
@@ -3202,7 +3308,9 @@ class LiveTranslateApp:
             # (see _process_segment's same-language branch), under the
             # generation it was registered in.
             self._session_work.release_msg(msg_generation, msg_id)
-            self._transcript.finalize_no_translation(msg_id)
+            self._transcript.finalize_no_translation(
+                msg_id, session=expected_session
+            )
             if self._overlay:
                 self._overlay.update_translation(msg_id, "", 0)
                 self._overlay.update_stats(self._asr_count, self._translate_count, self._total_prompt_tokens, self._total_completion_tokens, self._compute_cost())
@@ -3219,6 +3327,7 @@ class LiveTranslateApp:
                 self._submit_translation(
                     msg_id, original_text, source_lang, extra_langs or None,
                     session_generation=msg_generation,
+                    expected_session=expected_session,
                 )
             except TranslationUnavailable as exc:
                 self._session_work.release_msg(msg_generation, msg_id)
@@ -3317,18 +3426,22 @@ class LiveTranslateApp:
                     log.warning("Failed to clean up audio capture: %s", stop_exc)
                 break
             if item is None:
-                if (
-                    self._vad._is_speaking
-                    and not self._paused
-                    and not self._session_end_gating
-                ):
-                    n = self._vad._get_effective_silence_limit() + 1
-                    for _ in range(n):
-                        with self._vad_lock:
-                            seg = self._vad.process_chunk(silence_chunk)
-                        if seg is not None and self._asr_ready:
-                            self._enqueue_asr("vad_flush", seg)
-                            break
+                # Silence-feed branch (mid-utterance): runs under the session
+                # boundary lock like the main chunk path, so the fence covers
+                # every producer of the queue.
+                with self._session_boundary_lock:
+                    if (
+                        self._vad._is_speaking
+                        and not self._paused
+                        and not self._session_end_gating
+                    ):
+                        n = self._vad._get_effective_silence_limit() + 1
+                        for _ in range(n):
+                            with self._vad_lock:
+                                seg = self._vad.process_chunk(silence_chunk)
+                            if seg is not None and self._asr_ready:
+                                self._enqueue_asr("vad_flush", seg)
+                                break
                 continue
 
             chunk, mic_rms = item
@@ -3340,57 +3453,64 @@ class LiveTranslateApp:
             # 32 ms audio block on the real-time capture thread.
             rms = float(np.sqrt(np.dot(chunk, chunk) / max(chunk.size, 1)))
 
-            # Session ENDING: no new audio into VAD for the closing meeting.
-            # The monitor keeps updating (the user sees the level), but the
-            # buffer is left to the ENDING thread's flush.
-            if self._session_end_gating:
-                if self._overlay:
-                    self._overlay.update_monitor(rms, self._vad.last_confidence, mic_rms)
-                continue
-
             if self._overlay:
                 self._overlay.update_monitor(rms, self._vad.last_confidence, mic_rms)
 
-            with self._vad_lock:
-                speech_segment = self._vad.process_chunk(chunk)
-                speaking = self._vad._is_speaking
-                discarded = self._vad.discarded_segments
+            # Producer fence: the gate check, the VAD step and the enqueue
+            # run under the session boundary lock, the same lock the end
+            # thread holds when it raises the gate and flips the generation
+            # to CLOSING. Speech the VAD accepted before the end is therefore
+            # enqueued (and counted) before the close can start — the last
+            # utterance is kept, never silently dropped; audio after the end
+            # never reaches the VAD at all.
+            with self._session_boundary_lock:
+                if self._session_end_gating:
+                    # Session ENDING: no new audio into VAD for the closing
+                    # meeting. The monitor above still updates (the user sees
+                    # the level); the buffer is left to the ENDING thread's
+                    # flush.
+                    continue
 
-            if discarded != last_discarded:
-                # The density filter dropped a segment. It emits nothing, so
-                # without this the utterance's interim state (pending fragments
-                # and the echo tail) would leak into the next one.
-                last_discarded = discarded
-                if self._interim_active or self._interim_pending:
-                    log.debug("Low-density segment discarded; resetting interim state")
-                self._reset_interim_state()
+                with self._vad_lock:
+                    speech_segment = self._vad.process_chunk(chunk)
+                    speaking = self._vad._is_speaking
+                    discarded = self._vad.discarded_segments
 
-            if speaking or speech_segment is not None:
-                self._last_speech_activity = time.monotonic()
+                if discarded != last_discarded:
+                    # The density filter dropped a segment. It emits nothing, so
+                    # without this the utterance's interim state (pending fragments
+                    # and the echo tail) would leak into the next one.
+                    last_discarded = discarded
+                    if self._interim_active or self._interim_pending:
+                        log.debug("Low-density segment discarded; resetting interim state")
+                    self._reset_interim_state()
 
-            if speech_segment is None:
-                # Still accumulating — check for interim ASR
-                # Unlocked reads by design: these only throttle *whether* to
-                # consider an interim pass. _do_interim_asr re-reads the buffer
-                # under _vad_lock, so a torn read here costs at most one extra
-                # or skipped poll (see VADProcessor's class docstring).
-                if (self._incremental_enabled and self._asr_ready
-                        and self._vad._is_speaking):
-                    buf_samples = self._vad._speech_samples
-                    total_dur = buf_samples / 16000
-                    elapsed = (buf_samples - self._last_interim_samples) / 16000
-                    now = time.perf_counter()
-                    cooldown = now - self._last_interim_check_time
-                    if total_dur >= self._interim_interval and elapsed >= self._interim_interval and cooldown >= 1.0:
-                        self._last_interim_check_time = now
-                        self._enqueue_asr("interim", None)
-                continue
+                if speaking or speech_segment is not None:
+                    self._last_speech_activity = time.monotonic()
 
-            if not self._asr_ready:
-                log.debug("ASR not ready, dropping segment")
-                continue
+                if speech_segment is None:
+                    # Still accumulating — check for interim ASR
+                    # Unlocked reads by design: these only throttle *whether* to
+                    # consider an interim pass. _do_interim_asr re-reads the buffer
+                    # under _vad_lock, so a torn read here costs at most one extra
+                    # or skipped poll (see VADProcessor's class docstring).
+                    if (self._incremental_enabled and self._asr_ready
+                            and self._vad._is_speaking):
+                        buf_samples = self._vad._speech_samples
+                        total_dur = buf_samples / 16000
+                        elapsed = (buf_samples - self._last_interim_samples) / 16000
+                        now = time.perf_counter()
+                        cooldown = now - self._last_interim_check_time
+                        if total_dur >= self._interim_interval and elapsed >= self._interim_interval and cooldown >= 1.0:
+                            self._last_interim_check_time = now
+                            self._enqueue_asr("interim", None)
+                    continue
 
-            self._enqueue_asr("vad_flush", speech_segment)
+                if not self._asr_ready:
+                    log.debug("ASR not ready, dropping segment")
+                    continue
+
+                self._enqueue_asr("vad_flush", speech_segment)
 
     def _enqueue_asr(self, seg_type: str, segment):
         """Queue a segment for the ASR thread, dropping the oldest on overflow.
@@ -3398,36 +3518,29 @@ class LiveTranslateApp:
         Never raises: this runs on the capture thread, which has no outer
         handler and must not die because the consumer fell behind.
 
-        Session-work registration happens *here*, under the tracker's lock
-        and before the item is put on the queue: once the ASR thread takes
-        an item the queue looks empty even though recognition has not
-        finished, so the ENDING wait must count queue *items*, not queue
-        *emptiness*; and once the generation is CLOSING (the user ended the
-        meeting) the registration is refused, so a segment produced but not
-        yet enqueued at that moment is dropped here rather than racing the
-        end. The ENDING flush goes through _enqueue_final_segment instead.
+        Called with ``_session_boundary_lock`` held (the producer fence — the
+        capture loop holds it from the gate check through VAD to this
+        enqueue), so the "segment produced but not yet enqueued when the user
+        clicked end" interleaving cannot occur: either the whole
+        check→VAD→enqueue ran before the end's gate+CLOSING (the segment is
+        registered under the still-OPEN generation and kept), or the gate is
+        already up and the audio never reached the VAD. The ENDING flush
+        goes through _enqueue_final_segment instead.
 
         The item carries both the registration generation and the writer's
-        session stamp, snapshotted together, so the ASR result can be
-        identity-checked at write time: a session that ended (and possibly
-        re-opened as a new one) between enqueue and recognition can never
-        receive the old audio's entries.
+        session stamp, snapshotted together under the same fence, so the
+        ASR result can be identity-checked at write time: a session that
+        ended (and possibly re-opened as a new one) between enqueue and
+        recognition can never receive the old audio's entries.
         """
         if self._stop_event.is_set():
             return
-        # The generation and the writer's session stamp are snapshotted
-        # atomically with the admission decision so the item, its count and
-        # its expected session describe the same meeting: a begin/end racing
-        # this line can no longer make a queued segment land under the
-        # neighbouring session.
-        with self._session_work_lock:
-            generation = self._session_generation
-        expected_session = self._transcript.active_session()
+        generation, expected_session = self._session_snapshot()
         decision = self._session_work.admit(generation)
         if decision == "drop":
-            # The user ended this meeting (CLOSING/closed): recognising the
-            # audio would produce a result with no meeting to land in. Drop
-            # it before the queue.
+            # Unreachable under the producer fence (the gate precedes any
+            # CLOSING enqueue); kept as a defensive guard for stray callers.
+            log.debug("Dropping %s segment for a closing/closed session", seg_type)
             return
         work_id = None
         if decision == "register":
