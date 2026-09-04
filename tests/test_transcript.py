@@ -379,15 +379,93 @@ def test_listing_survives_a_session_with_no_sidecar(tmp_path):
 
 
 def test_deleting_a_session_removes_all_of_its_files(tmp_path):
+    from transcript_writer import _session_file_candidates
+
     writer = _writer(tmp_path)
     writer.write_original(1, "00:00:01", "hello")
     writer.write_translation(1, "hola")
     stamp = writer._session_ts  # saved: close clears it
     writer.close()
-    assert list(tmp_path.glob(f"livetrans_{stamp}_*"))
+    assert [p for p in _session_file_candidates(tmp_path, stamp) if p.exists()]
 
     assert delete_session(tmp_path, stamp) == []
-    assert list(tmp_path.glob(f"livetrans_{stamp}_*")) == []
+    assert [p for p in _session_file_candidates(tmp_path, stamp) if p.exists()] == []
+
+
+def _same_second_pair(tmp_path):
+    """Two complete file sets sharing one second: the bare stamp and its
+    ``_01`` suffixed sibling — the shape _unique_stamp produces when a
+    second session begins within the same second."""
+    bare = "20260101_090000"
+    sibling = f"{bare}_01"
+    sets = {}
+    for stamp, marker in ((bare, "parent"), (sibling, "sibling")):
+        files = {
+            f"livetrans_{stamp}_all.txt": f"[09:00:00] {marker} line\n",
+            f"livetrans_{stamp}_original.txt": f"[09:00:00] {marker} line\n",
+            f"livetrans_{stamp}_translation.txt": f"[09:00:00] {marker} TL\n",
+            f"livetrans_{stamp}_meeting.md": f"# Meeting record\n\n{marker}\n",
+            f"livetrans_{stamp}_meta.json": '{"session": "%s"}' % stamp,
+            f"livetrans_{stamp}_summary.md": f"# {marker} minutes",
+            f"livetrans_{stamp}_summary_meta.json": '{"provider_name": "X"}',
+            # A staged sibling a crashed atomic commit can leave behind.
+            f"livetrans_{stamp}_summary.md.tmp123.0123456789abcdef":
+                "half-written",
+        }
+        for name, content in files.items():
+            (tmp_path / name).write_text(content, encoding="utf-8")
+        sets[stamp] = files
+    return bare, sibling, sets
+
+
+def test_deleting_a_bare_stamp_spares_its_same_second_suffixed_sibling(tmp_path):
+    """[B1 regression] delete_session must enumerate this session's exact
+    files, never a ``livetrans_{stamp}_*`` prefix glob: a bare stamp is the
+    *prefix* of its same-second suffixed siblings, and the glob unlinked the
+    sibling's whole file set — original, translation, combined text,
+    Markdown, meta, AI minutes and staged temps — along with the target's,
+    destroying a second meeting the user never asked to delete."""
+    bare, sibling, sets = _same_second_pair(tmp_path)
+
+    assert delete_session(tmp_path, bare) == []
+
+    # The bare stamp's own files are all gone, temp siblings included.
+    for name in sets[bare]:
+        assert not (tmp_path / name).exists(), name
+    # Every _01 file survives with its content intact.
+    for name, content in sets[sibling].items():
+        survived = tmp_path / name
+        assert survived.exists(), name
+        assert survived.read_text(encoding="utf-8") == content, name
+
+
+def test_deleting_the_suffixed_sibling_spares_the_bare_stamp(tmp_path):
+    """The delete must be exact in the other direction too: removing the
+    ``_01`` sibling never touches the bare parent stamp's files."""
+    bare, sibling, sets = _same_second_pair(tmp_path)
+
+    assert delete_session(tmp_path, sibling) == []
+
+    for name in sets[sibling]:
+        assert not (tmp_path / name).exists(), name
+    for name, content in sets[bare].items():
+        survived = tmp_path / name
+        assert survived.exists(), name
+        assert survived.read_text(encoding="utf-8") == content, name
+
+
+def test_delete_session_summary_names_match_the_records_layer(tmp_path):
+    """The summary file names delete_session enumerates must be exactly the
+    records layer's _summary_paths — the two definitions are pinned together
+    so neither can drift."""
+    import meeting_records as records_module
+    from transcript_writer import _session_file_candidates
+
+    stamp = "20260101_090000"
+    md, meta = records_module._summary_paths(tmp_path, stamp)
+    enumerated = {p.name for p in _session_file_candidates(tmp_path, stamp)}
+    assert md.name in enumerated
+    assert meta.name in enumerated
 
 
 def test_listing_an_absent_directory_is_empty(tmp_path):
@@ -971,3 +1049,373 @@ def test_close_after_exception_can_start_a_new_session(tmp_path):
     summary = writer.end_session()
     assert summary["session_status"] == "completed"
     assert writer.has_open_resources() is False
+
+
+# --- auto-open adoption keeps the session's opening work [B2] ----------------
+
+import queue as _queue
+import threading as _threading
+
+
+class _AdoptionApp:
+    """A minimal LiveTranslateApp stand-in driving the *real* session-work
+    machinery — _SessionWorkTracker, _enqueue_asr, _process_segment_text,
+    _adopt_auto_opened_session, _do_interim_asr and the stale-segment guard —
+    against a real TranscriptWriter. The translation executor is sidestepped:
+    the target language equals the source, so every entry takes the
+    same-language finalize path and never submits a job.
+
+    Only what the bound real methods touch is stubbed (ASR, the language
+    setting, sentence splitting); the adoption itself, the tracker and the
+    writer are the production code under test."""
+
+    _bound = False
+
+    def __init__(self, writer, main):
+        self._main = main
+        self._transcript = writer
+        self._session_state = main.SessionState.IDLE
+        self._session_generation = 0
+        self._session_work = main._SessionWorkTracker()
+        self._session_boundary_lock = _threading.RLock()
+        self._session_work_lock = _threading.Lock()
+        self._session_work_seq = 0
+        self._stop_event = _threading.Event()
+        self._asr_queue = _queue.Queue()
+        self._overlay = None
+        self._subwin = None
+        self._panel = None
+        self._translator = None
+        self._asr_config = None
+        self._running = True
+        self._paused = False
+        self._target_language = "ru"
+        self._asr_count = 0
+        self._msg_id = 0
+        self._last_original = ""
+        self._last_msg_id = 0
+        # Interim-path state (used by the _do_interim_asr tests).
+        self._vad_lock = _threading.Lock()
+        self._vad = None
+        self._interim_pending = ""
+        self._interim_active = False
+        self._interim_committed_tail = ""
+        # Notified state changes: [(state, session_id), ...].
+        self.notifications = []
+        self._session_ui_callback = self._record_notification
+
+    def _record_notification(self, state, session_id, summary=None):
+        self.notifications.append((state, session_id))
+
+    # --- stubs for what only the real app owns -------------------------------
+    def _get_asr_language_setting(self):
+        return "auto"
+
+    def _run_asr(self, audio, kind, **kwargs):
+        raise AssertionError("no ASR stub installed for this test")
+
+    def _split_sentences(self, text, lang):
+        return [text]
+
+    # --- bound from LiveTranslateApp (see _make_adoption_app) ----------------
+    _enqueue_asr = None
+    _session_snapshot = None
+    _next_session_work_id = None
+    _requeue_stop_sentinel = None
+    _release_queued_work = None
+    _process_segment_text = None
+    _adopt_auto_opened_session = None
+    _notify_session_state = None
+    _finalize_untranslated = None
+    _record_session_info = None
+    _publish_transcript_paths = None
+    begin_recording_session = None
+    _strip_committed_overlap = None
+    _is_short_utterance = None
+    _is_substantial_echo = None
+    _buffer_interim_fragment = None
+    _do_interim_asr = None
+
+
+def _make_adoption_app(tmp_path):
+    main = pytest.importorskip("main")
+    if not _AdoptionApp._bound:
+        real = main.LiveTranslateApp
+        for name in (
+            "_enqueue_asr", "_session_snapshot", "_next_session_work_id",
+            "_requeue_stop_sentinel", "_release_queued_work",
+            "_process_segment_text", "_adopt_auto_opened_session",
+            "_notify_session_state", "_finalize_untranslated",
+            "_record_session_info", "_publish_transcript_paths",
+            "begin_recording_session", "_strip_committed_overlap",
+            "_is_substantial_echo", "_buffer_interim_fragment",
+            "_do_interim_asr",
+        ):
+            setattr(_AdoptionApp, name, getattr(real, name))
+        # A staticmethod retrieved from the class is a plain function; store
+        # it as a staticmethod again so the stub's calls keep its signature.
+        setattr(
+            _AdoptionApp, "_is_short_utterance",
+            staticmethod(real._is_short_utterance),
+        )
+        for name in (
+            "_ECHO_BOUNDARY", "_ECHO_MIN_UNSPACED", "_INTERIM_PENDING_MAX",
+        ):
+            setattr(_AdoptionApp, name, getattr(real, name))
+        _AdoptionApp._bound = True
+    writer = _writer(tmp_path)
+    return _AdoptionApp(writer, main), writer, main
+
+
+def test_items_enqueued_before_adoption_all_land_in_the_session(tmp_path):
+    """[B2 regression] The first entry's write auto-opens the session and the
+    adoption claims it — without bumping the generation: items enqueued
+    *before* the auto-open carry that same generation and are this meeting's
+    opening speech. The old bump made the stale-segment guard refuse them,
+    silently dropping their audio (and, on the interim path, trimming it)."""
+    app, writer, main = _make_adoption_app(tmp_path)
+
+    # Two queue items enter while no session exists yet (the moments right
+    # after the pipeline starts recording): both are counted from enqueue on.
+    with app._session_boundary_lock:
+        app._enqueue_asr("vad_flush", "audio-1")
+        app._enqueue_asr("vad_flush", "audio-2")
+    item1 = app._asr_queue.get_nowait()
+    item2 = app._asr_queue.get_nowait()
+    gen = app._session_generation
+    assert item1[2] is not None and item2[2] is not None  # counted ("pass")
+    assert app._session_work.pending_count(gen) == 2
+
+    # The first item is processed: its write auto-opens the session and the
+    # adoption claims it — at the SAME generation, one ACTIVE notification.
+    assert app._process_segment_text(
+        "первая фраза", "ru", 100,
+        generation=item1[3], expected_session=item1[4],
+    ) is True
+    stamp = writer.active_session()
+    assert stamp is not None
+    assert app._session_generation == gen
+    assert app.notifications == [("active", stamp)]
+    assert app._session_state == main.SessionState.ACTIVE
+
+    # The second item — enqueued BEFORE the auto-open — still commits into
+    # the same session instead of being discarded by the stale guard.
+    assert app._process_segment_text(
+        "вторая фраза", "ru", 100,
+        generation=item2[3], expected_session=item2[4],
+    ) is True
+    writer.end_session()
+    all_text = (tmp_path / f"livetrans_{stamp}_all.txt").read_text("utf-8")
+    assert "первая фраза" in all_text
+    assert "вторая фраза" in all_text
+
+
+def test_ending_waits_for_work_enqueued_before_adoption(tmp_path):
+    """The ENDING wait must cover queue work enqueued before the auto-open:
+    the counts exist from enqueue on (register() auto-creates the not-yet-
+    adopted generation), so wait_idle blocks on them instead of closing the
+    session out from under in-flight recognition."""
+    app, writer, main = _make_adoption_app(tmp_path)
+
+    with app._session_boundary_lock:
+        app._enqueue_asr("vad_flush", "audio-in-flight")
+    item = app._asr_queue.get_nowait()
+    gen = item[3]
+    assert app._session_work.pending_count(gen) == 1
+
+    # A first entry adopts the session at this same generation.
+    assert app._process_segment_text(
+        "фраза", "ru", 50, generation=gen, expected_session=None
+    ) is True
+    assert app._session_generation == gen
+    assert app._session_state == main.SessionState.ACTIVE
+
+    # The user ends the meeting: the end flips CLOSING and must wait for the
+    # pre-adoption item still in flight.
+    app._session_work.start_closing(gen)
+    assert app._session_work.wait_idle(gen, timeout=0.0) is False
+    # The ASR loop's finally releases the item's count — only then idle.
+    app._session_work.release(gen, item[2])
+    assert app._session_work.wait_idle(gen, timeout=0.0) is True
+
+
+class _FakeInterimVAD:
+    """Just enough VAD for _do_interim_asr: a peekable buffer and a
+    recording trimmer."""
+
+    def __init__(self, seconds: float):
+        self._samples = [0.0] * int(seconds * 16000)
+        self.trimmed = 0
+
+    def peek_buffer(self):
+        if not self._samples:
+            return None
+        return self._samples, len(self._samples) / 16000
+
+    def trim_front(self, samples):
+        self.trimmed += samples
+        self._samples = self._samples[samples:]
+
+
+def test_interim_sentences_after_adoption_are_not_lost(tmp_path):
+    """[B2 regression, interim path] An interim pass whose first sentence's
+    write auto-opens and adopts the session must still commit its remaining
+    sentences: adoption does not bump the generation, so nothing is refused
+    and the committed prefix (trim + echo tail) covers what actually
+    landed."""
+    app, writer, main = _make_adoption_app(tmp_path)
+    app._vad = _FakeInterimVAD(4.0)
+    app._run_asr = lambda audio, kind, **kw: (
+        {"text": "Первое предложение. Второе предложение. Хвост",
+         "language": "ru"},
+        120,
+    )
+    app._split_sentences = lambda text, lang: [
+        "Первое предложение.", "Второе предложение.", "Хвост"
+    ]
+
+    # The whole pass runs at the pre-adoption generation — the item that was
+    # in flight when its first sentence opened the session.
+    assert app._do_interim_asr(generation=0, expected_session=None) is True
+    stamp = writer.active_session()
+    assert stamp is not None
+    assert app._session_generation == 0  # adoption did not bump
+    all_text = (tmp_path / f"livetrans_{stamp}_all.txt").read_text("utf-8")
+    assert "Первое предложение." in all_text
+    assert "Второе предложение." in all_text
+    assert app._vad.trimmed > 0
+    assert app._interim_active is True
+
+
+def test_interim_pass_entirely_refused_consumes_nothing(tmp_path):
+    """[invariant 7] A pass every sentence of which the identity guard
+    refuses (a real session boundary crossed between enqueue and processing)
+    consumes nothing: no trim, no echo-tail update, no _interim_active —
+    the audio stays in the buffer for a later pass instead of being lost."""
+    app, writer, main = _make_adoption_app(tmp_path)
+    app._vad = _FakeInterimVAD(4.0)
+    app._run_asr = lambda audio, kind, **kw: (
+        {"text": "Третье предложение. Четвёртое предложение.",
+         "language": "ru"},
+        120,
+    )
+    app._split_sentences = lambda text, lang: [
+        "Третье предложение.", "Четвёртое предложение.", "Хвост"
+    ]
+    tail_before = app._interim_committed_tail
+    active_before = app._interim_active
+
+    # A stale generation: every sentence is refused before any write.
+    assert app._do_interim_asr(generation=42, expected_session=None) is False
+    assert app._vad.trimmed == 0                    # audio kept for later
+    assert app._interim_committed_tail == tail_before
+    assert app._interim_active == active_before
+    # Nothing was written anywhere.
+    assert list(tmp_path.glob("livetrans_*_all.txt")) == []
+
+
+def test_explicit_begin_still_refuses_pre_begin_queue_audio(tmp_path):
+    """[invariant 3] Starting an explicit new recording still isolates the
+    audio that was queued before it: the begin bumps the generation and the
+    stale-segment guard refuses the old item — pre-begin speech never lands
+    in the new meeting's files."""
+    app, writer, main = _make_adoption_app(tmp_path)
+
+    with app._session_boundary_lock:
+        app._enqueue_asr("vad_flush", "audio-old")
+    item = app._asr_queue.get_nowait()
+    old_gen = item[3]
+    assert old_gen == app._session_generation
+
+    stamp_new = app.begin_recording_session()
+    assert stamp_new is not None
+    assert app._session_generation == old_gen + 1
+    assert app.notifications == [("active", stamp_new)]
+
+    assert app._process_segment_text(
+        "старая фраза", "ru", 10,
+        generation=old_gen, expected_session=item[4],
+    ) is False
+    all_text = (tmp_path / f"livetrans_{stamp_new}_all.txt").read_text("utf-8")
+    assert "старая фраза" not in all_text
+    writer.end_session()
+
+
+def test_subtitle_only_records_nothing_and_drains_its_counts(tmp_path):
+    """[invariant 5] Subtitle-only mode (the pipeline resumed after a meeting
+    ended, no new session) recognises and displays but writes no meeting
+    files, opens no session — and its queue-work counts still drain cleanly
+    (nothing for an ENDING wait to hang on: there is no session to end)."""
+    app, writer, main = _make_adoption_app(tmp_path)
+    # A previous meeting ended: the writer's legacy auto-open is disarmed
+    # (explicitly_ended) while the pipeline keeps recording.
+    writer.begin_session()
+    writer.end_session()
+    assert writer.active_session() is None
+
+    assert app._process_segment_text(
+        "только субтитры", "ru", 10,
+        generation=app._session_generation, expected_session=None,
+    ) is True
+    assert writer.active_session() is None      # no ghost session
+    assert app._session_state == main.SessionState.IDLE
+    assert app.notifications == []              # nothing adopted
+    # The only files are the ended session's — nothing new was written.
+    ended = list(tmp_path.glob("livetrans_*_all.txt"))
+    assert len(ended) == 1
+
+    # Subtitle-only queue items are counted (waitable if a session is
+    # adopted at this generation later) and drain on release.
+    with app._session_boundary_lock:
+        app._enqueue_asr("vad_flush", "audio")
+    item = app._asr_queue.get_nowait()
+    assert item[2] is not None
+    app._session_work.release(item[3], item[2])
+    assert app._session_work.pending_count(item[3]) == 0
+
+
+def test_adoption_and_explicit_begin_yield_one_authority(tmp_path):
+    """[invariant 6] An adoption followed by an explicit begin (and vice
+    versa) yields exactly one authoritative session, one ACTIVE notification
+    and one live tracker generation — no double bump, no second tracker set,
+    no residual auto-created entries."""
+    app, writer, main = _make_adoption_app(tmp_path)
+
+    # An entry auto-opens and adopts.
+    assert app._process_segment_text(
+        "фраза", "ru", 10, generation=0, expected_session=None
+    ) is True
+    stamp = writer.active_session()
+    assert app.notifications == [("active", stamp)]
+
+    # An explicit begin arriving now is refused — the session is claimed.
+    assert app.begin_recording_session() is None
+    assert app.notifications == [("active", stamp)]
+    assert app._session_generation == 0
+
+    # A second adopting entry is a no-op against the live session.
+    assert app._process_segment_text(
+        "вторая", "ru", 10, generation=0, expected_session=None
+    ) is True
+    assert app.notifications == [("active", stamp)]
+    live = [
+        g for g, s in app._session_work._gen_state.items()
+        if s == app._session_work.OPEN
+    ]
+    assert live == [0]
+    writer.end_session()
+
+    # From scratch, an explicit begin wins first: a later adoption call
+    # finds the live session and returns the live generation untouched.
+    app2, writer2, _ = _make_adoption_app(tmp_path)
+    stamp2 = app2.begin_recording_session()
+    assert stamp2 is not None
+    gen2 = app2._session_generation
+    assert app2._adopt_auto_opened_session(1, gen2) == gen2
+    assert app2.notifications == [("active", stamp2)]
+    live2 = [
+        g for g, s in app2._session_work._gen_state.items()
+        if s == app2._session_work.OPEN
+    ]
+    assert live2 == [gen2]
+    writer2.end_session()

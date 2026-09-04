@@ -743,13 +743,17 @@ def test_rename_refused_when_the_session_was_deleted_under_the_dialog(page, monk
     renaming would recreate a sidecar for a session that no longer exists
     (a phantom row in the list). Refuse instead."""
     from PyQt6.QtWidgets import QInputDialog
+    from transcript_writer import _session_file_candidates
 
     page._list.setCurrentRow(0)
     stamp = page._list.item(0).record["session"]
 
     def dialog_that_deletes_under_itself(*a, **k):
-        for path in page._dir.glob(f"livetrans_{stamp}_*"):
-            path.unlink()
+        # Delete through the exact file enumeration (the production delete
+        # path), never a prefix glob — see delete_session.
+        for path in _session_file_candidates(page._dir, stamp):
+            if path.exists():
+                path.unlink()
         page.refresh()
         return ("标题", True)
 
@@ -768,18 +772,36 @@ def test_rename_refused_when_the_session_was_deleted_under_the_dialog(page, monk
     page._rename_session(page._list.item(0))
     assert shown, "the session-gone refusal must be shown"
     # No sidecar was resurrected for the deleted session.
-    assert not list(page._dir.glob(f"livetrans_{stamp}_*"))
+    assert not list(_session_file_candidates(page._dir, stamp))
 
 
-def test_delete_of_a_parent_stamp_is_allowed_while_a_suffixed_sibling_records(page, monkeypatch):
-    """File ownership is the writer's exact held stamp, never a path
-    substring: a bare stamp is a prefix of its same-second suffixed
-    siblings (livetrans_X vs livetrans_X_01), so substring matching
-    refused deleting the parent history record while the sibling
-    recorded."""
+def test_delete_of_a_parent_stamp_spares_its_same_second_suffixed_sibling(page, monkeypatch):
+    """[B1 regression] A bare stamp is the prefix of its same-second
+    suffixed siblings (livetrans_X vs livetrans_X_01): the writer-ownership
+    guard correctly allows deleting the closed parent record, and the
+    deletion itself must then remove *only* the parent's exact files — the
+    old ``livetrans_{stamp}_*`` prefix glob unlinked the sibling's whole
+    file set too, destroying a second meeting (here: one still held by the
+    writer) the user never asked to delete."""
     page._list.setCurrentRow(0)
     parent = page._list.item(0).record["session"]
     sibling = f"{parent}_01"
+    # Real on-disk files for the same-second sibling — the full writer set,
+    # the AI-summary pair and a staged tmp sibling — with distinct content
+    # so survival is provable, not assumed.
+    sibling_files = {
+        f"livetrans_{sibling}_all.txt": "[09:00:00] sibling line\n",
+        f"livetrans_{sibling}_original.txt": "[09:00:00] sibling line\n",
+        f"livetrans_{sibling}_translation.txt": "[09:00:00] SIBLING TL\n",
+        f"livetrans_{sibling}_meeting.md": "# Meeting record\n\nsibling\n",
+        f"livetrans_{sibling}_meta.json": '{"session": "%s"}' % sibling,
+        f"livetrans_{sibling}_summary.md": "# sibling minutes",
+        f"livetrans_{sibling}_summary_meta.json": '{"provider_name": "X"}',
+        f"livetrans_{sibling}_summary.md.tmp123.0123456789abcdef":
+            "half-written",
+    }
+    for name, content in sibling_files.items():
+        (page._dir / name).write_text(content, encoding="utf-8")
     # The writer holds the suffixed sibling's files (same-second session).
     page.set_transcript_writer(_FakeWriter(held=sibling))
 
@@ -795,8 +817,18 @@ def test_delete_of_a_parent_stamp_is_allowed_while_a_suffixed_sibling_records(pa
     assert page._writer_holds_session_files(parent) is False
     assert page._writer_holds_session_files(sibling) is True
     page._delete_session(page._record_for_session(parent))
-    # The delete went through (the substring version refused it).
-    assert not list(page._dir.glob(f"livetrans_{parent}_all.txt"))
+
+    # The parent's own files are gone (the substring-guard version refused
+    # the delete outright; the glob version deleted far too much).
+    for kind in ("all", "original", "translation", "meeting", "meta"):
+        suffix = {"meeting": ".md", "meta": ".json"}.get(kind, ".txt")
+        assert not (page._dir / f"livetrans_{parent}_{kind}{suffix}").exists()
+    # Every sibling file survives *with its content intact* — the deletion
+    # of one history record must never destroy another meeting.
+    for name, content in sibling_files.items():
+        survived = page._dir / name
+        assert survived.exists(), name
+        assert survived.read_text(encoding="utf-8") == content, name
 
 
 def test_export_button_disabled_in_ui_while_record_is_ending(page):

@@ -1257,12 +1257,53 @@ def read_session_meta(base_dir: Path) -> list[dict]:
     )
 
 
+# Non-writer files filed under the session's name prefix and belonging to the
+# same meeting: the records layer's AI-summary pair (see
+# meeting_records._summary_paths — a test pins these suffixes to it so the
+# two definitions cannot drift). Listed here only so delete_session() can
+# enumerate a session's *complete* exact file set.
+_SUMMARY_FILE_SUFFIXES = ("_summary.md", "_summary_meta.json")
+
+
+def _session_file_candidates(base_dir: Path, stamp: str) -> list[Path]:
+    """Every file this app files under one session's exact name.
+
+    Exact names only — never a ``livetrans_{stamp}_*`` glob: a bare stamp is
+    the *prefix* of its same-second suffixed siblings
+    (``livetrans_X_all.txt`` vs ``livetrans_X_01_all.txt``), so a prefix
+    glob also matches the sibling meeting's whole file set. Writer-owned
+    kinds come from ``TranscriptWriter._STAMP_KIND_SUFFIXES`` — the same
+    definition the same-second stamp probe uses, so the delete set can
+    never drift from the create set. Staged ``.tmp*`` siblings (a crashed
+    atomic write) are matched per exact file name, never per stamp prefix.
+    """
+    base_dir = Path(base_dir)
+    names = [
+        f"livetrans_{stamp}_{kind}{suffix}"
+        for kind, suffix in TranscriptWriter._STAMP_KIND_SUFFIXES
+    ]
+    names += [f"livetrans_{stamp}{suffix}" for suffix in _SUMMARY_FILE_SUFFIXES]
+    candidates = [base_dir / name for name in names]
+    for name in names:
+        candidates.extend(base_dir.glob(f"{name}.tmp*"))
+    return candidates
+
+
 def delete_session(base_dir: Path, stamp: str) -> list[str]:
-    """Remove every file of one session. Returns the paths that would not go."""
+    """Remove every file of one session. Returns the paths that would not go.
+
+    The file set is enumerated exactly (see ``_session_file_candidates``):
+    the previous ``livetrans_{stamp}_*`` prefix glob also unlinked every
+    same-second suffixed sibling (``livetrans_{X}_*`` matches
+    ``livetrans_{X}_01_all.txt``), destroying another meeting's record —
+    possibly one still being recorded — along with the one the user asked
+    to delete.
+    """
     failures = []
-    for path in Path(base_dir).glob(f"livetrans_{stamp}_*"):
+    for path in _session_file_candidates(Path(base_dir), stamp):
         try:
-            path.unlink()
+            if path.exists():
+                path.unlink()
         except OSError as exc:
             failures.append(f"{path}: {exc}")
     return failures

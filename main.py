@@ -289,6 +289,12 @@ class _SessionWorkTracker:
         # are retired once superseded and drained, so the map stays
         # proportional to live sessions, not the session history.
         self._gen_state = {}
+        # Generations auto-created by register() (see there) for periods with
+        # no explicitly tracked session — subtitle-only speech, or the window
+        # before a legacy auto-open session is adopted. At most one is live
+        # at a time (the current generation); a later begin/auto-create
+        # supersedes the older ones so the map stays bounded.
+        self._auto_created = set()
         self._highest_generation = -1
 
     # --- registration -----------------------------------------------------
@@ -296,28 +302,79 @@ class _SessionWorkTracker:
     def begin(self, generation: int) -> None:
         """A new session opened: its counts start empty and it is OPEN.
 
-        Generations are monotonic; a begin for an older generation than one
-        already seen is a caller bug and is refused (defensive only —
-        LiveTranslateApp only ever increments).
+        A begin for a generation whose close is in flight (CLOSING) is a
+        caller bug and is refused (defensive only — the state machine is
+        ENDING then and LiveTranslateApp never begins it). Any other
+        generation — never seen, retired after a supersede, or the
+        auto-created entry an adoption is reusing in place — may be
+        (re)begun: work ids and msg ids are unique for the process
+        lifetime, so a stale release from the previous lifecycle can never
+        touch the fresh counts.
         """
         with self._cond:
-            if generation <= self._highest_generation:
+            if self._gen_state.get(generation) == self.CLOSING:
                 return
-            self._highest_generation = generation
-            self._pending[generation] = {}
-            self._msgs[generation] = set()
-            self._gen_state[generation] = self.OPEN
-            self._cond.notify_all()
+            self._begin_locked(generation)
+
+    def _begin_locked(self, generation: int) -> None:
+        # Lock-held core of begin(); also used to adopt an auto-created
+        # entry in place (its pre-adoption counts must survive, so maps are
+        # never reset for a generation that is already tracked).
+        self._gen_state[generation] = self.OPEN
+        self._pending.setdefault(generation, {})
+        self._msgs.setdefault(generation, set())
+        self._auto_created.discard(generation)
+        self._highest_generation = max(self._highest_generation, generation)
+        # An auto-created entry for an older generation is obsolete the
+        # moment a real session begins (its counts, if any, drain through
+        # the ordinary terminal paths and the entry retires) — the map stays
+        # proportional to live sessions.
+        self._supersede_auto_created_locked(keep=generation)
+        self._cond.notify_all()
+
+    def _supersede_auto_created_locked(self, keep: int) -> None:
+        for gen in list(self._auto_created):
+            if gen == keep:
+                continue
+            self._auto_created.discard(gen)
+            self._gen_state[gen] = self.SUPERSEDED
+            self._pending.pop(gen, None)
+            self._msgs.pop(gen, None)
+            self._maybe_retire_locked(gen)
 
     def register(self, generation: int, work_id, kind: str = "asr") -> bool:
         """Count one *ordinary* unit of work (capture-thread segment).
 
-        Returns False when the generation is not OPEN — closing, closed, or
-        unknown: the caller must drop the segment, not enqueue it.
+        Returns False when the generation is CLOSING or SUPERSEDED — the
+        caller must drop the segment, not enqueue it.
+
+        An *unknown* generation is auto-created as OPEN so the count is
+        waitable: items produced while no session is tracked (subtitle-only
+        speech) still carry a count, because a legacy auto-open session
+        adopted moments later reuses this same generation (adoption does not
+        bump it — see LiveTranslateApp._adopt_auto_opened_session) and those
+        in-flight items are that meeting's opening work. Without the count,
+        an end racing them would close the session first and their speech
+        would be refused at write time. If no session ever adopts the
+        generation the counts still drain normally and nothing waits on
+        them (an ENDING wait only ever names a session's generation).
         """
         with self._cond:
-            if self._gen_state.get(generation) != self.OPEN:
+            state = self._gen_state.get(generation)
+            if state == self.SUPERSEDED or state == self.CLOSING:
                 return False
+            if state is None:
+                self._pending[generation] = {}
+                self._msgs[generation] = set()
+                self._gen_state[generation] = self.OPEN
+                self._auto_created.add(generation)
+                self._highest_generation = max(
+                    self._highest_generation, generation
+                )
+                # A newer generation being tracked means this auto-create is
+                # for a stale value (defensive only — the fence keeps enqueue
+                # snapshots current); retire any older auto-created entries.
+                self._supersede_auto_created_locked(keep=generation)
             self._pending[generation][work_id] = kind
             return True
 
@@ -358,9 +415,13 @@ class _SessionWorkTracker:
           it) and enqueue it;
         * ``"pass"``     — no session exists under this generation (nothing
           was ever begun, or the state was cleared by an app quit that was
-          itself superseded): enqueue *without* counting. This is the
-          subtitle-only mode — recognition runs for the live overlay, no
-          meeting is recorded, so there is nothing to wait on;
+          itself superseded): this is the subtitle-only mode — recognition
+          runs for the live overlay, no meeting is recorded. The item is
+          still counted (register() auto-creates the generation): if a
+          legacy auto-open session is adopted at this generation moments
+          later, the in-flight items are that meeting's opening work and
+          the ENDING wait must see them; with no session ever adopted the
+          counts drain normally and nothing waits on them;
         * ``"drop"``     — the generation is CLOSING/SUPERSEDED: the user
           ended this meeting; recognising the audio would produce a result
           with no meeting to land in (and its write would be refused by the
@@ -419,6 +480,7 @@ class _SessionWorkTracker:
             self._gen_state[generation] = self.SUPERSEDED
             self._pending.pop(generation, None)
             self._msgs.pop(generation, None)
+            self._auto_created.discard(generation)
             self._maybe_retire_locked(generation)
             self._cond.notify_all()
 
@@ -428,6 +490,7 @@ class _SessionWorkTracker:
             self._pending.clear()
             self._msgs.clear()
             self._gen_state.clear()
+            self._auto_created.clear()
             self._cond.notify_all()
 
     def _maybe_retire_locked(self, generation: int) -> None:
@@ -829,19 +892,23 @@ class LiveTranslateApp:
         if self._session_state == SessionState.ENDING:
             log.warning("begin_recording_session ignored: a session is ending")
             return None
-        if self._session_state != SessionState.IDLE:
-            log.warning(
-                "begin_recording_session ignored: session already %s",
-                self._session_state,
-            )
-            return None
         # Session first, pipeline second: create the writer session *before*
         # resuming capture, so nothing can be recorded into a session that
         # failed to open (no empty active meeting on a start failure). The
-        # whole open+bump runs under the session boundary lock (the producer
-        # fence), so a capture-thread snapshot can never observe the new
-        # generation with the old session or vice versa.
+        # whole open+bump+ACTIVE-flip runs under the session boundary lock
+        # (the producer fence), so a capture-thread snapshot can never
+        # observe the new generation with the old session or vice versa —
+        # and an ASR-thread adoption (the legacy auto-open path, same lock)
+        # can never interleave between the session opening and the state
+        # machine claiming it: exactly one of the two claims the session,
+        # one ACTIVE notification, one tracker generation.
         with self._session_boundary_lock:
+            if self._session_state != SessionState.IDLE:
+                log.warning(
+                    "begin_recording_session ignored: session already %s",
+                    self._session_state,
+                )
+                return None
             session_id = self._transcript.begin_session()
             if session_id is None:
                 # Auto-save disabled or the writer could not open files (the
@@ -857,22 +924,85 @@ class LiveTranslateApp:
             self._session_work.begin(self._session_generation)
             self._record_session_info()
             self._publish_transcript_paths()
-        if not self._running:
-            # A recording session requires a live pipeline; the app-level
-            # start (main()'s handler) refuses earlier, this guard covers
-            # stray callers.
-            log.warning(
-                "begin_recording_session: pipeline not running; closing the session"
-            )
-            with self._session_boundary_lock:
+            if not self._running:
+                # A recording session requires a live pipeline; the app-level
+                # start (main()'s handler) refuses earlier, this guard covers
+                # a capture death flipping _running at any moment. The state
+                # has not flipped to ACTIVE yet, so there is nothing to
+                # un-notify: close what we opened, under the same fence.
+                log.warning(
+                    "begin_recording_session: pipeline not running; "
+                    "closing the session"
+                )
                 self._transcript.end_session()
                 self._session_work.supersede(self._session_generation)
-            return None
+                return None
+            self._notify_session_state(SessionState.ACTIVE, session_id)
         if self._paused:
             self.resume()
-        self._notify_session_state(SessionState.ACTIVE, session_id)
         log.info("Recording session started: %s", session_id)
         return session_id
+
+    def _adopt_auto_opened_session(self, msg_id, msg_generation: int) -> int:
+        """The single authoritative legacy auto-open adoption.
+
+        Called from the ASR thread right after an entry recorded into a
+        writer session the state machine does not track — the writer
+        auto-opened it because an entry arrived while the pipeline records
+        and no explicit session exists. Both entry paths
+        (``_process_segment`` / ``_process_segment_text``) go through here;
+        the adoption must exist exactly once.
+
+        The adopted session reuses the CURRENT generation — adoption never
+        bumps it. Items already enqueued by the capture thread (before the
+        auto-open) carry this same generation and are this meeting's
+        opening speech: a bump would make the stale-segment guard refuse
+        them and their audio would be lost. Those items are counted from
+        enqueue on (see ``_enqueue_asr`` and
+        ``_SessionWorkTracker.register``'s auto-create), so an ENDING wait
+        covers them; the entry being processed right now registers its
+        translation count here when its own earlier registration was
+        refused (the generation had nothing tracked yet).
+
+        Returns the generation the caller must use for this msg's
+        translation bookkeeping from here on (release paths key to it).
+        """
+        if self._session_state != SessionState.IDLE:
+            # A tracked session is already live. The caller's stale-segment
+            # guard has already dropped items from before a begin/end
+            # boundary, so this entry registered its msg count under the
+            # live generation — nothing to adopt.
+            return msg_generation
+        with self._session_boundary_lock:
+            if self._session_state != SessionState.IDLE:
+                # An explicit begin (or another entry's adoption) claimed
+                # the session while this call waited for the fence. The
+                # entry landed in that same writer session (begin_session
+                # returns an open session unchanged), so re-key this msg's
+                # count to the live generation — the ENDING wait must cover
+                # it. The item's own registration (if any, under its
+                # pre-boundary generation) is released first so the count
+                # stays exactly-once; an idempotent re-registration when the
+                # generations are the same.
+                self._session_work.release_msg(msg_generation, msg_id)
+                self._session_work.register_msg(
+                    self._session_generation, msg_id
+                )
+                return self._session_generation
+            adopted = self._transcript.active_session()
+            if not adopted:
+                # The session this entry recorded into is already gone (an
+                # end landed between the write and the fence): nothing to
+                # adopt, and the tracker refuses counts for it — the msg's
+                # release will no-op either way.
+                return msg_generation
+            # No bump (see the docstring). begin() adopts an auto-created
+            # entry in place — its pre-adoption queue-item counts survive,
+            # which is exactly what an ENDING wait must see.
+            self._session_work.begin(self._session_generation)
+            self._session_work.register_msg(self._session_generation, msg_id)
+            self._notify_session_state(SessionState.ACTIVE, adopted)
+            return self._session_generation
 
     def end_recording_session(self, expected_session: str | None = None) -> bool:
         """Finish the current meeting without stopping the app (the
@@ -2869,28 +2999,13 @@ class LiveTranslateApp:
             # registration — the loop's finally releases it only after this
             # whole processing returns.
             self._session_work.register_msg(msg_generation, msg_id)
-        # Legacy auto-open path: the writer just opened a session because an
-        # entry arrived while none was begun explicitly. Adopt it into the
-        # state machine so the UI (button, records page, AI-minutes gate)
-        # tracks the same session the writer is writing — including the work
-        # tracker: without the begin() below, every later segment of this
-        # adopted session would run uncounted, so ending the meeting would
-        # not wait for anything.
-        if recorded and self._session_state == SessionState.IDLE:
-            with self._session_boundary_lock:
-                adopted = self._transcript.active_session()
-                if adopted:
-                    self._session_generation += 1
-                    self._session_work.begin(self._session_generation)
-                    # This very msg was registered under the pre-adoption
-                    # generation (refused — nothing was open); re-register
-                    # under the adopted session so its translation is
-                    # waited on.
-                    self._session_work.register_msg(
-                        self._session_generation, msg_id
-                    )
-                    msg_generation = self._session_generation
-                    self._notify_session_state(SessionState.ACTIVE, adopted)
+            # Legacy auto-open adoption — the single authoritative helper,
+            # shared with _process_segment_text. No generation bump: items
+            # enqueued before the auto-open carry this generation and are
+            # this meeting's opening speech (see the helper).
+            msg_generation = self._adopt_auto_opened_session(
+                msg_id, msg_generation
+            )
 
         # Store for subtitle window (translation will be added later)
         self._last_original = original_text
@@ -3101,7 +3216,9 @@ class LiveTranslateApp:
         Returns True if any sentences were committed. ``generation``/
         ``expected_session`` are the interim queue item's session identity,
         threaded into each committed sentence so a session superseded
-        mid-pass cannot receive them."""
+        mid-pass cannot receive them. A sentence the identity guard refuses
+        is not consumed: no trim, no echo-tail update — its audio stays in
+        the buffer for a later pass (see _process_segment_text's return)."""
         with self._vad_lock:
             peek = self._vad.peek_buffer()
         if peek is None:
@@ -3149,14 +3266,52 @@ class LiveTranslateApp:
         # All but last are complete; last is still being spoken
         complete = sentences[:-1]
 
-        committed_text = ""
+        # Output committed sentences first: the trim point and the echo
+        # tail below are derived from what *actually* committed. A sentence
+        # the identity guard refuses (stale session generation, or a
+        # session-mismatch write — see _process_segment_text) landed in no
+        # session and no overlay entry, so it is NOT consumed: it stays out
+        # of the committed prefix and its audio stays in the VAD buffer for
+        # a later pass. The pass's remaining sentences carry the same
+        # identity, so the loop stops at the first refusal.
+        committed_parts: list[str] = []
+        actually_committed = False
+        consumed_any = False
         for sent in complete:
-            committed_text += sent
+            text = sent.strip()
+            if not text:
+                continue
+            if self._is_short_utterance(text):
+                self._buffer_interim_fragment(text)
+                # Buffering still consumes the audio: the trim and the echo tail
+                # below must run, or the next pass re-recognizes the same words
+                # and appends them to _interim_pending all over again.
+                committed_parts.append(text)
+                consumed_any = True
+                continue
 
-        if not committed_text.strip():
+            if self._interim_pending:
+                text = self._interim_pending + text
+                self._interim_pending = ""
+
+            if not self._process_segment_text(
+                text, result_lang, asr_ms,
+                generation=generation, expected_session=expected_session,
+            ):
+                break
+            committed_parts.append(text)
+            actually_committed = True
+            consumed_any = True
+
+        if not consumed_any:
+            # Nothing consumed — every sentence was refused (or there was
+            # nothing to commit): the buffer, the echo tail and the interim
+            # state stay untouched so a later pass can retry them.
             return False
+        committed_text = "".join(committed_parts)
 
-        # Determine trim point
+        # Determine trim point — from the committed prefix only, so audio
+        # for refused sentences is never trimmed away.
         total_samples = len(audio)
         if use_word_ts and result.get("words"):
             words = result["words"]
@@ -3185,34 +3340,6 @@ class LiveTranslateApp:
             if trim_samples < min_trim and trim_samples > 0:
                 trim_samples = min(min_trim, total_samples // 2)
 
-        # Output committed sentences
-        actually_committed = False
-        consumed_any = False
-        for sent in complete:
-            text = sent.strip()
-            if not text:
-                continue
-            if self._is_short_utterance(text):
-                self._buffer_interim_fragment(text)
-                # Buffering still consumes the audio: the trim and the echo tail
-                # below must run, or the next pass re-recognizes the same words
-                # and appends them to _interim_pending all over again.
-                consumed_any = True
-                continue
-
-            if self._interim_pending:
-                text = self._interim_pending + text
-                self._interim_pending = ""
-
-            self._process_segment_text(text, result_lang, asr_ms,
-                                       generation=generation,
-                                       expected_session=expected_session)
-            actually_committed = True
-            consumed_any = True
-
-        if not consumed_any:
-            return False
-
         if trim_samples > 0:
             with self._vad_lock:
                 self._vad.trim_front(trim_samples)
@@ -3222,7 +3349,7 @@ class LiveTranslateApp:
 
         self._interim_active = True
         log.info(
-            f"Interim ASR: consumed {len(complete)} sentence(s) "
+            f"Interim ASR: consumed {len(committed_parts)} sentence(s) "
             f"({'committed' if actually_committed else 'buffered only'}), "
             f"trimmed {trim_samples / 16000:.2f}s"
         )
@@ -3263,21 +3390,29 @@ class LiveTranslateApp:
         segment case exactly as in _process_segment (an interim sentence
         committed by a queue item whose session ended while a newer one
         began must not land in the newer meeting); ``expected_session`` is
-        the writer-side identity check for the same purpose."""
+        the writer-side identity check for the same purpose.
+
+        Returns True when the sentence was accounted for — recorded,
+        displayed, filtered as noise, or failed-but-closed-out — and False
+        only when an identity guard refused it (stale session generation,
+        or the writer's session mismatch): the caller (the interim path)
+        must treat a refused sentence as *not consumed*, so its audio stays
+        in the VAD buffer for a later pass instead of being trimmed away.
+        """
         if generation is not None and generation != self._session_generation:
             log.info(
                 "Dropping interim text from superseded session generation %s",
                 generation,
             )
-            return
+            return False
         original_text = text.strip()
         if not original_text or not any(c.isalnum() for c in original_text):
-            return
+            return True
 
         asr_lang_setting = self._get_asr_language_setting()
         if asr_lang_setting != "auto" and source_lang != asr_lang_setting:
             log.info(f"Language filter: expected '{asr_lang_setting}' but got '{source_lang}', discarding: {original_text[:60]}")
-            return
+            return True
 
         self._asr_count += 1
         self._msg_id += 1
@@ -3299,24 +3434,17 @@ class LiveTranslateApp:
                 msg_id, "interim text belongs to a closed session",
                 user_visible=False,
             )
-            return
+            return False
         recorded = result == TranscriptWriter.WRITE_RECORDED
         if recorded:
             self._session_work.register_msg(msg_generation, msg_id)
-        # Legacy auto-open adoption (see _process_segment): begin() the
-        # tracker for the adopted generation and re-register this msg, so
-        # ending the meeting later waits for this translation.
-        if recorded and self._session_state == SessionState.IDLE:
-            with self._session_boundary_lock:
-                adopted = self._transcript.active_session()
-                if adopted:
-                    self._session_generation += 1
-                    self._session_work.begin(self._session_generation)
-                    self._session_work.register_msg(
-                        self._session_generation, msg_id
-                    )
-                    msg_generation = self._session_generation
-                    self._notify_session_state(SessionState.ACTIVE, adopted)
+            # Legacy auto-open adoption — the single authoritative helper,
+            # shared with _process_segment. No generation bump: items
+            # enqueued before the auto-open carry this generation and are
+            # this meeting's opening speech (see the helper).
+            msg_generation = self._adopt_auto_opened_session(
+                msg_id, msg_generation
+            )
 
         self._last_original = original_text
         self._last_msg_id = msg_id
@@ -3364,6 +3492,8 @@ class LiveTranslateApp:
                 self._finalize_untranslated(
                     msg_id, "translation executor shut down", user_visible=False
                 )
+        return True
+
     def _process_interim_final(self, speech_segment, work_id=None, generation=None,
                                expected_session=None):
         """Handle VAD flush after interim outputs were already made."""
@@ -3567,12 +3697,20 @@ class LiveTranslateApp:
             # CLOSING enqueue); kept as a defensive guard for stray callers.
             log.debug("Dropping %s segment for a closing/closed session", seg_type)
             return
-        work_id = None
-        if decision == "register":
-            work_id = self._next_session_work_id()
-            if not self._session_work.register(generation, work_id, seg_type):
+        # Both the session-tracked item ("register") and the subtitle-only
+        # one ("pass" — no session exists yet) carry a work count: a legacy
+        # auto-open session adopted moments later reuses this same
+        # generation (adoption never bumps it — see
+        # _adopt_auto_opened_session), so items already in flight are that
+        # meeting's opening speech and the ENDING wait must cover them.
+        # register() auto-creates an unknown generation as OPEN; a
+        # CLOSING/SUPERSEDED one refuses, and only then does a "register"
+        # item stay dropped while a "pass" item falls back to uncounted.
+        work_id = self._next_session_work_id()
+        if not self._session_work.register(generation, work_id, seg_type):
+            if decision == "register":
                 return
-        # decision == "pass": subtitle-only (no session to count or wait on)
+            work_id = None
         item = (seg_type, segment, work_id, generation, expected_session)
         try:
             self._asr_queue.put_nowait(item)

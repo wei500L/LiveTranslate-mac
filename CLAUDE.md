@@ -133,6 +133,13 @@ transcript_writer.py     Per-session meeting record: original/translation/all te
                          Entries are released in utterance order (translations
                          finish out of order on the worker pool), and read_session_meta()
                          / delete_session() back the Meeting Records panel page.
+                         `delete_session()` enumerates a session's files by
+                         exact name (`_STAMP_KIND_SUFFIXES` + the summary
+                         pair + each exact name's `.tmp*` staged siblings)
+                         — never a `livetrans_{stamp}_*` prefix glob: a bare
+                         stamp is the prefix of its same-second suffixed
+                         siblings (`_01`), and the glob deleted the sibling
+                         meeting's whole file set along with the target's.
                          Explicit session lifecycle: `begin_session()` /
                          `end_session()` / `active_session()` /
                          `has_active_session()`; `set_recording(True/False)`
@@ -466,9 +473,13 @@ linearized lifecycle inside one lock/Condition —
 
 1. **queue-item work** — the capture thread's segments go through
    `admit(generation)`, which returns `"register"` (OPEN: count + enqueue),
-   `"pass"` (no session exists: enqueue *without* counting — the
-   subtitle-only mode, recognition for the live overlay with nothing
-   recorded), or `"drop"` (CLOSING/SUPERSEDED: the segment is discarded
+   `"pass"` (no session exists — the subtitle-only mode, recognition for the
+   live overlay with nothing recorded; the item is *still counted*:
+   `register()` auto-creates the unknown generation as OPEN, because a
+   legacy auto-open session adopted moments later reuses this same
+   generation and those in-flight items are that meeting's opening work —
+   with no session ever adopted the counts drain normally and nothing waits
+   on them), or `"drop"` (CLOSING/SUPERSEDED: the segment is discarded
    before the queue). Items carry their registration generation as the
    fourth tuple element; `_asr_loop`'s `finally` releases the count under
    *that* generation (a begin racing the queue can neither steal the
@@ -492,9 +503,8 @@ before the end is therefore enqueued and counted under the still-OPEN
 generation — the last utterance is kept, never silently dropped; audio
 after the end never reaches the VAD. `_session_snapshot()` reads the
 generation and the writer's session stamp together under the same lock, and
-every writer of `_session_generation` (begin, adoption, the end's bump,
-`stop()`) holds it, so a queue item's identity pair can never straddle a
-boundary.
+every writer of `_session_generation` (begin, the end's bump, `stop()`)
+holds it, so a queue item's identity pair can never straddle a boundary.
 
 Stale-segment guard, three layers: `_process_segment`/
 `_process_segment_text` drop any queue item whose generation is no longer
@@ -511,11 +521,21 @@ take the same `session=` argument; `_complete` has **no orphan-write path**
 (a translation without a recorded original is discarded — that path was how
 a refused entry's late translation could land in the next meeting's files).
 A requeue failure in `_drain_interim_duplicates` releases the displaced
-item's work count. Legacy auto-open adoption (the IDLE branch in
-`_process_segment`/`_process_segment_text`) runs under the boundary lock,
-calls `tracker.begin()` for the adopted generation and re-registers the
-adopting msg, so an adopted session's work is counted the same as an
-explicit one.
+item's work count. Legacy auto-open adoption is *one* authoritative helper,
+`_adopt_auto_opened_session` (called by both `_process_segment` and
+`_process_segment_text` after a recorded write): it reuses the **current**
+generation — adoption never bumps it, because items enqueued before the
+auto-open carry that generation and are the same meeting's opening speech (a
+bump made the stale-segment guard discard them, silently losing speech).
+`begin()` adopts an auto-created entry in place, so the pre-adoption queue
+counts survive into the ENDING wait. `begin_recording_session` flips to
+ACTIVE *inside* the boundary lock, so adoption and an explicit begin can
+never both claim the session — exactly one ACTIVE notification and one live
+tracker generation. `_process_segment_text` returns False only when an
+identity guard refused the sentence; `_do_interim_asr` then treats the
+refused sentence as *not consumed* — excluded from the committed prefix, so
+neither the audio trim nor the echo-tail update accounts for it and a later
+pass can still commit it.
 
 End-thread fault tolerance: `_run_session_end` is wrapped by its caller —
 a failure anywhere (flush, wait, `end_session`) is logged, the writer is
