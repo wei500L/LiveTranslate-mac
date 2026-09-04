@@ -22,18 +22,20 @@ Pure logic: no Qt, no network, so the offline test job covers all of it.
 from __future__ import annotations
 
 import hashlib
-import itertools
 import json
 import logging
 import os
 import re
+import uuid
 from datetime import datetime
 from pathlib import Path
 
 log = logging.getLogger("LiveTranslate.Records")
 
-# Per-call suffix for staged atomic writes (see _atomic_write_text).
-_STAGE_SEQ = itertools.count()
+# Staged atomic writes use a per-call UUID suffix (see _staged_path): the
+# writer module stages the *same* sidecar file with the same name shape, and
+# pid+counter counters are per-module — two independent counters can agree,
+# letting concurrent staged writes replace each other's temp file.
 
 SUMMARY_KIND = "summary"
 SUMMARY_META_KIND = "summary_meta"
@@ -149,6 +151,14 @@ def list_sessions(base_dir: Path, active_session: str | None = None,
         #   writers that pre-dated that invariant may still show an "ended"
         #   snapshot from a mid-session sidecar rewrite — the footer check
         #   stays authoritative for them.
+        #
+        # An ENDING row is neither: the close is in flight (the writer has
+        #   stopped reporting it active, and the sidecar still says "active"
+        #   until the seal commits). Classifying it "interrupted" for those
+        #   seconds contradicted its own is_ending flag — one record could
+        #   be simultaneously ending and interrupted, and any consumer
+        #   keying on interrupted (filters, exports, permissions) would
+        #   misread a meeting mid-close as a crash-left one.
         status = record.get("session_status")
         if status is not None:
             record["ended_cleanly"] = status == "completed"
@@ -158,7 +168,9 @@ def list_sessions(base_dir: Path, active_session: str | None = None,
                 or bool(record.get("ended"))
             )
         record["interrupted"] = bool(
-            not record["is_active"] and not record["ended_cleanly"]
+            not record["is_active"]
+            and not record["is_ending"]
+            and not record["ended_cleanly"]
         )
         # The committed state is "the pair loads and verifies" — a meta without
         # a matching body (interrupted commit) must not show as summarized.
@@ -486,14 +498,17 @@ def save_summary(
     """Write the summary pair as one commit, meta last. Meta is scrubbed.
 
     Commit protocol (single-replace-pair, no true cross-file transaction):
-    both files are staged as ``.tmp`` siblings first, so a failure before the
-    commit phase leaves the old pair untouched. The body is then replaced,
-    and the meta — which carries ``content_sha256`` — is replaced last. The
-    meta is therefore the commit marker: readers verify its hash against the
-    body, so a crash between the two replaces can never present new metadata
-    over an old body as a valid summary. A crash the other way (meta replaced,
-    body not) cannot occur, and a leftover ``.tmp`` from a crash matches no
-    listing glob and is overwritten by the next save.
+    both files are staged as uniquely-suffixed ``.tmp`` siblings first, so a
+    failure before the commit phase leaves the old pair untouched — and two
+    concurrent saves (a generation finishing while the user edits, or two
+    workers) never share a staged name, so one save cannot commit the other
+    save's body with its own meta. The body is then replaced, and the meta —
+    which carries ``content_sha256`` — is replaced last. The meta is
+    therefore the commit marker: readers verify its hash against the body,
+    so a crash between the two replaces can never present new metadata over
+    an old body as a valid summary. A crash the other way (meta replaced,
+    body not) cannot occur; a leftover ``.tmp*`` from a crash matches no
+    listing glob and is removed by ``delete_summary``.
     """
     base_dir = Path(base_dir)
     md_path, meta_path = _summary_paths(base_dir, stamp)
@@ -503,8 +518,8 @@ def save_summary(
     safe_meta["content_sha256"] = hashlib.sha256(
         content.encode("utf-8")
     ).hexdigest()
-    md_tmp = md_path.with_name(md_path.name + ".tmp")
-    meta_tmp = meta_path.with_name(meta_path.name + ".tmp")
+    md_tmp = _staged_path(md_path)
+    meta_tmp = _staged_path(meta_path)
     try:
         md_tmp.write_text(content, encoding="utf-8")
         meta_tmp.write_text(
@@ -529,7 +544,7 @@ def delete_summary(base_dir: Path, stamp: str) -> bool:
     removed = False
     # Includes the staged siblings a crashed commit can leave behind —
     # both the legacy fixed ".tmp" names and the unique-suffixed staged
-    # names (".tmp<pid>.<n>") — so a delete never strands half-written
+    # names (".tmp<pid>.<uuid>") — so a delete never strands half-written
     # files in the transcripts folder.
     candidates = [md_path, meta_path,
                   md_path.with_name(md_path.name + ".tmp"),
@@ -641,8 +656,17 @@ def _atomic_write_text(path: Path, content: str):
     # staged meta writes let two concurrent writers replace each other's
     # temp file. (The coordinated-writer rule keeps the *final* file
     # single-writer; this keeps even the staging area collision-free.)
-    tmp = path.with_name(
-        f"{path.name}.tmp{os.getpid()}.{next(_STAGE_SEQ)}"
-    )
+    tmp = _staged_path(path)
     tmp.write_text(content, encoding="utf-8")
     tmp.replace(path)
+
+
+def _staged_path(path: Path) -> Path:
+    """A per-call staged sibling. A pid+counter suffix is unique only
+    within this module — transcript_writer stages the *same* sidecar file
+    with the same name shape, and two independent counters can agree, so
+    the suffix carries a UUID (collision-free across modules and
+    processes)."""
+    return path.with_name(
+        f"{path.name}.tmp{os.getpid()}.{uuid.uuid4().hex[:10]}"
+    )

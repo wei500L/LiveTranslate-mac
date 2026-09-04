@@ -260,8 +260,10 @@ class ControlPanel(QWidget):
     delete_cache_and_quit_requested = pyqtSignal(list)
     # The records page's end-recording button: request-only. The app's
     # end_recording_session() is the single implementation; the panel just
-    # forwards the request.
-    end_recording_requested = pyqtSignal()
+    # forwards the request. The session id rides along so the app can
+    # refuse when the meeting open at handling time is not the one the
+    # user clicked on.
+    end_recording_requested = pyqtSignal(str)
 
     def __init__(self, config, saved_settings=None):
         super().__init__()

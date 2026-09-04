@@ -166,7 +166,15 @@ transcript_writer.py     Per-session meeting record: original/translation/all te
                          stamp), `_session_open` is set only when every required
                          file opened, and the first sidecar write is
                          `create_only` — a fresh session can never overwrite
-                         another session's meta. `write_original(..., session=)`
+                         another session's meta. Staged sidecar writes use a
+                         per-call UUID suffix (`.tmp<pid>.<uuid>`): a pid+
+                         counter is unique only within one module, and
+                         meeting_records stages the same file with the same
+                         name shape, so two counters could agree. `rename_session(title,
+                         expected_session=)` verifies the expected stamp
+                         inside the lock — an end+begin racing the rename
+                         dialog must not retitle the new meeting.
+                         `write_original(..., session=)`
                          takes the caller's expected session stamp and verifies
                          it inside the writer's lock: an entry whose audio
                          belongs to a session that is no longer open (an end
@@ -215,7 +223,13 @@ meeting_records.py       Records data layer: list_sessions/parse_session (Markdo
                          `content_sha256` in the meta — the meta is the commit
                          marker and `load_summary()` verifies the hash, so an
                          interrupted commit never presents new metadata over an
-                         old body. An orphan body (meta missing or unreadable)
+                         old body. Both files stage under uniquely-suffixed
+                         names (`.tmp<pid>.<uuid>`) — a fixed `.tmp` let two
+                         concurrent saves (a generation finishing while a
+                         manual edit saves) commit one save's body with the
+                         other's meta; `delete_summary()` globs `.tmp*` so a
+                         crashed commit's staged siblings never linger. An
+                         orphan body (meta missing or unreadable)
                          also loads as absent: without the marker there is no
                          committed summary. A legacy meta without
                          `content_sha256` is accepted (pre-field summaries are
@@ -232,7 +246,13 @@ meeting_records.py       Records data layer: list_sessions/parse_session (Markdo
                          footer or an `ended` timestamp** — the status is
                          committed last and outranks them. Sidecars without
                          the field (older writers) fall back to the footer /
-                         `ended` heuristics unchanged. The records page
+                         `ended` heuristics unchanged. `interrupted` is
+                         mutually exclusive with `is_ending`: a mid-close
+                         record (writer no longer reports it active, sidecar
+                         still `active` until the seal commits) is ending,
+                         NOT interrupted — one record carrying both made
+                         filters/exports/permissions misread a meeting
+                         mid-close as a crash-left one. The records page
                          labels interrupted sessions "Interrupted" instead
                          of presenting a half-recorded meeting as complete.
                          Stamp sorting goes through
@@ -263,9 +283,41 @@ meeting_records_page.py  The records-center page (ControlPanel "Meeting Records"
                          (from LiveTranslateApp's bridge); the page never
                          derives it, and AI minutes are refused while
                          ACTIVE/PAUSED/ENDING. `end_recording_requested` is a
-                         request-only signal — the app's
-                         `end_recording_session()` is the single
-                         implementation. Dependency injection is public API:
+                         request-only signal carrying the target session id —
+                         the app's `end_recording_session()` is the single
+                         implementation, and main() verifies the carried id
+                         against the writer's live session before calling it,
+                         so a click cannot end "whatever is active now".
+                         Every record-scoped operation carries its target
+                         explicitly and validates it twice: the cached record
+                         flags (from the last refresh) gate the UI
+                         (`_update_action_availability` covers end/generate/
+                         edit/delete/export in one pass; a running worker's
+                         controls stay disabled), and the handler re-asks the
+                         writer at click time (`_live_session_role`:
+                         the app-level ENDING stamp outranks a writer still
+                         reporting the session active). Delete also refuses
+                         while the writer still holds that session's file
+                         paths (`session_paths()`), covering a half-dead
+                         close neither active_session() nor ending_session()
+                         reports. Rename routes live sessions through the
+                         writer's `rename_session(title, expected_session)`.
+                         Manual minutes edits fix the session identity and
+                         the original content hash at editor open and
+                         revalidate both at save (`_save_edited_summary`):
+                         a selection switched by a background refresh, or a
+                         generation that completed under the dialog, refuses
+                         the save rather than writing another meeting's files
+                         or discarding newer content. Export refuses while
+                         the record is ENDING (a mid-seal file set can miss
+                         the final entries; an active record stays
+                         exportable and is flagged as a snapshot). The list
+                         rebuild preserves the selection by session identity
+                         (`_refill_list`): clear() resets currentItem, so an
+                         unconditional setCurrentRow(0) re-fired the load on
+                         every refresh — which cancelled a running summary
+                         worker; only a real session switch cancels now.
+                         Dependency injection is public API:
                          `set_transcript_writer(writer)` /
                          `set_summary_registry(registry)`. Page-owned
                          single-shot QTimers (`_layout_settle_timer`,

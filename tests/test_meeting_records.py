@@ -198,6 +198,35 @@ def test_ending_session_marks_only_its_own_row(tmp_path):
     assert by_stamp["20260102_090000"]["is_active"] is False
 
 
+def test_ending_row_is_never_also_interrupted(tmp_path):
+    """A session mid-close is not "interrupted": during ENDING the writer
+    has stopped reporting it active and the sidecar still says "active"
+    (the seal has not committed yet), so the old interrupted formula
+    (not active, not ended cleanly) fired on it — one record could be
+    is_ending=True and interrupted=True at once, and any consumer keying
+    on interrupted (filters, exports, permissions) misread a meeting
+    mid-close as a crash-left one."""
+    # session_status=active on disk: exactly what a live sidecar carries
+    # while the seal is still writing.
+    _write_status_session(
+        tmp_path, "20260101_090000", {"session_status": "active"},
+        with_footer=False,
+    )
+    sessions = records.list_sessions(
+        tmp_path,
+        active_session=None,
+        ending_session="20260101_090000",
+    )
+    row = sessions[0]
+    assert row["is_ending"] is True
+    assert row["interrupted"] is False
+    # Once the ENDING flag is gone, the same on-disk state (status still
+    # active, no footer) is genuinely interrupted — a crash-left record.
+    sessions = records.list_sessions(tmp_path)
+    assert sessions[0]["is_ending"] is False
+    assert sessions[0]["interrupted"] is True
+
+
 def test_state_badge_is_per_record_not_global():
     """A global "ending" must never paint rows that are not the closing
     session: the badge keys on the record's own is_ending/is_active, so a
@@ -272,11 +301,13 @@ def test_source_hash_is_stable_and_content_sensitive(tmp_path):
     h1 = records.source_hash(entries)
     assert h1 == records.source_hash(records.parse_session(tmp_path, sessions[0]))
     entries[0]["translation"] = "changed"
-    assert records.source_hash(entries) != h1
-    # Language tags are display metadata, not content
+    h2 = records.source_hash(entries)
+    assert h2 != h1
+    # Language tags are display metadata, not content: clearing them must
+    # not move the digest (the content fields are unchanged from h2's state).
     for e in entries:
         e["language"] = None
-    assert records.source_hash(entries) != h1 or True  # only translation changed above
+    assert records.source_hash(entries) == h2
 
 
 def test_summary_becomes_stale_when_record_changes(tmp_path):
@@ -345,8 +376,44 @@ def test_summary_meta_never_stores_credentials(tmp_path):
 
 def test_summary_writes_are_atomic_no_tmp_left_behind(tmp_path):
     records.save_summary(tmp_path, "20260101_090000", "content", {})
-    leftovers = list(tmp_path.glob("*.tmp"))
+    # Unique staged names end in ".tmp<pid>.<uuid>", so the glob must cover
+    # the whole staged-name family, not just the legacy exact ".tmp".
+    leftovers = list(tmp_path.glob("*.tmp*"))
     assert leftovers == []
+
+
+def test_staged_names_are_unique_across_calls_and_modules():
+    """The records layer and the transcript writer stage the *same* final
+    file (the session sidecar) with the same name shape. With per-module
+    pid+counter suffixes both counters could emit ".tmp<pid>.0" for one
+    path, letting a staged write replace another module's temp mid-flight;
+    the suffixes must be unique across modules (UUID-based)."""
+    from pathlib import Path
+
+    from transcript_writer import TranscriptWriter
+
+    target = Path("/nowhere/livetrans_20260101_090000_meta.json")
+    names = set()
+    for _ in range(100):
+        names.add(str(records._staged_path(target)))
+        names.add(str(TranscriptWriter._staged_meta_path(target)))
+    assert len(names) == 200
+
+
+def test_delete_summary_removes_unique_suffixed_staged_siblings(tmp_path):
+    """A crash mid-commit can leave uniquely-suffixed staged siblings
+    behind; delete_summary must remove those too, not only the exact
+    legacy ".tmp" names."""
+    md, meta = records._summary_paths(tmp_path, "20260101_090000")
+    staged = [
+        md.with_name(md.name + ".tmp123.0123456789abcdef"),
+        meta.with_name(meta.name + ".tmp123.fedcba9876543210"),
+        md.with_name(md.name + ".tmp"),  # legacy fixed name
+    ]
+    for path in staged:
+        path.write_text("half-written", encoding="utf-8")
+    assert records.delete_summary(tmp_path, "20260101_090000")
+    assert not list(tmp_path.glob("livetrans_20260101_090000_summary*"))
 
 
 def test_broken_summary_pair_loads_as_absent(tmp_path):

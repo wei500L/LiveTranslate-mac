@@ -120,11 +120,13 @@ def test_a_translation_without_an_original_is_discarded(tmp_path):
     whatever session was open — the exact channel through which a refused
     entry's late translation could land in the *next* meeting's files."""
     writer = _writer(tmp_path)
+    writer.write_original(1, "00:00:01", "recorded line")  # opens the session
     stamp = writer._session_ts
     result = writer.write_translation(99, "orphan")
     writer.close()
     assert result == TranscriptWriter.WRITE_SKIPPED
     text = (tmp_path / f"livetrans_{stamp}_all.txt").read_text("utf-8")
+    assert "recorded line" in text
     assert "orphan" not in text
 
 
@@ -378,9 +380,9 @@ def test_listing_survives_a_session_with_no_sidecar(tmp_path):
 
 def test_deleting_a_session_removes_all_of_its_files(tmp_path):
     writer = _writer(tmp_path)
-    stamp = writer._session_ts
     writer.write_original(1, "00:00:01", "hello")
     writer.write_translation(1, "hola")
+    stamp = writer._session_ts  # saved: close clears it
     writer.close()
     assert list(tmp_path.glob(f"livetrans_{stamp}_*"))
 
@@ -586,8 +588,8 @@ def test_abort_session_after_failed_close_keeps_files_and_clears_state(tmp_path)
     in-memory session state, so the next begin starts clean and the records
     layer classifies the meeting as interrupted (no footer)."""
     writer = _writer(tmp_path)
-    stamp = writer._session_ts
     writer.write_original(1, "09:00:00", "kept line")
+    stamp = writer._session_ts  # saved: close/abort clears it
 
     # Force the seal to fail after the state has been written to.
     import transcript_writer as tw
@@ -640,8 +642,8 @@ def test_failed_original_write_rolls_back_memory_and_counts(tmp_path, monkeypatc
     may survive in memory: _pending/_order/_entry_sessions hold nothing the
     seal could re-emit, and speech_seconds never counted it."""
     writer = _writer(tmp_path)
-    stamp = writer._session_ts
     writer.write_original(1, "09:00:00", "good line", duration=1.0)
+    stamp = writer._session_ts  # saved: close clears it
 
     # Sabotage the file write for the next entry only.
     real_write = writer._write_locked
@@ -676,9 +678,9 @@ def test_footer_write_failure_seals_as_interrupted(tmp_path, monkeypatch):
     (no exception — the failure is a verdict, not a crash) and the final
     sidecar carries session_status=interrupted."""
     writer = _writer(tmp_path)
-    stamp = writer._session_ts
     writer.write_original(1, "09:00:00", "hello")
     writer.write_translation(1, "hola")
+    stamp = writer._session_ts  # saved: close clears it
 
     def failing_footer():
         return False
@@ -702,8 +704,8 @@ def test_final_meta_write_failure_leaves_no_completed_verdict(tmp_path, monkeypa
     written, the on-disk sidecar keeps the live "active" status — never a
     fabricated "completed" — and the returned summary says interrupted."""
     writer = _writer(tmp_path)
-    stamp = writer._session_ts
     writer.write_original(1, "09:00:00", "hello")
+    stamp = writer._session_ts  # saved: close clears it
 
     monkeypatch.setattr(
         writer, "_write_meta_locked", lambda *a, **k: False
@@ -726,6 +728,7 @@ def test_live_sidecar_carries_active_status(tmp_path):
     its sidecar from the very first commit — the records layer's primary
     signal for "still recording"."""
     writer = _writer(tmp_path)
+    writer.write_original(1, "09:00:00", "hello")  # auto-opens the session
     stamp = writer._session_ts
     meta = json.loads(
         (tmp_path / f"livetrans_{stamp}_meta.json").read_text("utf-8")
@@ -740,8 +743,8 @@ def test_rename_live_session_goes_through_the_writer_lock(tmp_path):
     writer. The rename lands in the sidecar immediately, and the seal's
     final commit still carries it (the whitelisted user-field merge)."""
     writer = _writer(tmp_path)
-    stamp = writer._session_ts
     writer.write_original(1, "09:00:00", "hello")
+    stamp = writer._session_ts  # saved: close clears it
 
     assert writer.rename_session("课前准备") is True
     live = json.loads(
@@ -768,8 +771,8 @@ def test_rename_refused_while_ending(tmp_path):
     """ENDING refuses: the seal owns the sidecar then, and a concurrent
     rename write could overwrite the just-committed status."""
     writer = _writer(tmp_path)
-    stamp = writer._session_ts
     writer.write_original(1, "09:00:00", "hello")
+    stamp = writer._session_ts  # saved: close clears it
 
     writer._ending = True  # the end_session window
     try:
@@ -783,6 +786,38 @@ def test_rename_refused_while_ending(tmp_path):
     assert "title" not in sealed
 
 
+def test_rename_expected_session_closes_the_identity_chain(tmp_path):
+    """The caller names the meeting it saw when the rename was issued. When
+    the session open at write time is a different one (an end+begin raced
+    the rename dialog), the write is refused — the new meeting must not
+    inherit the title the user typed for the old one."""
+    writer = _writer(tmp_path)
+    first = writer.begin_session()
+    assert first is not None
+    writer.write_original(1, "09:00:00", "hello")
+    assert writer.rename_session("对旧会议的标题", expected_session=first) is True
+    writer.end_session()
+
+    # A new session exists now; a rename still carrying the OLD stamp
+    # must be refused, and the new session's sidecar must stay untitled.
+    second = writer.begin_session()
+    assert second is not None and second != first
+    assert writer.rename_session("对旧会议的标题", expected_session=first) is False
+    meta = json.loads(
+        (tmp_path / f"livetrans_{second}_meta.json").read_text("utf-8")
+    )
+    assert "title" not in meta
+    # The matching stamp still renames normally.
+    assert writer.rename_session("新会议标题", expected_session=second) is True
+    meta = json.loads(
+        (tmp_path / f"livetrans_{second}_meta.json").read_text("utf-8")
+    )
+    assert meta["title"] == "新会议标题"
+    # A wrong expected stamp also refuses while the writer holds no session.
+    writer.end_session()
+    assert writer.rename_session("无会话", expected_session=second) is False
+
+
 def test_completed_meta_commits_only_after_content_files_closed(tmp_path):
     """The completed verdict must be the last thing committed: when the
     final sidecar is written, every content handle must already be closed
@@ -790,9 +825,9 @@ def test_completed_meta_commits_only_after_content_files_closed(tmp_path):
     flush/close failure would leave a "completed" marker over unwritten
     buffers."""
     writer = _writer(tmp_path)
-    stamp = writer._session_ts
     writer.write_original(1, "09:00:00", "hello")
     writer.write_translation(1, "hola")
+    stamp = writer._session_ts  # saved: close clears it
 
     order = []
     real_seal = writer._seal_content_files_locked
@@ -832,8 +867,8 @@ def test_content_flush_failure_seals_as_interrupted(tmp_path, monkeypatch):
     import transcript_writer as tw
 
     writer = _writer(tmp_path)
-    stamp = writer._session_ts
     writer.write_original(1, "09:00:00", "hello")
+    stamp = writer._session_ts  # saved: close clears it
 
     real_fsync = tw.os.fsync
 
@@ -858,6 +893,7 @@ def test_opened_without_session_open_still_reports_resources(tmp_path):
     broadcast gates on. has_active_session/has_open_session alone would
     both answer False and let the UI claim done over live handles."""
     writer = _writer(tmp_path)
+    writer.write_original(1, "09:00:00", "hello")  # a real open session
     # Simulate the half-dead state a failed close leaves behind.
     writer._session_open = False
     assert writer.has_active_session() is False

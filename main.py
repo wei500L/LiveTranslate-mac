@@ -4567,13 +4567,27 @@ def main():
         pause_action.setText(t("tray_pause"))
 
     overlay.session_toggle_requested.connect(_on_session_toggle)
-    panel.end_recording_requested.connect(
-        lambda: (
-            live_trans.end_recording_session()
-            if _confirm_end_session()
-            else None
-        )
-    )
+
+    def _on_end_recording_requested(session_id):
+        # Identity closure: the request names the meeting it was issued on
+        # (the records page's end button only shows for that record). If
+        # the writer's live session is no longer that stamp — the meeting
+        # already ended, or a new one began while the click was in flight —
+        # the request must not end whichever meeting happens to be active
+        # now. active_session() is the writer's authority; PAUSED keeps the
+        # session open, so a paused meeting still ends correctly.
+        if session_id:
+            live = live_trans._transcript.active_session()
+            if live != session_id:
+                QMessageBox.information(
+                    overlay, t("error_title"), t("session_end_target_gone")
+                )
+                return
+        if not _confirm_end_session():
+            return
+        live_trans.end_recording_session()
+
+    panel.end_recording_requested.connect(_on_end_recording_requested)
 
     def _on_overlay_source_lang(code):
         """Overlay source language combo → sync to panel + ASR engine + tray."""

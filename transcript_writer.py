@@ -13,12 +13,12 @@ entry has completed, which is what makes this usable as a meeting record. The
 the one to tail while a session runs.
 """
 
-import itertools
 import json
 import logging
 import os
 import re
 import threading
+import uuid
 from collections import deque
 from datetime import datetime
 from pathlib import Path
@@ -34,10 +34,11 @@ def _discard_quietly(path: Path) -> None:
         pass
 
 
-# Per-call suffix for staged meta writes (see
-# TranscriptWriter._staged_meta_path): two concurrent staged writes must
-# never share a temp name.
-_META_STAGE_SEQ = itertools.count()
+# Staged meta writes use a per-call UUID suffix (see
+# TranscriptWriter._staged_meta_path): a pid+counter suffix is unique only
+# within this module — meeting_records stages the *same* final file with the
+# same name shape, and two independent counters can agree, letting two
+# concurrent staged writes replace each other's temp file.
 
 # Session stamps are "YYYYmmdd_HHMMSS" plus an optional "_NN" suffix used only
 # when two sessions begin within the same second (end one meeting, start the
@@ -285,7 +286,7 @@ class TranscriptWriter:
             if self._session_open:
                 self._write_meta_locked()
 
-    def rename_session(self, title: str) -> bool:
+    def rename_session(self, title: str, expected_session: str | None = None) -> bool:
         """Rename the open session, inside the writer's lock.
 
         This is the single coordinated path for renaming a *live* session:
@@ -297,12 +298,27 @@ class TranscriptWriter:
         merge every meta write uses, so they survive the seal. Refused
         while ENDING (the seal owns the sidecar) and when no session is
         open. Returns True when the sidecar now carries the new title.
+
+        ``expected_session`` closes the identity chain: the caller names
+        the meeting it saw when the rename was issued, and the write is
+        refused when the session open now is a different one (an end+begin
+        raced the dialog) — otherwise the new meeting would get the title
+        the user typed for the old one.
         """
         title = (title or "").strip()
         if not title:
             return False
         with self._lock:
             if not self._session_open or self._ending:
+                return False
+            if (
+                expected_session is not None
+                and expected_session != self._session_ts
+            ):
+                log.info(
+                    "Refusing rename for session %s: the open session is %s",
+                    expected_session, self._session_ts,
+                )
                 return False
             # One complete write (summary + merged user fields + the new
             # title): the sidecar is never reduced to a fields-only stub,
@@ -863,10 +879,12 @@ class TranscriptWriter:
     def _staged_meta_path(path) -> Path:
         """A per-call staged path. A fixed ``.tmp`` name shared by every
         writer (and by the records layer's rename) let two concurrent
-        staged writes replace each other's temp; the pid+counter suffix
-        keeps them distinct."""
+        staged writes replace each other's temp; a pid+counter suffix is
+        still only unique within this module (meeting_records stages the
+        same final file with the same name shape), so the suffix carries a
+        UUID — collision-free across modules and processes."""
         return Path(path).with_name(
-            f"{Path(path).name}.tmp{os.getpid()}.{next(_META_STAGE_SEQ)}"
+            f"{Path(path).name}.tmp{os.getpid()}.{uuid.uuid4().hex[:10]}"
         )
 
     def close(self):

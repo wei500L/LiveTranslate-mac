@@ -27,6 +27,7 @@ and Retina both work.
 
 from __future__ import annotations
 
+import hashlib
 import logging
 import subprocess
 import sys
@@ -110,7 +111,11 @@ class MeetingRecordsPage(QWidget):
     settings_updated = pyqtSignal(dict)
     # Request-only: the page never ends a session itself, it asks the app
     # (through the panel) so the one end-meeting implementation stays there.
-    end_recording_requested = pyqtSignal()
+    # The session id travels with the request: the app can then refuse when
+    # the meeting open at handling time is not the one the user clicked on
+    # (an end+begin raced the click), instead of ending whichever meeting
+    # happens to be active then.
+    end_recording_requested = pyqtSignal(str)
 
     def __init__(self, transcripts_dir: Path, settings: dict, transcript_writer=None, parent=None):
         super().__init__(parent)
@@ -364,7 +369,9 @@ class MeetingRecordsPage(QWidget):
 
         self._delete_btn = QPushButton(t("btn_delete_record"))
         self._delete_btn.setObjectName("dangerButton")
-        self._delete_btn.clicked.connect(self._delete_session)
+        self._delete_btn.clicked.connect(
+            lambda: self._delete_session(self._current_record())
+        )
         actions.addWidget(self._delete_btn)
         layout.addLayout(actions)
 
@@ -623,13 +630,28 @@ class MeetingRecordsPage(QWidget):
             for row in range(self._list.count()):
                 item = self._list.item(row)
                 if item and item.record.get("session") == select_session:
-                    self._list.setCurrentRow(row)
+                    if self._list.currentRow() != row:
+                        self._list.setCurrentRow(row)
+                    else:
+                        # The refill preserved this row's selection and so
+                        # suppressed the change signal; the just-ended
+                        # meeting must still load its final state.
+                        self._load_session(item.record)
                     break
 
     def _refill_list(self):
         """Rebuild list rows from the search box, filter and session state."""
         if not hasattr(self, "_list"):
             return
+        # The selection survives the rebuild *by session identity*: clear()
+        # resets currentItem to None, so an unconditional setCurrentRow(0)
+        # re-fired the selection change on every refresh — jumping the view
+        # to the newest record and re-running _load_session for a meeting
+        # the user never left (which cancelled a running summary worker as
+        # if they had switched meetings). Re-selecting the same session is
+        # therefore suppressed; a real change (the selected row was
+        # filtered out or deleted) falls back to row 0 and loads it.
+        previous = self._current_session()
         self._suppress_selection = True
         self._list.clear()
         query = self._search.text().strip().lower()
@@ -652,8 +674,24 @@ class MeetingRecordsPage(QWidget):
                 t("records_search_no_match") if (query or filter_key != "records_filter_all")
                 else t("records_empty")
             )
-        else:
+            return
+        row = None
+        if previous is not None:
+            for i in range(self._list.count()):
+                if self._list.item(i).record.get("session") == previous:
+                    row = i
+                    break
+        if row is None:
+            # Nothing to preserve (first fill, or the selected session no
+            # longer matches the filter): select the top row for real,
+            # loading its detail.
             self._list.setCurrentRow(0)
+        else:
+            # Same session re-selected: suppress the load — the detail pane
+            # already shows it.
+            self._suppress_selection = True
+            self._list.setCurrentRow(row)
+            self._suppress_selection = False
 
     @staticmethod
     def _record_matches(record: dict, query: str) -> bool:
@@ -668,7 +706,11 @@ class MeetingRecordsPage(QWidget):
         if item is None:
             return
         # Same permission functions as the detail buttons — the menu and
-        # the buttons must never disagree about what a record allows.
+        # the buttons must never disagree about what a record allows. The
+        # record under the cursor is the operation's target from here on:
+        # the click may not have selected the row, so re-reading
+        # currentItem afterwards (the old delete path) could act on a
+        # *different* meeting than the one the menu was opened on.
         record = item.record
         menu = QMenu(self)
         rename = menu.addAction(t("records_rename"))
@@ -680,13 +722,19 @@ class MeetingRecordsPage(QWidget):
         if action == rename:
             self._rename_session(item)
         elif action == delete:
-            self._delete_session()
+            self._delete_session(record)
 
     def _rename_session(self, item=None):
         item = item or self._list.currentItem()
         if item is None:
             return
+        # Snapshot the identity before any modal dialog runs: the dialog
+        # pumps the event loop, so state pushes, refreshes and selection
+        # changes can land while it is open — the save must stay bound to
+        # the meeting the user started renaming, not to whichever row is
+        # current when the dialog closes.
         record = item.record
+        session = record.get("session")
         # ENDING refuses: the seal owns the sidecar then, and a concurrent
         # rename write could overwrite the just-committed status.
         if not self._can_rename(record):
@@ -706,22 +754,48 @@ class MeetingRecordsPage(QWidget):
         if not title:
             QMessageBox.warning(self, t("error_title"), t("records_rename_empty"))
             return
+        # Re-derive the record from the *session identity* — the row object
+        # the dialog left behind may be stale (a refresh replaced the list
+        # while the dialog was open).
+        record = self._record_for_session(session) or record
         # Live sessions route through the writer's locked rename so the
         # sidecar has a single writer (an uncoordinated records-layer write
         # could race the seal's meta commit and lose the title or roll the
         # status back). Closed records have no writer contention and use
-        # the records-layer path.
-        if record.get("is_active") and self._writer is not None:
-            renamed = self._writer.rename_session(title)
-        else:
-            renamed = records.set_session_title(
-                self._dir, record["session"], title
+        # the records-layer path. The writer path carries the expected
+        # session: an end+begin racing the dialog must not retitle the new
+        # meeting with the old one's name.
+        live_role = self._live_session_role(session)
+        if live_role == "ending":
+            # The record entered ENDING while the dialog was open: the seal
+            # owns the sidecar now, refuse rather than write against it.
+            QMessageBox.warning(
+                self, t("error_title"), t("records_rename_ending_session")
             )
+            return
+        if live_role == "active" and self._writer is not None:
+            renamed = self._writer.rename_session(
+                title, expected_session=session
+            )
+        else:
+            renamed = records.set_session_title(self._dir, session, title)
         if renamed:
             record["title"] = title
             item.setText(title)
-            if record.get("session") == self._current_session():
+            if session == self._current_session():
                 self._title_label.setText(title)
+
+    def _record_for_session(self, session: str | None) -> dict | None:
+        """The page's current view of one session's record, by identity.
+
+        Returns None when a refresh removed the session from the list
+        (e.g. it was deleted while a dialog was open)."""
+        if session is None:
+            return None
+        for record in self._sessions:
+            if record.get("session") == session:
+                return record
+        return None
 
     def _current_session(self) -> str | None:
         item = self._list.currentItem()
@@ -782,9 +856,18 @@ class MeetingRecordsPage(QWidget):
         return not record.get("is_ending")
 
     def _update_action_availability(self):
-        """One permission pass for every record-scoped control: the end
-        button, and (via the same roles) the context menu. Called on
-        selection change and on every session-state push."""
+        """One permission pass for every record-scoped control: end button,
+        generate, edit, export, delete and (via the same roles) the context
+        menu. Called on selection change and on every session-state push.
+
+        The refresh that precedes a state push may have changed the
+        selection, so this reads the *current* record — but a live summary
+        worker's controls are driven by the generation logic, not by the
+        record state: a closed record with a generation in flight keeps
+        generate disabled and cancel visible until the worker ends (the
+        worker's own handlers restore them); re-enabling generate here
+        would let a second worker race the first.
+        """
         if not hasattr(self, "_end_recording_btn"):
             return
         record = self._current_record()
@@ -792,24 +875,53 @@ class MeetingRecordsPage(QWidget):
         self._end_recording_btn.setEnabled(
             self._session_role(record) != "ending"
         )
+        worker_running = self._worker is not None and self._worker.isRunning()
+        # Generate follows the record's own (cached) state — the handler
+        # still refuses on a stale cache, the button just stops advertising
+        # an action the cached state already knows is refused.
+        self._generate_btn.setEnabled(
+            not worker_running and self._can_summarize(record)
+        )
+        self._cancel_btn.setVisible(worker_running)
+        self._edit_btn.setEnabled(
+            self._summary_doc is not None and not worker_running
+        )
+        self._delete_btn.setEnabled(self._can_delete(record))
+        self._export_btn.setEnabled(record is not None)
 
     def _on_end_recording_clicked(self):
         """The end button was clicked on some record's detail view: verify
         the selected record really is the live meeting before emitting the
         request — the button only shows for it, but a state change racing
         the click could have ended the meeting already, and the request
-        must not silently end a different one."""
+        must not silently end a different one. The cached-record check is
+        followed by the writer's authoritative view; the session id travels
+        with the request so the app re-validates it at handling time."""
         record = self._current_record()
         if not self._can_end_recording(record):
             self._update_action_availability()
             return
-        self.end_recording_requested.emit()
+        if self._live_session_role(record.get("session")) != "active":
+            # Stale cache: the cached flags said live, the writer no longer
+            # does (the meeting ended between refresh and click).
+            self._update_action_availability()
+            return
+        self.end_recording_requested.emit(record["session"])
 
     # --- detail loading -------------------------------------------------------
 
     def _load_session(self, record: dict):
         worker = self._worker
-        if worker is not None and worker.isRunning():
+        if (
+            worker is not None
+            and worker.isRunning()
+            # Cancel only on a real identity change (the user switched
+            # meetings). A refresh re-selecting the same session used to
+            # reach this branch too — the refill's selection restore fired
+            # the load — and cancelled a healthy generation as though the
+            # user had navigated away.
+            and self._worker_session != record.get("session")
+        ):
             # The old generation's results must not land on the new session.
             worker.cancel()
             self._worker = None
@@ -989,7 +1101,14 @@ class MeetingRecordsPage(QWidget):
         if record is None or not self._entries:
             self._status_label.setText(t("summary_empty_record"))
             return
-        if not self._can_summarize(record):
+        # Authoritative guard, queried at click time: the record's
+        # is_active/is_ending flags are a snapshot from the last refresh
+        # and can be stale — a meeting that started after the refresh shows
+        # as a plain history row, and minutes generated over it would read
+        # as final while the meeting is still growing. The gate keys on the
+        # *session identity*: only the writer's own live stamp refuses.
+        session = record.get("session")
+        if self._live_session_role(session) != "none":
             # The record is still growing (is_active) or its final save is
             # in flight (is_ending — during end_session() the record is no
             # longer is_active, so the role check must cover both); a
@@ -998,11 +1117,11 @@ class MeetingRecordsPage(QWidget):
             # refreshes to a closed session.
             self._status_label.setText(t("summary_active_session"))
             return
-        if record.get("interrupted"):
-            # An interrupted record is closed (nothing more will be appended
-            # to it), so minutes are allowed — the state label alone is the
-            # hint that the meeting ended abnormally.
-            pass
+        if not self._can_summarize(record):
+            # Cached state still says live/ending (a stale refresh): treat
+            # it the same way rather than assume it cleared.
+            self._status_label.setText(t("summary_active_session"))
+            return
         if self._worker is not None and self._worker.isRunning():
             return
         provider = resolve_provider(self._settings)
@@ -1144,6 +1263,10 @@ class MeetingRecordsPage(QWidget):
             return  # an orphaned old worker finishing; the current one stays
         self._worker = None
         self._worker_session = None
+        # The registry drops its reference on finished; the QThread object
+        # itself is freed here, on the GUI thread, after run() returned.
+        if worker is not None:
+            worker.deleteLater()
         self._cancel_btn.hide()
         self._generate_btn.setEnabled(True)
         # A cancel leaves "Cancelling…" behind — run() emits nothing on that
@@ -1155,10 +1278,7 @@ class MeetingRecordsPage(QWidget):
             t("records_regenerate_summary") if (record and record.get("has_summary"))
             else t("records_generate_summary")
         )
-        # The registry drops its reference on finished; the QThread object
-        # itself is freed here, on the GUI thread, after run() returned.
-        if worker is not None:
-            worker.deleteLater()
+        self._update_action_availability()
 
     def _on_cancel_generate(self):
         if self._worker is not None:
@@ -1168,8 +1288,21 @@ class MeetingRecordsPage(QWidget):
     # --- summary editing ---------------------------------------------------------------
 
     def _on_edit_summary(self):
+        """Open the minutes editor for the loaded summary.
+
+        The session identity and the content being edited are snapshotted
+        before the modal dialog runs (it pumps the event loop, so state
+        pushes and refreshes can land while it is open), and revalidated
+        at save time: a background refresh cannot redirect the save onto
+        another meeting's summary, and a generation that overwrote the
+        minutes while the dialog was open is surfaced as a conflict rather
+        than silently discarding the newer content.
+        """
         if self._summary_doc is None:
             return
+        session = self._current_session()
+        base_content = self._summary_doc["content"]
+        base_hash = hashlib.sha256(base_content.encode("utf-8")).hexdigest()
         from PyQt6.QtWidgets import QDialog, QDialogButtonBox
 
         dlg = QDialog(self)
@@ -1177,7 +1310,7 @@ class MeetingRecordsPage(QWidget):
         dlg.resize(600, 500)
         layout = QVBoxLayout(dlg)
         editor = QPlainTextEdit()
-        editor.setPlainText(self._summary_doc["content"])
+        editor.setPlainText(base_content)
         layout.addWidget(editor, 1)
         buttons = QDialogButtonBox(
             QDialogButtonBox.StandardButton.Save
@@ -1192,17 +1325,61 @@ class MeetingRecordsPage(QWidget):
         if not content:
             QMessageBox.warning(self, t("error_title"), t("summary_error_empty"))
             return
-        meta = dict(self._summary_doc.get("meta") or {})
+        self._save_edited_summary(session, base_hash, content)
+
+    def _save_edited_summary(self, session: str, base_hash: str,
+                             content: str) -> bool:
+        """Persist a manual minutes edit opened as (session, base_hash).
+
+        Three single-writer checks, each re-derived at save time (the modal
+        dialog pumped the event loop, so state moved under it):
+
+        * identity — the selection is still the meeting whose summary the
+          editor was opened on; a background refresh must not redirect the
+          save onto another meeting's files;
+        * generation — no summary worker is running for this session; its
+          save and this one would clobber each other;
+        * conflict — the summary on disk is still the content the editor
+          was opened on; a generation that completed under the dialog is
+          newer and must not be silently discarded.
+        """
+        if session is None or self._current_session() != session:
+            QMessageBox.warning(
+                self, t("error_title"), t("records_edit_session_changed")
+            )
+            return False
+        if (
+            self._worker is not None
+            and self._worker.isRunning()
+            and self._worker_session == session
+        ):
+            QMessageBox.warning(
+                self, t("error_title"), t("records_edit_generate_running")
+            )
+            return False
+        loaded = records.load_summary(self._dir, session)
+        if (
+            loaded is not None
+            and hashlib.sha256(
+                loaded["content"].encode("utf-8")
+            ).hexdigest() != base_hash
+        ):
+            QMessageBox.warning(
+                self, t("error_title"), t("records_edit_conflict")
+            )
+            return False
+        meta = dict((self._summary_doc or {}).get("meta") or {})
         meta["edited_by_user"] = True
         meta["edited_at"] = datetime.now().isoformat(timespec="seconds")
-        if records.save_summary(self._dir, self._current_session(), content, meta):
-            record = self._current_record()
-            if record:
-                record["summary_edited"] = True
-            self._load_minutes(self._current_record() or {})
-            self._status_label.setText(t("summary_saved"))
-        else:
+        if not records.save_summary(self._dir, session, content, meta):
             QMessageBox.critical(self, t("error_title"), t("summary_error_save"))
+            return False
+        record = self._current_record()
+        if record:
+            record["summary_edited"] = True
+        self._load_minutes(record or {})
+        self._status_label.setText(t("summary_saved"))
+        return True
 
     # --- export --------------------------------------------------------------------------
 
@@ -1231,6 +1408,18 @@ class MeetingRecordsPage(QWidget):
         if record is None:
             return
         session = record["session"]
+        # ENDING refuses to export: the seal may still be writing the final
+        # entries and the footer, so what reads as a complete export could
+        # be a mid-close snapshot missing the last utterance — and unlike
+        # an active record it cannot be flagged as such, because the end is
+        # already decided. The window is short (the ENDING drain is
+        # bounded); exporting an active record stays allowed and is
+        # flagged as a snapshot in the output's meta rows.
+        if self._live_session_role(session) == "ending":
+            QMessageBox.information(
+                self, t("records_export"), t("records_state_ending")
+            )
+            return
         loaded = records.load_summary(self._dir, session)
         if kind in ("pdf_summary", "md_summary") and loaded is None:
             QMessageBox.information(
@@ -1283,10 +1472,14 @@ class MeetingRecordsPage(QWidget):
 
     def _pdf_meta_rows(self, record: dict) -> list[tuple[str, str]]:
         rows = []
+        # A snapshot of a record that is not final must say so as plainly
+        # as the UI does: is_active is "still growing", is_ending is "the
+        # final save is in flight" — both are interim snapshots, never
+        # final minutes, and the paper trail must not present them as such.
         if record.get("is_active"):
-            # The export is a snapshot, not final minutes; the paper trail
-            # should say so as plainly as the UI does.
             rows.append((t("records_pdf_active_flag"), t("records_state_active")))
+        elif record.get("is_ending"):
+            rows.append((t("records_pdf_active_flag"), t("records_state_ending")))
         started = record.get("started") or ""
         try:
             rows.append((t("records_info_started"),
@@ -1348,20 +1541,34 @@ class MeetingRecordsPage(QWidget):
         self._dir.mkdir(parents=True, exist_ok=True)
         _open_folder(self._dir)
 
-    def _delete_session(self):
-        record = self._current_record()
+    def _delete_session(self, record: dict | None = None):
+        """Delete one session's files. ``record`` is the explicit target
+        (the context menu passes the row it was opened on; the detail
+        button passes the selected record) — the identity is snapshotted
+        before the confirmation dialog and revalidated after it, so the
+        modal dialog's event loop cannot redirect the deletion onto a
+        different meeting."""
+        record = record if record is not None else self._current_record()
         if record is None:
             return
-        # Identity re-check (the UI hides the entry, but hiding is not a
-        # guard): deleting the live or closing session would unlink files
-        # the writer still holds open — on macOS the writer keeps writing
-        # into the unlinked inodes and the record is lost.
-        if not self._can_delete(record):
+        session = record["session"]
+        # Authoritative live check, queried from the writer at the moment
+        # of the click: the record's is_active/is_ending flags are a
+        # snapshot from the last refresh and can be stale (a meeting that
+        # started after the refresh shows as a plain history row).
+        # Deleting a session whose files the writer still holds open would
+        # (on macOS) leave the writer writing into unlinked inodes — the
+        # record is lost while the UI shows it gone. The role check covers
+        # active and ending; the paths check covers a half-dead close the
+        # writer no longer reports by stamp.
+        if (
+            self._live_session_role(session) != "none"
+            or self._writer_holds_session_files(session)
+        ):
             QMessageBox.warning(
                 self, t("error_title"), t("records_delete_live_session")
             )
             return
-        session = record["session"]
         confirm = QMessageBox.warning(
             self,
             t("btn_delete_record"),
@@ -1370,6 +1577,17 @@ class MeetingRecordsPage(QWidget):
             QMessageBox.StandardButton.No,
         )
         if confirm != QMessageBox.StandardButton.Yes:
+            return
+        # Revalidate after the dialog (it pumped the event loop): a state
+        # push or a begin/end may have landed while the user was deciding.
+        record = self._record_for_session(session) or record
+        if (
+            self._live_session_role(session) != "none"
+            or self._writer_holds_session_files(session)
+        ):
+            QMessageBox.warning(
+                self, t("error_title"), t("records_delete_live_session")
+            )
             return
         if self._worker is not None and self._worker_session == session:
             self._worker.cancel()
@@ -1382,6 +1600,56 @@ class MeetingRecordsPage(QWidget):
                 t("cache_delete_failed").format(paths="\n".join(failures)),
             )
         self.refresh()
+
+    def _live_session_role(self, session: str | None) -> str:
+        """The writer's authoritative role for one session stamp, queried
+        at call time (never from the cached record): "active" (session
+        open — recording or paused), "ending" (a close is in flight), or
+        "none". The record's is_active/is_ending flags are a snapshot from
+        the last refresh and can be stale; every destructive operation
+        re-asks the writer here.
+
+        The app-level ENDING stamp is checked *first*: in the window before
+        end_session() starts, the writer still reports the session active
+        while the state machine has already announced ENDING — the seal
+        owns the record from the announcement, not from the writer flip.
+        """
+        if session is None:
+            return "none"
+        if (
+            self._session_state == "ending"
+            and self._ending_session_id == session
+        ):
+            return "ending"
+        if self._writer is not None:
+            try:
+                if self._writer.ending_session() == session:
+                    return "ending"
+                if self._writer.active_session() == session:
+                    return "active"
+            except Exception:
+                log.debug("Could not query writer session state", exc_info=True)
+        return "none"
+
+    def _writer_holds_session_files(self, session: str | None) -> bool:
+        """True when the writer verifiably holds *this* session's files —
+        including the half-dead-close case where neither active_session()
+        nor ending_session() reports a stamp but handles and paths survive.
+        A *different* session being open does not block deleting this one;
+        that is a normal, legitimate combination (recording meeting B while
+        deleting history record A)."""
+        if self._writer is None or session is None:
+            return False
+        probe = getattr(self._writer, "session_paths", None)
+        if not callable(probe):
+            return False
+        try:
+            paths = probe() or {}
+        except Exception:
+            log.debug("Could not query writer paths", exc_info=True)
+            return False
+        marker = f"livetrans_{session}_"
+        return any(marker in str(p) for p in paths.values() if p)
 
     def cleanup(self):
         """Called when the panel closes: cancel the worker, keep old summaries.

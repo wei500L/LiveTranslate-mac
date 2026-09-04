@@ -141,10 +141,8 @@ def test_long_meeting_renders_in_batches(page, app, monkeypatch):
 def test_rename_updates_list_and_detail(page):
     item = page._list.item(0)
     page._list.setCurrentItem(item)
-    page._rename_session.__wrapped__ if False else None
-    # Drive rename directly (QInputDialog is modal; the logic under test is
-    # set_session_title + list refresh, covered separately) — here verify
-    # the context path by calling set + refresh.
+    # Drive the persistence path the rename handler uses (QInputDialog is
+    # modal; the dialog-independent path is set_session_title + refresh).
     records.set_session_title(page._dir, item.record["session"], "新标题")
     page.refresh()
     assert page._list.item(0).text().splitlines()[0] == "新标题"
@@ -201,7 +199,9 @@ def test_stale_summary_is_flagged_in_list_and_detail(page):
     })
     page.refresh()
     row = page._list.item(0).text()
-    assert "建议重新生成" in row or "regenerate" in row.lower() or True  # locale text
+    # The stale badge is locale text (zh or en); the record field is the
+    # locale-independent assertion.
+    assert ("重新生成" in row) or ("regenerate" in row.lower())
     record = page._list.item(0).record
     assert record["summary_stale"] is True
 
@@ -266,6 +266,7 @@ class _FakeWriter:
     def __init__(self, active=None, ending=None):
         self._active = active
         self._ending = ending
+        self.renamed_with = None
 
     def active_session(self):
         return self._active
@@ -273,8 +274,15 @@ class _FakeWriter:
     def ending_session(self):
         return self._ending
 
-    def rename_session(self, title):
-        self.renamed_to = title
+    def session_paths(self):
+        stamp = self._ending or self._active
+        if stamp is None:
+            return {}
+        return {kind: f"/tmp/x/livetrans_{stamp}_{kind}.txt"
+                for kind in ("original", "translation", "all")}
+
+    def rename_session(self, title, expected_session=None):
+        self.renamed_with = (title, expected_session)
         return True
 
 
@@ -328,6 +336,58 @@ def test_delete_of_live_or_ending_session_is_refused(page, monkeypatch):
     assert list(page._dir.glob(f"livetrans_{stamp}*"))
 
 
+def test_delete_refused_on_stale_cache_when_writer_is_live(page, monkeypatch):
+    """The cached record can lie: the refresh ran before the meeting
+    started, so the row shows as a plain history record. The delete must
+    still refuse — the authority is the writer queried at click time, not
+    the record's is_active/is_ending snapshot."""
+    page._list.setCurrentRow(0)
+    stamp = page._list.item(0).record["session"]
+    # Refresh WITHOUT a writer: the cached record is a closed history row.
+    page.set_transcript_writer(None)
+    page.refresh()
+    assert page._can_delete(page._current_record()) is True
+
+    # The meeting starts only after the refresh: the cache is now stale.
+    page.set_transcript_writer(_FakeWriter(active=stamp))
+    # No refresh: the cached flags still say "closed".
+
+    popped = []
+    monkeypatch.setattr(
+        "meeting_records_page.QMessageBox",
+        type("MB", (), {
+            "warning": staticmethod(lambda *a, **k: popped.append(1) or 16385),
+            "StandardButton": type("SB", (), {"Yes": 16384, "No": 65536}),
+        }),
+    )
+    page._delete_session()
+    assert popped, "the live-writer refusal must fire despite the stale cache"
+    assert list(page._dir.glob(f"livetrans_{stamp}*"))
+
+
+def test_delete_target_is_the_record_argument_not_current_item(page, monkeypatch):
+    """The context menu deletes the row it was opened on. Right-clicking an
+    unselected row must not delete the *current* row: _delete_session's
+    explicit record argument is the target, identity held through the
+    confirmation dialog."""
+    # Select the newest row; target the OTHER one explicitly (the context
+    # menu passes the right-clicked row's record).
+    page._list.setCurrentRow(0)
+    current_stamp = page._list.item(0).record["session"]
+    target_stamp = page._list.item(1).record["session"]
+
+    monkeypatch.setattr(
+        "meeting_records_page.QMessageBox",
+        type("MB", (), {
+            "warning": staticmethod(lambda *a, **k: 16384),
+            "StandardButton": type("SB", (), {"Yes": 16384, "No": 65536}),
+        }),
+    )
+    page._delete_session(page._list.item(1).record)
+    assert not list(page._dir.glob(f"livetrans_{target_stamp}*"))
+    assert list(page._dir.glob(f"livetrans_{current_stamp}*"))
+
+
 def test_end_button_only_on_the_live_meetings_own_detail(page):
     """The end button belongs to the live meeting's detail view: selecting
     a history row hides it; selecting the live row shows it. Clicking on a
@@ -348,11 +408,41 @@ def test_end_button_only_on_the_live_meetings_own_detail(page):
     # A stale click (the meeting ended between show and click) emits
     # nothing and refreshes the button state instead.
     emitted = []
-    page.end_recording_requested.connect(lambda: emitted.append(1))
+    page.end_recording_requested.connect(lambda sid: emitted.append(sid))
     page.set_transcript_writer(_FakeWriter(active=None))
     page.refresh()
     page._on_end_recording_clicked()
     assert emitted == []
+
+    # The live click carries the meeting's identity: the app re-validates
+    # it at handling time (main.py's active_session() comparison).
+    page.set_transcript_writer(_FakeWriter(active=history_stamp))
+    page.refresh()
+    page._on_end_recording_clicked()
+    assert emitted == [history_stamp]
+
+
+def test_live_role_prefer_the_ending_state_over_writer_active(page):
+    """In the window before end_session() starts, the writer still reports
+    the session active while the state machine already announced ENDING —
+    the app-level stamp must win, or the page would treat the closing
+    record as merely active (end button re-enabled, export allowed)."""
+    page._list.setCurrentRow(0)
+    stamp = page._list.item(0).record["session"]
+    # The writer is mid-END-flip: still reports active, not yet ending.
+    page.set_transcript_writer(_FakeWriter(active=stamp, ending=None))
+    page._ending_session_id = stamp
+    page._session_state = "ending"
+    assert page._live_session_role(stamp) == "ending"
+    # Without the app-level push it is what the writer says.
+    page._session_state = "active"
+    assert page._live_session_role(stamp) == "active"
+    # Another session's ENDING never paints this row.
+    page._session_state = "ending"
+    page._ending_session_id = "some_other_stamp"
+    assert page._live_session_role(stamp) == "none"
+    page._session_state = "idle"
+    page._ending_session_id = None
 
 
 # --- worker wiring ----------------------------------------------------------------
@@ -423,3 +513,183 @@ def test_switching_sessions_cancels_running_worker(page, monkeypatch):
     assert worker._cancel.is_set()
     assert page._worker is None
     assert page._generate_btn.isEnabled()
+
+
+# --- manual minutes editing (identity and conflict checks) -----------------------
+
+
+def _loaded_summary_page(page, monkeypatch):
+    """A page with one session selected and a committed summary loaded,
+    with modal message boxes recorded instead of shown."""
+    page._list.setCurrentRow(0)
+    stamp = page._list.item(0).record["session"]
+    records.save_summary(page._dir, stamp, "# original", {"provider_name": "X"})
+    page._list.setCurrentRow(0)
+    page._load_session(page._list.item(0).record)
+    shown = []
+    monkeypatch.setattr(
+        "meeting_records_page.QMessageBox",
+        type("MB", (), {
+            "warning": staticmethod(lambda *a, **k: shown.append(a) or 16385),
+            "critical": staticmethod(lambda *a, **k: shown.append(a) or 16385),
+            "information": staticmethod(lambda *a, **k: shown.append(a) or 16385),
+            "StandardButton": type("SB", (), {"Yes": 16384, "No": 65536}),
+        }),
+    )
+    return stamp, shown
+
+
+def _content_hash(text):
+    import hashlib
+
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def test_edit_save_lands_on_the_opened_session(page, monkeypatch):
+    stamp, _shown = _loaded_summary_page(page, monkeypatch)
+    assert page._save_edited_summary(stamp, _content_hash("# original"), "# edited")
+    loaded = records.load_summary(page._dir, stamp)
+    assert loaded["content"] == "# edited"
+    assert loaded["meta"]["edited_by_user"] is True
+
+
+def test_edit_save_refused_when_selection_changed_under_the_dialog(page, monkeypatch):
+    """The editor was opened on meeting A; a background refresh moved the
+    selection to meeting B while the dialog was open. The save must not
+    land on B's files."""
+    stamp_a, shown = _loaded_summary_page(page, monkeypatch)
+    stamp_b = page._list.item(1).record["session"]
+    # The dialog's event loop delivered a selection change.
+    page._list.setCurrentRow(1)
+
+    ok = page._save_edited_summary(stamp_a, _content_hash("# original"), "# edited")
+    assert ok is False
+    assert shown, "the identity refusal must be shown"
+    # Neither meeting's summary was overwritten.
+    assert records.load_summary(page._dir, stamp_a)["content"] == "# original"
+    assert records.load_summary(page._dir, stamp_b) is None
+
+
+def test_edit_save_refused_when_generation_overwrote_the_summary(page, monkeypatch):
+    """A worker completed under the dialog and replaced the minutes: the
+    manual save must refuse (conflict) instead of silently discarding the
+    newer generation."""
+    stamp, shown = _loaded_summary_page(page, monkeypatch)
+    # The generation landed while the dialog was open.
+    records.save_summary(page._dir, stamp, "# freshly generated", {})
+
+    ok = page._save_edited_summary(stamp, _content_hash("# original"), "# edited")
+    assert ok is False
+    assert shown, "the conflict refusal must be shown"
+    assert records.load_summary(page._dir, stamp)["content"] == "# freshly generated"
+
+
+def test_edit_save_refused_while_generation_is_running(page, monkeypatch):
+    """Single-writer rule: while a summary worker runs for this session a
+    manual save must not race the worker's own save."""
+    stamp, shown = _loaded_summary_page(page, monkeypatch)
+
+    class _RunningWorker:
+        session = stamp
+        generation = 1
+
+        @staticmethod
+        def isRunning():
+            return True
+
+    page._worker = _RunningWorker()
+    page._worker_session = stamp
+    try:
+        ok = page._save_edited_summary(
+            stamp, _content_hash("# original"), "# edited"
+        )
+        assert ok is False
+        assert shown, "the running-generation refusal must be shown"
+    finally:
+        page._worker = None
+        page._worker_session = None
+    assert records.load_summary(page._dir, stamp)["content"] == "# original"
+
+
+def test_edit_button_disabled_while_generation_runs(page, monkeypatch):
+    """The edit control must not advertise an action the single-writer rule
+    refuses: while a worker runs, edit (and generate) are disabled and
+    cancel is visible — and nothing re-enables them on a state push."""
+    _loaded_summary_page(page, monkeypatch)
+
+    class _RunningWorker:
+        session = page._list.item(0).record["session"]
+        generation = 1
+
+        @staticmethod
+        def isRunning():
+            return True
+
+    page._worker = _RunningWorker()
+    page._worker_session = _RunningWorker.session
+    try:
+        page._update_action_availability()
+        assert page._edit_btn.isEnabled() is False
+        assert page._generate_btn.isEnabled() is False
+        assert page._cancel_btn.isVisibleTo(page)
+        # A state push (e.g. app-level refresh) must not re-enable them.
+        page.on_session_state_changed("idle")
+        assert page._edit_btn.isEnabled() is False
+        assert page._generate_btn.isEnabled() is False
+    finally:
+        page._worker = None
+        page._worker_session = None
+    page._update_action_availability()
+    assert page._edit_btn.isEnabled() is True
+
+
+# --- ENDING export -----------------------------------------------------------------
+
+
+def test_export_refused_while_session_is_ending(page, monkeypatch):
+    """The seal may still be writing the final entries and the footer, so
+    an export mid-close could read as complete while missing the last
+    utterance — refuse until the close lands."""
+    stamp, shown = _loaded_summary_page(page, monkeypatch)
+    page.set_transcript_writer(_FakeWriter(active=None, ending=stamp))
+    page._ending_session_id = stamp
+    page._session_state = "ending"
+
+    page._export("pdf_summary")
+    assert shown, "the ending refusal must be shown"
+    # An active record still exports (flagged as a snapshot elsewhere).
+    page.set_transcript_writer(_FakeWriter(active=stamp, ending=None))
+    page._session_state = "active"
+    page._ending_session_id = None
+    shown.clear()
+    # QFileDialog.getSaveFileName is monkeypatched to cancel: the point is
+    # that the *guard* let the call through to the file dialog.
+    monkeypatch.setattr(
+        "PyQt6.QtWidgets.QFileDialog.getSaveFileName",
+        staticmethod(lambda *a, **k: ("", "")),
+    )
+    page._export("pdf_summary")
+    assert shown == []
+
+
+# --- rename routing ------------------------------------------------------------------
+
+
+def test_rename_of_live_session_routes_through_writer_with_expected(page, monkeypatch):
+    """A live session's rename goes through the writer's locked path and
+    carries the session identity it was issued on, so an end+begin racing
+    the dialog cannot retitle the new meeting."""
+    from PyQt6.QtWidgets import QInputDialog
+
+    page._list.setCurrentRow(0)
+    stamp = page._list.item(0).record["session"]
+    writer = _FakeWriter(active=stamp)
+    page.set_transcript_writer(writer)
+    page.refresh()
+
+    monkeypatch.setattr(
+        QInputDialog, "getText",
+        staticmethod(lambda *a, **k: ("新标题", True)),
+    )
+    page._rename_session(page._list.item(0))
+    assert writer.renamed_with == ("新标题", stamp)
