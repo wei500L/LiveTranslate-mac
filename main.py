@@ -916,14 +916,17 @@ class LiveTranslateApp:
                 # _run_session_end's supersede never ran; retire the
                 # generation here so the tracker drops its CLOSING entry.
                 self._session_work.supersede(generation)
-            # IDLE may only be announced once the writer verifiably has no
-            # session: a state machine claiming "done" over a live writer
-            # session is a lie that strands the meeting's files open.
-            # abort_session's finally guarantees this on the failure path;
-            # _run_session_end's end_session/reset does on the success path.
-            if self._transcript.has_active_session():
+            # IDLE may only be announced once the writer verifiably holds
+            # nothing of the session: a state machine claiming "done" over
+            # live handles is a lie that strands the meeting's files open.
+            # has_open_resources is the strictest check — it also catches a
+            # half-dead close (_opened=True, _session_open=False) that
+            # has_active_session() would miss. abort_session's finally
+            # guarantees this on the failure path; _run_session_end's
+            # end_session/reset does on the success path.
+            if self._transcript.has_open_resources():
                 log.critical(
-                    "Writer still reports an active session after the end "
+                    "Writer still holds session resources after the end "
                     "path completed; refusing to announce IDLE (staying in "
                     "ENDING — the app may need a restart)"
                 )

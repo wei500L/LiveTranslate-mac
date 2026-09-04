@@ -177,18 +177,28 @@ transcript_writer.py     Per-session meeting record: original/translation/all te
                          `speech_seconds` uncopped) so the seal can never
                          re-emit it; `_emit_locked` counts an entry only
                          when every view write succeeded. `close()` is the
-                         *pipeline* shutdown path (app stop) and shares
-                         `_close_locked()` with `end_session()` — do not bind
-                         `close()` to the "end recording" button. The seal
-                         protocol: fix `_ended_at` exactly once, write the
-                         footers, then decide `session_status` —
-                         `completed` only when no write degraded *and* the
-                         final sidecar committed; otherwise `interrupted`,
-                         with the sidecar rewritten to say so (best effort).
+                         *pipeline* shutdown path and shares the seal with
+                         `end_session()` — on failure it runs the *same*
+                         abort fallback (`_abort_locked`) and is idempotent;
+                         do not bind `close()` to the "end recording"
+                         button. Seal order (the verdict commits last):
+                         entries → footer → **content seal**
+                         (`_seal_content_files_locked`: flush + fsync +
+                         close every handle; OSError *and* ValueError count
+                         as file-state failures) → decide `session_status`
+                         (`completed` only when nothing degraded) → atomic
+                         sidecar commit (a failure downgrades to
+                         `interrupted` and retries once) → memory reset
+                         (cleanup only — the reset is never the verdict).
                          The sidecar carries `session_status: active` from
                          the first commit; `abort_session()` (never raises,
                          resets in a finally, marks the sidecar interrupted)
-                         is the fallback for a close that failed. A live
+                         is the fallback for a close that failed.
+                         `has_open_resources()` is the strictest liveness
+                         check (logical open, closing, `_opened`, live
+                         handles, stamp or paths — catches the
+                         `_opened=True, _session_open=False` half-dead
+                         state) and gates the IDLE broadcast; a live
                          session's sidecar carries `"ended": null`.
                          `active_session()` exposes the in-flight stamp so
                          the records center can label a still-recording

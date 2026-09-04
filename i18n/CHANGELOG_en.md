@@ -1,5 +1,14 @@
 # Changelog
 
+## 2026-09-04 (round 7)
+- Fixed a mechanical-replacement accident in the tests: seven `stamp = stamp` self-assignments (the save line itself had been mangled by the previous round's bulk replace), restored to saving the session stamp before close; the file was swept for further self-assignments or unbound variables
+- Fixed the seal-order defect where the "completed" marker preceded the content flush: the status sidecar used to be written before the file handles were flushed/closed, so a later handle failure left a wrong "completed" commit marker on disk. The order is now: entries → footers → content files flush+fsync+close → decide the status → atomic sidecar commit last; any failure can only commit "interrupted"
+- Memory cleanup is no longer part of the seal verdict: the content seal (which reports success) is split from the state reset (pure tail), and failure evidence (the files, the status) is not cleared before the verdict is decided
+- Hardened the "end finished" check: a new strictest resources check (any of logical open, closing, opened flag, live handles, stamp or paths means unfinished) covers the half-dead "opened=True, session_open=False" state; the idle broadcast gates on it
+- The app-exit close() now shares the same failure fallback as the button-end path (mark interrupted, release handles, clear state), is idempotent, and no longer re-raises into the stop sequence
+- Write-exception boundary fixed: ValueError from a dead handle joins OSError on the interrupted path; plain programming errors still propagate
+- Static test additions (not executed): completed meta commits only after the content files closed; an fsync failure seals as interrupted; the half-dead state is caught by the resources check; a new session can start after a throwing close
+
 ## 2026-09-04 (round 6)
 - Fixed "failed entries reappearing": an original line whose write failed used to stay in the pending queue, and the seal would re-emit it as an untranslated entry. A failed write now rolls the entry back completely (no trace in memory, speech time never counted), and the end-of-session statistics reflect only entries that actually reached disk
 - Explicit persistent session state: the sidecar now carries a session_status field — "active" from open, "completed" committed only when every required file and the final sidecar wrote successfully, "interrupted" for an abort or any failed required write. Records without the field (older format) keep the footer/ended heuristics

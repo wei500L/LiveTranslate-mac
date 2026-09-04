@@ -218,6 +218,32 @@ class TranscriptWriter:
         with self._lock:
             return self._session_open and not self._ending
 
+    def has_open_session(self) -> bool:
+        """True while a session is open in *any* sense — recording or in the
+        middle of a close. ``has_active_session`` deliberately hides ENDING
+        (for UI labelling); this is the lifecycle question: is there a
+        session whose fate is not yet decided?"""
+        with self._lock:
+            return self._session_open or self._ending
+
+    def has_open_resources(self) -> bool:
+        """True when anything of a session is still held: the logical open
+        flag, a close in progress, the opened-file-set flag, live file
+        handles, a session stamp or paths. This is the strictest check —
+        e.g. ``_opened=True, _session_open=False`` (a close that died before
+        finishing) is caught here even though has_active_session() and
+        has_open_session() both answer False. The IDLE broadcast gates on
+        this being False."""
+        with self._lock:
+            return bool(
+                self._session_open
+                or self._ending
+                or self._opened
+                or self._files
+                or self._session_ts is not None
+                or self._paths
+            )
+
     def session_paths(self) -> dict:
         with self._lock:
             return dict(self._paths)
@@ -662,7 +688,12 @@ class TranscriptWriter:
         try:
             fp.write(text)
             return True
-        except OSError as e:
+        except (OSError, ValueError) as e:
+            # OSError: the disk/stream failed. ValueError: the handle is in
+            # an unusable file state (e.g. closed under us) — both are
+            # environment failures that belong on the degraded/interrupted
+            # path. Anything else (TypeError from bad arguments, ...) is a
+            # programming error and propagates.
             log.warning(f"Transcript write failed ({kind}): {e}")
             return False
 
@@ -784,40 +815,61 @@ class TranscriptWriter:
             return False
 
     def close(self):
-        """Close the writer outright (app stop / shutdown).
+        """Close the writer outright (app stop / shutdown). Idempotent.
 
-        This is the *pipeline* shutdown path: whatever is pending is flushed
-        as untranslated, the footer and final sidecar are written, files are
-        closed and all session state is reset. Ending a *meeting* without
-        stopping the pipeline is ``end_session()``; do not bind this to the
-        "end recording" button.
+        This is the *pipeline* shutdown path. It shares the seal protocol
+        with ``end_session`` — content files flush+close before the final
+        status commit — and on any failure it runs the *same* abort
+        fallback the button-end path uses (mark interrupted, release
+        handles, clear state) instead of merely flipping booleans, so a
+        throwing close cannot leave handles or session state behind. The
+        failure is logged, not re-raised: stop() must continue reclaiming
+        the rest of the app.
         """
         with self._lock:
+            if not self._opened and not self._session_open:
+                return
             self._ending = True
             try:
                 self._close_locked()
+            except Exception:
+                log.error(
+                    "Transcript close failed; aborting the session",
+                    exc_info=True,
+                )
+                try:
+                    self._abort_locked()
+                except Exception:
+                    log.error(
+                        "Transcript abort after a failed close also failed",
+                        exc_info=True,
+                    )
             finally:
                 self._ending = False
-                self._session_open = False
-                self._opened = False
 
     def _close_locked(self) -> dict | None:
         """Flush and finalize the current session; shared by close() and
         end_session(). Returns the final sidecar contents, or None when there
         was no session to close.
 
-        Seal protocol (the returned summary's ``session_status`` records the
-        outcome; the sidecar is the last thing written):
+        Seal protocol — the status commits last, after the content is
+        verifiably on disk:
         1. flush pending entries as untranslated (each emit's failure marks
            the session degraded — the entry is consumed either way, so it
            can never reappear);
         2. fix the seal timestamp once, shared by footer/summary;
         3. write the text footers (a failure marks degraded);
-        4. decide the status: ``completed`` only when nothing was degraded
-           and the final sidecar write succeeds — otherwise ``interrupted``,
-           and the sidecar is rewritten with that status (best effort: a
-           status write that itself fails is logged and the record falls
-           back to the footer/ended heuristics on read).
+        4. seal the *content* files: flush → fsync → close each handle; any
+           failure (OSError, ValueError from a dead handle, ...) marks
+           degraded — a "completed" marker must never precede this point;
+        5. decide the status: ``completed`` only when nothing degraded;
+        6. atomically commit the final sidecar (completed, or interrupted
+           after a degraded seal); a failed commit downgrades to
+           ``interrupted`` and retries once — a second failure leaves the
+           on-disk sidecar at its live ``active`` status, which readers
+           classify as interrupted;
+        7. clear the in-memory state (the reset's own errors are logged —
+           it is cleanup, not part of the verdict).
         """
         if not self._opened:
             return None
@@ -835,20 +887,17 @@ class TranscriptWriter:
             self._ended_at = datetime.now()
         if not self._write_summary_footer_locked():
             self._write_degraded = True
+        # Content seal BEFORE any status commit: once a handle fails to
+        # flush/close, the session is interrupted regardless of what the
+        # buffered writes claimed.
+        if not self._seal_content_files_locked():
+            self._write_degraded = True
         self._session_status = (
             "interrupted" if self._write_degraded else "completed"
         )
-        # The final sidecar is the commit marker: with its write included in
-        # the status decision, "completed" can only appear on disk when
-        # every required artifact made it.
+        # The final sidecar is the commit marker, written only after the
+        # content files verifiably closed.
         if not self._write_meta_locked():
-            # The final sidecar could not be written: the session cannot be
-            # called completed. Retry once with the interrupted status so
-            # the record says so; if even that fails, the on-disk sidecar
-            # keeps the live "active" status and the readers fall back to
-            # the footer heuristic (which will not see a footer-only seal as
-            # cleanly ended whenever the footer itself failed, and will for
-            # the degraded-entry case — the remaining risk is documented).
             self._write_degraded = True
             self._session_status = "interrupted"
             if not self._write_meta_locked():
@@ -861,76 +910,120 @@ class TranscriptWriter:
         self._reset_session_state_locked()
         return summary
 
+    def _seal_content_files_locked(self) -> bool:
+        """Flush+fsync+close every content file, reporting success.
+
+        This is the content seal: True means every line written this
+        session is in the files (flush), durable (fsync) and the handles
+        are released. Any failure — including ValueError from writing or
+        flushing a half-dead handle — is logged, marks the session
+        degraded and still tries to close the remaining handles, but the
+        return value is False and the seal therefore interrupted. The
+        handles dictionary is left untouched for the reset tail.
+        """
+        ok = True
+        for kind, fp in self._files.items():
+            if fp is None:
+                continue
+            try:
+                fp.flush()
+                os.fsync(fp.fileno())
+                fp.close()
+            except (OSError, ValueError) as e:
+                # ValueError: the handle is in an unusable state (e.g.
+                # already closed under us) — a file-state error, not a
+                # programming error, and it belongs on the interrupted
+                # path. Other exceptions (TypeError, ...) propagate: a
+                # genuine bug should not be misread as a disk failure.
+                log.warning("Could not seal transcript file %s: %s", kind, e)
+                ok = False
+                try:
+                    fp.close()
+                except Exception:
+                    pass
+        return ok
+
+    def _abort_locked(self) -> dict | None:
+        """Lock-held core of the abort fallback. See abort_session()."""
+        try:
+            summary = self._summary_locked() if self._session_ts else None
+            log.error(
+                "Aborting session %s after a failed close; the record stays "
+                "as written and is marked interrupted",
+                self._session_ts,
+            )
+            self._session_status = "interrupted"
+            # Mark the half-sealed record: the sidecar's status field is
+            # what readers of this format trust (a footer may already be in
+            # the text files from the failed seal). A failure here is
+            # logged, not raised — the abort must still complete.
+            if self._session_ts:
+                try:
+                    if not self._write_meta_locked():
+                        log.error(
+                            "Could not mark session %s interrupted in its "
+                            "sidecar", self._session_ts,
+                        )
+                except Exception:
+                    log.error(
+                        "Marking session %s interrupted failed",
+                        self._session_ts, exc_info=True,
+                    )
+            if summary is not None:
+                summary["session_status"] = "interrupted"
+            return summary
+        finally:
+            # Whatever happened above, the writer ends with no session:
+            # handles closed, memory cleared, the next begin starts clean.
+            # Swallow close-time errors — a half-dead handle must not
+            # propagate out of an abort.
+            try:
+                self._reset_session_state_locked()
+            except Exception:
+                log.error(
+                    "Session state reset failed during abort", exc_info=True
+                )
+
     def abort_session(self) -> dict | None:
         """Best-effort abort of a session whose close failed. Never raises.
 
         The record is kept exactly as far as it got, and the sidecar is
         rewritten (best effort) with ``session_status=interrupted`` so no
         footer that already landed can make the half-sealed meeting read as
-        completed — the status field outranks the footer for readers of this
-        format. Handles are released and every piece of in-memory session
-        state is cleared by the same reset the normal close uses, in a
-        ``finally`` so even an internal failure cannot leave a live session
-        behind. Returns the last known summary snapshot (carrying the
-        interrupted status), or None when there was no session.
+        completed — the status field outranks the footer for readers of
+        this format. Handles are released and every piece of in-memory
+        session state is cleared, in a ``finally`` so even an internal
+        failure cannot leave a live session behind. Returns the last known
+        summary snapshot (carrying the interrupted status), or None when
+        there was no session.
         """
         with self._lock:
             if not self._session_open and not self._opened:
                 return None
-            try:
-                summary = (
-                    self._summary_locked() if self._session_ts else None
-                )
-                log.error(
-                    "Aborting session %s after a failed close; the record "
-                    "stays as written and is marked interrupted",
-                    self._session_ts,
-                )
-                self._session_status = "interrupted"
-                # Mark the half-sealed record: the sidecar's status field is
-                # what readers of this format trust (a footer may already be
-                # in the text files from the failed seal). A failure here is
-                # logged, not raised — the abort must still complete.
-                if self._session_ts:
-                    try:
-                        if not self._write_meta_locked():
-                            log.error(
-                                "Could not mark session %s interrupted in "
-                                "its sidecar", self._session_ts,
-                            )
-                    except Exception:
-                        log.error(
-                            "Marking session %s interrupted failed",
-                            self._session_ts, exc_info=True,
-                        )
-                if summary is not None:
-                    summary["session_status"] = "interrupted"
-                return summary
-            finally:
-                # Whatever happened above, the writer ends with no session:
-                # handles closed, memory cleared, the next begin starts
-                # clean. Swallow close-time errors — a half-dead handle must
-                # not propagate out of an abort.
-                try:
-                    self._reset_session_state_locked()
-                except Exception:
-                    log.error(
-                        "Session state reset failed during abort",
-                        exc_info=True,
-                    )
+            return self._abort_locked()
 
     def _reset_session_state_locked(self):
         """The single tail for every close path (seal, pipeline close,
-        abort): close handles, clear paths/timestamps/entries and the
-        per-session counters. Must leave the writer indistinguishable from
-        "no session ever opened" so the next begin starts clean."""
+        abort): close any remaining handles (idempotent — the content seal
+        already closed the healthy ones), clear paths/timestamps/entries
+        and the per-session counters. Must leave the writer
+        indistinguishable from "no session ever opened" so the next begin
+        starts clean.
+
+        This is cleanup, NOT part of the seal verdict: the verdict is
+        decided by _seal_content_files_locked and the final sidecar commit
+        before this runs, and this method's own failures are logged and
+        swallowed — the on-disk status is the durable evidence either way.
+        Failure evidence (the files, the sidecar) is never touched here."""
         for fp in self._files.values():
             if fp is None:
                 continue
             try:
                 fp.flush()
                 fp.close()
-            except Exception:
+            except (OSError, ValueError):
+                # Already sealed/dead handle: nothing further to do, and no
+                # reason to raise out of cleanup.
                 pass
         self._files.clear()
         self._pending.clear()

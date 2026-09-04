@@ -39,7 +39,7 @@ def test_entries_are_written_in_utterance_order_not_completion_order(tmp_path):
     writer.write_translation(3, "THIRD")
     writer.write_translation(2, "SECOND")
     writer.write_translation(1, "FIRST")
-    stamp = stamp  # saved: close clears it
+    stamp = writer._session_ts  # saved: close clears it
     writer.close()
 
     all_lines = _entries(tmp_path / f"livetrans_{stamp}_all.txt")
@@ -80,7 +80,7 @@ def test_close_flushes_entries_whose_translation_never_arrived(tmp_path):
     writer.write_original(1, "00:00:01", "answered")
     writer.write_original(2, "00:00:02", "abandoned")
     writer.write_translation(1, "ANSWERED")
-    stamp = stamp  # saved: close clears it
+    stamp = writer._session_ts  # saved: close clears it
     writer.close()
 
     text = (tmp_path / f"livetrans_{stamp}_all.txt").read_text("utf-8")
@@ -96,7 +96,7 @@ def test_an_untranslated_entry_keeps_its_place(tmp_path):
     writer.write_translation(3, "THREE")
     writer.finalize_no_translation(2)  # same language, no translation needed
     writer.write_translation(1, "ONE")
-    stamp = stamp  # saved: close clears it
+    stamp = writer._session_ts  # saved: close clears it
     writer.close()
 
     lines = _entries(tmp_path / f"livetrans_{stamp}_all.txt")
@@ -108,7 +108,7 @@ def test_no_entry_is_registered_twice(tmp_path):
     writer.write_original(1, "00:00:01", "first")
     writer.write_original(1, "00:00:02", "corrected")
     writer.write_translation(1, "FIRST")
-    stamp = stamp  # saved: close clears it
+    stamp = writer._session_ts  # saved: close clears it
     writer.close()
     lines = _entries(tmp_path / f"livetrans_{stamp}_all.txt")
     assert len(lines) == 1
@@ -143,7 +143,7 @@ def test_the_meeting_record_carries_language_duration_and_provenance(tmp_path):
         1, "09:15:00", "Здравствуйте", language="ru", duration=2.5
     )
     writer.write_translation(1, "你好")
-    stamp = stamp  # saved: close clears it
+    stamp = writer._session_ts  # saved: close clears it
     writer.close()
 
     text = (
@@ -162,7 +162,7 @@ def test_the_plain_text_files_end_with_a_session_summary(tmp_path):
     writer = _writer(tmp_path)
     writer.write_original(1, "09:15:00", "hello")
     writer.write_translation(1, "hola")
-    stamp = stamp  # saved: close clears it
+    stamp = writer._session_ts  # saved: close clears it
     writer.close()
     for kind in TranscriptWriter.KINDS:
         text = (tmp_path / f"livetrans_{stamp}_{kind}.txt").read_text("utf-8")
@@ -177,7 +177,7 @@ def test_the_metadata_sidecar_describes_the_session(tmp_path):
     writer.write_translation(1, "hola")
     writer.write_original(2, "09:15:10", "again", duration=1.0)
     writer.finalize_no_translation(2)
-    stamp = stamp  # saved: close clears it
+    stamp = writer._session_ts  # saved: close clears it
     writer.close()
 
     meta = json.loads(
@@ -733,3 +733,132 @@ def test_live_sidecar_carries_active_status(tmp_path):
     assert meta["session_status"] == "active"
     summary = writer.end_session()
     assert summary["session_status"] == "completed"
+
+
+def test_completed_meta_commits_only_after_content_files_closed(tmp_path):
+    """The completed verdict must be the last thing committed: when the
+    final sidecar is written, every content handle must already be closed
+    and durable (flush+fsync+close ran before it). Otherwise a later
+    flush/close failure would leave a "completed" marker over unwritten
+    buffers."""
+    writer = _writer(tmp_path)
+    stamp = writer._session_ts
+    writer.write_original(1, "09:00:00", "hello")
+    writer.write_translation(1, "hola")
+
+    order = []
+    real_seal = writer._seal_content_files_locked
+    real_meta = writer._write_meta_locked
+
+    def sealing_seal():
+        order.append("seal-start")
+        ok = real_seal()
+        order.append("seal-done" if ok else "seal-failed")
+        return ok
+
+    def ordered_meta(*args, **kwargs):
+        closed = all(
+            fp is None or fp.closed for fp in writer._files.values()
+        )
+        order.append(f"meta(content-closed={closed})")
+        return real_meta(*args, **kwargs)
+
+    writer._seal_content_files_locked = sealing_seal
+    writer._write_meta_locked = ordered_meta
+
+    summary = writer.end_session()
+
+    assert order[0] == "seal-start"
+    assert order[1] == "seal-done"
+    assert order[2] == "meta(content-closed=True)"
+    assert summary["session_status"] == "completed"
+    sealed = json.loads(
+        (tmp_path / f"livetrans_{stamp}_meta.json").read_text("utf-8")
+    )
+    assert sealed["session_status"] == "completed"
+
+
+def test_content_flush_failure_seals_as_interrupted(tmp_path, monkeypatch):
+    """A content file that cannot be flushed/fsynced/closed degrades the
+    seal: the verdict can only be interrupted, never completed."""
+    import transcript_writer as tw
+
+    writer = _writer(tmp_path)
+    stamp = writer._session_ts
+    writer.write_original(1, "09:00:00", "hello")
+
+    real_fsync = tw.os.fsync
+
+    def failing_fsync(fd):
+        raise OSError("fsync failed")
+
+    monkeypatch.setattr(tw.os, "fsync", failing_fsync)
+
+    summary = writer.end_session()
+    monkeypatch.undo()
+
+    assert summary["session_status"] == "interrupted"
+    sealed = json.loads(
+        (tmp_path / f"livetrans_{stamp}_meta.json").read_text("utf-8")
+    )
+    assert sealed["session_status"] == "interrupted"
+
+
+def test_opened_without_session_open_still_reports_resources(tmp_path):
+    """A close that died between flags (_opened=True, _session_open=False)
+    must still be recognized by has_open_resources — the check the IDLE
+    broadcast gates on. has_active_session/has_open_session alone would
+    both answer False and let the UI claim done over live handles."""
+    writer = _writer(tmp_path)
+    # Simulate the half-dead state a failed close leaves behind.
+    writer._session_open = False
+    assert writer.has_active_session() is False
+    assert writer.has_open_session() is False
+    assert writer._opened is True
+    assert writer.has_open_resources() is True
+    writer.abort_session()
+    assert writer.has_open_resources() is False
+
+
+def test_close_after_exception_can_start_a_new_session(tmp_path):
+    """The pipeline-shutdown close() shares the abort fallback with the
+    button-end path: a throwing seal is contained (logged, not raised),
+    resources are released, and the writer can open the next session."""
+    import transcript_writer as tw
+
+    writer = TranscriptWriter(tmp_path)
+    writer.set_enabled(True)
+    writer.set_recording(True)
+    assert writer.write_original(1, "09:00:00", "hello") == (
+        TranscriptWriter.WRITE_RECORDED
+    )
+    stamp = writer._session_ts
+
+    def exploding_footer():
+        raise OSError("disk gone")
+
+    monkeypatched = exploding_footer
+    original = writer._write_summary_footer_locked
+    writer._write_summary_footer_locked = monkeypatched
+    try:
+        # close() must swallow the failure (stop() has to continue) —
+        # the abort fallback runs inside it.
+        writer.close()
+    finally:
+        writer._write_summary_footer_locked = original
+
+    assert writer.has_open_resources() is False
+    sealed = json.loads(
+        (tmp_path / f"livetrans_{stamp}_meta.json").read_text("utf-8")
+    )
+    assert sealed["session_status"] == "interrupted"
+
+    # The next session opens and seals normally.
+    stamp2 = writer.begin_session()
+    assert stamp2 is not None and stamp2 != stamp
+    assert writer.write_original(1, "10:00:00", "next meeting") == (
+        TranscriptWriter.WRITE_RECORDED
+    )
+    summary = writer.end_session()
+    assert summary["session_status"] == "completed"
+    assert writer.has_open_resources() is False
