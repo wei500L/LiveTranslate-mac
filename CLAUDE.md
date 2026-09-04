@@ -166,7 +166,12 @@ transcript_writer.py     Per-session meeting record: original/translation/all te
                          stamp), `_session_open` is set only when every required
                          file opened, and the first sidecar write is
                          `create_only` — a fresh session can never overwrite
-                         another session's meta. Staged sidecar writes use a
+                         another session's meta. `held_session()` is the
+                         exact, lock-held answer to "whose files does the
+                         writer still hold" (open, closing, or half-dead) —
+                         callers must use it instead of path substrings (a
+                         bare stamp is a prefix of its same-second suffixed
+                         siblings). Staged sidecar writes use a
                          per-call UUID suffix (`.tmp<pid>.<uuid>`): a pid+
                          counter is unique only within one module, and
                          meeting_records stages the same file with the same
@@ -224,10 +229,18 @@ meeting_records.py       Records data layer: list_sessions/parse_session (Markdo
                          marker and `load_summary()` verifies the hash, so an
                          interrupted commit never presents new metadata over an
                          old body. Both files stage under uniquely-suffixed
-                         names (`.tmp<pid>.<uuid>`) — a fixed `.tmp` let two
-                         concurrent saves (a generation finishing while a
-                         manual edit saves) commit one save's body with the
-                         other's meta; `delete_summary()` globs `.tmp*` so a
+                         names (`.tmp<pid>.<uuid>`), and the whole
+                         staged-write-replace sequence is serialized by a
+                         module lock (`_SUMMARY_SAVE_LOCK`): unique staged
+                         names prevent temp collisions, but only mutual
+                         exclusion prevents two racing saves (a generation
+                         finishing while a manual edit saves) from
+                         interleaving their final replaces into one save's
+                         body under the other's meta — which the hash check
+                         then reads as "no summary", losing both. The lock
+                         is in-process only; two OS processes sharing a
+                         transcripts directory are outside this app's file
+                         protocol. `delete_summary()` globs `.tmp*` so a
                          crashed commit's staged siblings never linger. An
                          orphan body (meta missing or unreadable)
                          also loads as absent: without the marker there is no
@@ -284,39 +297,58 @@ meeting_records_page.py  The records-center page (ControlPanel "Meeting Records"
                          derives it, and AI minutes are refused while
                          ACTIVE/PAUSED/ENDING. `end_recording_requested` is a
                          request-only signal carrying the target session id —
-                         the app's `end_recording_session()` is the single
-                         implementation, and main() verifies the carried id
-                         against the writer's live session before calling it,
-                         so a click cannot end "whatever is active now".
+                         the app's `end_recording_session(expected_session)`
+                         is the single implementation, and the expected id is
+                         re-verified *inside* it, immediately before the
+                         ENDING flip: both entry points (records page and
+                         the overlay toggle) reach it through a confirmation
+                         dialog that pumps a nested event loop, so the
+                         meeting open when the dialog closes may differ from
+                         the one the user clicked on — the check and the
+                         flip are one synchronous GUI-thread sequence.
                          Every record-scoped operation carries its target
                          explicitly and validates it twice: the cached record
                          flags (from the last refresh) gate the UI
                          (`_update_action_availability` covers end/generate/
-                         edit/delete/export in one pass; a running worker's
-                         controls stay disabled), and the handler re-asks the
-                         writer at click time (`_live_session_role`:
-                         the app-level ENDING stamp outranks a writer still
-                         reporting the session active). Delete also refuses
-                         while the writer still holds that session's file
-                         paths (`session_paths()`), covering a half-dead
-                         close neither active_session() nor ending_session()
-                         reports. Rename routes live sessions through the
-                         writer's `rename_session(title, expected_session)`.
+                         edit/delete/export in one pass, export disabled
+                         while the cached record is ENDING; a running
+                         worker's controls stay disabled), and the handler
+                         re-asks the writer at click time
+                         (`_live_session_role`: the app-level ENDING stamp
+                         outranks a writer still reporting the session
+                         active). Delete also refuses while the writer's
+                         `held_session()` equals the record's stamp — the
+                         exact ownership answer, never a path substring (a
+                         bare stamp is a prefix of its same-second suffixed
+                         siblings). Rename routes live sessions through the
+                         writer's `rename_session(title, expected_session)`
+                         and never touches a pre-dialog list item: rows are
+                         destroyed by every rebuild, so post-dialog row
+                         updates go through `_list_item_for_session()`.
                          Manual minutes edits fix the session identity and
                          the original content hash at editor open and
                          revalidate both at save (`_save_edited_summary`):
-                         a selection switched by a background refresh, or a
-                         generation that completed under the dialog, refuses
-                         the save rather than writing another meeting's files
-                         or discarding newer content. Export refuses while
-                         the record is ENDING (a mid-seal file set can miss
-                         the final entries; an active record stays
-                         exportable and is flagged as a snapshot). The list
+                         a selection switched by a background refresh, a
+                         generation that completed under the dialog, or the
+                         summary pair vanishing under the dialog all refuse
+                         the save rather than writing another meeting's
+                         files, discarding newer content or resurrecting
+                         deleted minutes. Export refuses while
+                         the record is ENDING in both the UI and the
+                         handler (a mid-seal file set can miss the final
+                         entries; an active record stays exportable and is
+                         flagged as a snapshot). The list
                          rebuild preserves the selection by session identity
                          (`_refill_list`): clear() resets currentItem, so an
                          unconditional setCurrentRow(0) re-fired the load on
                          every refresh — which cancelled a running summary
-                         worker; only a real session switch cancels now.
+                         worker; the suppressed re-select instead re-syncs
+                         the detail pane's data in place
+                         (`_refresh_detail_for_record`: title/meta/info/
+                         minutes and button states, but never the record
+                         view's scroll, never the current tab, and never a
+                         running generation's status text) — only a real
+                         session switch does the full load.
                          Dependency injection is public API:
                          `set_transcript_writer(writer)` /
                          `set_summary_registry(registry)`. Page-owned

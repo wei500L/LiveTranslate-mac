@@ -874,9 +874,21 @@ class LiveTranslateApp:
         log.info("Recording session started: %s", session_id)
         return session_id
 
-    def end_recording_session(self) -> bool:
+    def end_recording_session(self, expected_session: str | None = None) -> bool:
         """Finish the current meeting without stopping the app (the
         "End this recording" button). Returns True when an ENDING began.
+
+        ``expected_session`` is the meeting the *user* asked to end, named
+        at click time. It is re-verified here, immediately before the state
+        flips to ENDING: every caller reaches this method through a
+        confirmation dialog, and the dialog pumps a nested event loop — an
+        end and a new begin can land under it, so the session active by the
+        time the dialog closes may be a different meeting. The check and
+        the flip are one synchronous GUI-thread sequence, so nothing can
+        interleave them; a mismatch refuses (the caller shows why) instead
+        of ending whichever meeting happens to be active now. ``None``
+        keeps the legacy "end whatever is open" behaviour for callers that
+        genuinely have no identity to assert.
 
         The heavy work runs on a background thread: flushing the last VAD
         segment, letting in-flight ASR/translation finish (bounded), then
@@ -893,6 +905,16 @@ class LiveTranslateApp:
         # Snapshot the session id: the writer still reports the open session
         # until end_session() runs.
         session_id = self._transcript.active_session()
+        if (
+            expected_session is not None
+            and expected_session != session_id
+        ):
+            log.info(
+                "end_recording_session refused: the request named session "
+                "%s, the open session is %s (the state changed under the "
+                "confirmation dialog)", expected_session, session_id,
+            )
+            return False
         self._ending_session_id = session_id
         self._notify_session_state(SessionState.ENDING, session_id)
 
@@ -4541,9 +4563,17 @@ def main():
         if state == SessionState.ENDING:
             return  # the close is running; the button is disabled anyway
         if SessionState.is_recording(state):
+            # Fix the target *before* the dialog: the confirmation pumps a
+            # nested event loop, and an end plus a new begin can land under
+            # it — without the identity, the toggle after the dialog would
+            # end whichever meeting happens to be active then.
+            target = live_trans._transcript.active_session()
             if not _confirm_end_session():
                 return
-            live_trans.end_recording_session()
+            if not live_trans.end_recording_session(expected_session=target):
+                QMessageBox.information(
+                    overlay, t("error_title"), t("session_end_target_gone")
+                )
             return
         # IDLE: start a new recording. The session is created first and the
         # pipeline resumed second (inside begin_recording_session), so a
@@ -4585,7 +4615,16 @@ def main():
                 return
         if not _confirm_end_session():
             return
-        live_trans.end_recording_session()
+        # Re-validate inside the authoritative entry, atomically with the
+        # ENDING flip: the dialog pumped the event loop, so the meeting
+        # open now may differ from the one the user clicked on. expected
+        # is None only for a legacy caller with no identity to assert.
+        if not live_trans.end_recording_session(
+            expected_session=session_id or None
+        ):
+            QMessageBox.information(
+                overlay, t("error_title"), t("session_end_target_gone")
+            )
 
     panel.end_recording_requested.connect(_on_end_recording_requested)
 

@@ -275,6 +275,33 @@ class TranscriptWriter:
         with self._lock:
             return self._session_ts if self._ending and self._session_open else None
 
+    def held_session(self) -> str | None:
+        """The stamp of the session whose files this writer still holds, or
+        None — open, closing, or half-dead after a failed close (the state
+        where ``active_session()``/``ending_session()`` answer None but
+        handles and paths survive). Mirrors ``has_open_resources`` for the
+        stamp.
+
+        Callers must use this instead of inferring ownership from path
+        strings: a bare stamp is a *prefix* of its same-second suffixed
+        siblings (``livetrans_20260904_120000`` matches
+        ``livetrans_20260904_120000_01_all.txt`` under any substring test),
+        so path matching both over-blocks the parent stamp and cannot prove
+        exact ownership. The answer is exact because the open and the reset
+        each set/clear the stamp and the paths together under this lock.
+        """
+        with self._lock:
+            if not (
+                self._session_open
+                or self._ending
+                or self._opened
+                or self._files
+                or self._session_ts is not None
+                or self._paths
+            ):
+                return None
+            return self._session_ts
+
     def set_session_info(self, **info):
         """Record what produced this session (ASR engine, model, languages).
 

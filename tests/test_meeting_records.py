@@ -416,6 +416,69 @@ def test_delete_summary_removes_unique_suffixed_staged_siblings(tmp_path):
     assert not list(tmp_path.glob("livetrans_20260101_090000_summary*"))
 
 
+def test_concurrent_summary_saves_commit_consistent_pairs(tmp_path):
+    """Two saves racing on one session (a generation finishing while a
+    manual edit saves) must serialize: unique staged names alone let the
+    two replace-pairs interleave into one save's body under the other's
+    meta, which load_summary's hash check then reads as "no summary" —
+    both saves lost. With the commit serialized, the pair on disk is
+    always one save's body plus its own meta."""
+    import threading
+
+    stamp = "20260101_090000"
+    barrier = threading.Barrier(4)
+    errors = []
+
+    def saver(content):
+        try:
+            barrier.wait()
+            for _ in range(25):
+                records.save_summary(tmp_path, stamp, content, {"n": content})
+        except Exception as exc:  # pragma: no cover - failure reporting
+            errors.append(exc)
+
+    threads = [
+        threading.Thread(target=saver, args=(f"content-{i}",)) for i in range(4)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join()
+    assert errors == []
+    # The final pair must verify: one save's body under its own meta.
+    loaded = records.load_summary(tmp_path, stamp)
+    assert loaded is not None, "an interleaved pair would read as absent"
+    assert loaded["content"] in {f"content-{i}" for i in range(4)}
+    assert loaded["meta"]["n"] == loaded["content"]
+    assert list(tmp_path.glob("*.tmp*")) == []
+
+
+def test_atomic_write_failure_cleans_up_its_staged_file(tmp_path, monkeypatch):
+    """A failed staged write must not leave its temp sibling behind — a
+    crashed replace strands a uniquely-named file that no later save
+    overwrites (only delete_summary globs them away)."""
+    from pathlib import Path
+
+    target = tmp_path / "livetrans_20260101_090000_meta.json"
+    real_replace = Path.replace
+
+    def failing_replace(self, dest):
+        if ".tmp" in self.name:
+            raise OSError("replace failed")
+        return real_replace(self, dest)
+
+    monkeypatch.setattr(Path, "replace", failing_replace)
+    try:
+        records._atomic_write_text(target, "data")
+        raised = False
+    except OSError:
+        raised = True
+    monkeypatch.undo()
+    assert raised, "the sabotaged replace must raise"
+    assert not target.exists()
+    assert list(tmp_path.glob("*.tmp*")) == []
+
+
 def test_broken_summary_pair_loads_as_absent(tmp_path):
     """A crash between the two writes leaves meta without content: that must
     surface as 'no summary', never as an empty one."""

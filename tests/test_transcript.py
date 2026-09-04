@@ -818,6 +818,31 @@ def test_rename_expected_session_closes_the_identity_chain(tmp_path):
     assert writer.rename_session("无会话", expected_session=second) is False
 
 
+def test_held_session_reports_the_exact_stamp_across_states(tmp_path):
+    """held_session() is the exact file-ownership answer callers must use
+    instead of path matching (a bare stamp is a prefix of its same-second
+    suffixed siblings): the stamp while open or ending, still the stamp in
+    the half-dead close neither active_session() nor ending_session()
+    reports, and None once every resource is released."""
+    writer = _writer(tmp_path)
+    writer.write_original(1, "09:00:00", "hello")
+    stamp = writer._session_ts
+    assert writer.held_session() == stamp
+
+    writer._ending = True  # the end_session window
+    assert writer.active_session() is None
+    assert writer.held_session() == stamp
+
+    writer._ending = False
+    writer._session_open = False  # a half-dead close
+    assert writer.active_session() is None
+    assert writer.ending_session() is None
+    assert writer.held_session() == stamp
+
+    writer.abort_session()
+    assert writer.held_session() is None
+
+
 def test_completed_meta_commits_only_after_content_files_closed(tmp_path):
     """The completed verdict must be the last thing committed: when the
     final sidecar is written, every content handle must already be closed

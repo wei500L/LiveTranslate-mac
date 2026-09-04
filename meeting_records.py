@@ -26,11 +26,18 @@ import json
 import logging
 import os
 import re
+import threading
 import uuid
 from datetime import datetime
 from pathlib import Path
 
 log = logging.getLogger("LiveTranslate.Records")
+
+# Serializes save_summary's staged-write-replace sequence (see its
+# docstring): unique staged names prevent temp collisions, but only mutual
+# exclusion prevents two saves from interleaving their final replaces into
+# a body/meta mismatch. In-process only.
+_SUMMARY_SAVE_LOCK = threading.Lock()
 
 # Staged atomic writes use a per-call UUID suffix (see _staged_path): the
 # writer module stages the *same* sidecar file with the same name shape, and
@@ -498,17 +505,25 @@ def save_summary(
     """Write the summary pair as one commit, meta last. Meta is scrubbed.
 
     Commit protocol (single-replace-pair, no true cross-file transaction):
-    both files are staged as uniquely-suffixed ``.tmp`` siblings first, so a
-    failure before the commit phase leaves the old pair untouched — and two
-    concurrent saves (a generation finishing while the user edits, or two
-    workers) never share a staged name, so one save cannot commit the other
-    save's body with its own meta. The body is then replaced, and the meta —
-    which carries ``content_sha256`` — is replaced last. The meta is
-    therefore the commit marker: readers verify its hash against the body,
-    so a crash between the two replaces can never present new metadata over
-    an old body as a valid summary. A crash the other way (meta replaced,
-    body not) cannot occur; a leftover ``.tmp*`` from a crash matches no
-    listing glob and is removed by ``delete_summary``.
+    both files are staged as uniquely-suffixed ``.tmp`` siblings first, so
+    a failure before the commit phase leaves the old pair untouched. The
+    body is then replaced, and the meta — which carries
+    ``content_sha256`` — is replaced last. The meta is therefore the
+    commit marker: readers verify its hash against the body, so a crash
+    between the two replaces can never present new metadata over an old
+    body as a valid summary. A crash the other way (meta replaced, body
+    not) cannot occur; a leftover ``.tmp*`` from a crash matches no listing
+    glob and is removed by ``delete_summary``.
+
+    Concurrency: unique staged names alone do NOT make the two replaces
+    atomic — two racing saves (a generation finishing while a manual edit
+    saves) could interleave their replaces into one save's body under the
+    other's meta, which the hash check then reads as "no summary", losing
+    both. The whole staged-write-replace sequence is therefore serialized
+    by a module lock. That lock is **in-process only**: two OS processes
+    writing one transcripts directory have no coordination anywhere in
+    this app's file protocol (the session files themselves assume a single
+    writer process), and this is not a cross-process lock.
     """
     base_dir = Path(base_dir)
     md_path, meta_path = _summary_paths(base_dir, stamp)
@@ -518,21 +533,27 @@ def save_summary(
     safe_meta["content_sha256"] = hashlib.sha256(
         content.encode("utf-8")
     ).hexdigest()
-    md_tmp = _staged_path(md_path)
-    meta_tmp = _staged_path(meta_path)
-    try:
-        md_tmp.write_text(content, encoding="utf-8")
-        meta_tmp.write_text(
-            json.dumps(safe_meta, ensure_ascii=False, indent=2), encoding="utf-8"
-        )
-        md_tmp.replace(md_path)
-        meta_tmp.replace(meta_path)
-        return True
-    except OSError as exc:
-        log.warning("Could not save summary for %s: %s", stamp, exc)
-        _discard_quietly(md_tmp)
-        _discard_quietly(meta_tmp)
-        return False
+    with _SUMMARY_SAVE_LOCK:
+        md_tmp = _staged_path(md_path)
+        meta_tmp = _staged_path(meta_path)
+        try:
+            md_tmp.write_text(content, encoding="utf-8")
+            meta_tmp.write_text(
+                json.dumps(safe_meta, ensure_ascii=False, indent=2),
+                encoding="utf-8",
+            )
+            md_tmp.replace(md_path)
+            meta_tmp.replace(meta_path)
+            return True
+        except OSError as exc:
+            log.warning("Could not save summary for %s: %s", stamp, exc)
+            return False
+        finally:
+            # Consumed names are gone after replace; these cleanups no-op
+            # on success and remove the staged sibling on any failure —
+            # including non-OSError raises, which propagate.
+            _discard_quietly(md_tmp)
+            _discard_quietly(meta_tmp)
 
 
 _SENSITIVE_META_KEYS = ("api_key", "api_base", "key", "password", "token")
@@ -656,9 +677,14 @@ def _atomic_write_text(path: Path, content: str):
     # staged meta writes let two concurrent writers replace each other's
     # temp file. (The coordinated-writer rule keeps the *final* file
     # single-writer; this keeps even the staging area collision-free.)
+    # A failure at either step must not leave the staged sibling behind.
     tmp = _staged_path(path)
-    tmp.write_text(content, encoding="utf-8")
-    tmp.replace(path)
+    try:
+        tmp.write_text(content, encoding="utf-8")
+        tmp.replace(path)
+    except BaseException:
+        _discard_quietly(tmp)
+        raise
 
 
 def _staged_path(path: Path) -> Path:

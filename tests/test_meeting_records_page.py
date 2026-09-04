@@ -263,9 +263,13 @@ def test_delete_removes_session_and_summary_together(page, monkeypatch):
 class _FakeWriter:
     """Stands in for the app's TranscriptWriter for identity queries."""
 
-    def __init__(self, active=None, ending=None):
+    def __init__(self, active=None, ending=None, held=None):
         self._active = active
         self._ending = ending
+        # The stamp whose files the writer holds, when it differs from the
+        # active/ending answer (the half-dead-close case). Defaults to the
+        # live stamp, mirroring the real writer.
+        self._held = held
         self.renamed_with = None
 
     def active_session(self):
@@ -274,12 +278,10 @@ class _FakeWriter:
     def ending_session(self):
         return self._ending
 
-    def session_paths(self):
-        stamp = self._ending or self._active
-        if stamp is None:
-            return {}
-        return {kind: f"/tmp/x/livetrans_{stamp}_{kind}.txt"
-                for kind in ("original", "translation", "all")}
+    def held_session(self):
+        if self._held is not None:
+            return self._held
+        return self._ending or self._active
 
     def rename_session(self, title, expected_session=None):
         self.renamed_with = (title, expected_session)
@@ -584,6 +586,19 @@ def test_edit_save_refused_when_generation_overwrote_the_summary(page, monkeypat
     assert records.load_summary(page._dir, stamp)["content"] == "# freshly generated"
 
 
+def test_edit_save_refused_when_summary_vanished_under_the_dialog(page, monkeypatch):
+    """The summary pair was deleted (or broke) while the dialog was open:
+    saving would silently resurrect the edited content as the committed
+    minutes. That is a conflict, not a fresh save."""
+    stamp, shown = _loaded_summary_page(page, monkeypatch)
+    records.delete_summary(page._dir, stamp)
+
+    ok = page._save_edited_summary(stamp, _content_hash("# original"), "# edited")
+    assert ok is False
+    assert shown, "the vanished-summary conflict must be shown"
+    assert records.load_summary(page._dir, stamp) is None  # nothing resurrected
+
+
 def test_edit_save_refused_while_generation_is_running(page, monkeypatch):
     """Single-writer rule: while a summary worker runs for this session a
     manual save must not race the worker's own save."""
@@ -693,3 +708,181 @@ def test_rename_of_live_session_routes_through_writer_with_expected(page, monkey
     )
     page._rename_session(page._list.item(0))
     assert writer.renamed_with == ("新标题", stamp)
+
+
+def test_rename_after_a_refresh_under_the_dialog_updates_the_live_row(page, monkeypatch):
+    """The rename dialog pumps the event loop; a refresh under it clears
+    the list and destroys the pre-dialog row's C++ object. Touching that
+    item afterwards raises RuntimeError — the handler must re-locate the
+    row by session identity instead."""
+    from PyQt6.QtWidgets import QInputDialog
+
+    page._list.setCurrentRow(0)
+    stamp = page._list.item(0).record["session"]
+    stale_item = page._list.item(0)
+
+    def dialog_that_refreshes_under_itself(*a, **k):
+        # The nested event loop delivers a refresh while the dialog is up.
+        page.refresh()
+        return ("新标题", True)
+
+    monkeypatch.setattr(
+        QInputDialog, "getText",
+        staticmethod(dialog_that_refreshes_under_itself),
+    )
+    page._rename_session(stale_item)  # must not raise on the dead item
+    fresh_item = page._list_item_for_session(stamp)
+    assert fresh_item is not None
+    assert fresh_item is not stale_item  # the rebuild replaced the row
+    assert "新标题" in fresh_item.text()
+    assert page._record_for_session(stamp)["title"] == "新标题"
+
+
+def test_rename_refused_when_the_session_was_deleted_under_the_dialog(page, monkeypatch):
+    """The meeting's files were deleted while the rename dialog was open:
+    renaming would recreate a sidecar for a session that no longer exists
+    (a phantom row in the list). Refuse instead."""
+    from PyQt6.QtWidgets import QInputDialog
+
+    page._list.setCurrentRow(0)
+    stamp = page._list.item(0).record["session"]
+
+    def dialog_that_deletes_under_itself(*a, **k):
+        for path in page._dir.glob(f"livetrans_{stamp}_*"):
+            path.unlink()
+        page.refresh()
+        return ("标题", True)
+
+    shown = []
+    monkeypatch.setattr(
+        "meeting_records_page.QMessageBox",
+        type("MB", (), {
+            "warning": staticmethod(lambda *a, **k: shown.append(a) or 16385),
+            "StandardButton": type("SB", (), {"Yes": 16384, "No": 65536}),
+        }),
+    )
+    monkeypatch.setattr(
+        QInputDialog, "getText",
+        staticmethod(dialog_that_deletes_under_itself),
+    )
+    page._rename_session(page._list.item(0))
+    assert shown, "the session-gone refusal must be shown"
+    # No sidecar was resurrected for the deleted session.
+    assert not list(page._dir.glob(f"livetrans_{stamp}_*"))
+
+
+def test_delete_of_a_parent_stamp_is_allowed_while_a_suffixed_sibling_records(page, monkeypatch):
+    """File ownership is the writer's exact held stamp, never a path
+    substring: a bare stamp is a prefix of its same-second suffixed
+    siblings (livetrans_X vs livetrans_X_01), so substring matching
+    refused deleting the parent history record while the sibling
+    recorded."""
+    page._list.setCurrentRow(0)
+    parent = page._list.item(0).record["session"]
+    sibling = f"{parent}_01"
+    # The writer holds the suffixed sibling's files (same-second session).
+    page.set_transcript_writer(_FakeWriter(held=sibling))
+
+    monkeypatch.setattr(
+        "meeting_records_page.QMessageBox",
+        type("MB", (), {
+            "warning": staticmethod(lambda *a, **k: 16384),
+            "StandardButton": type("SB", (), {"Yes": 16384, "No": 65536}),
+        }),
+    )
+    # The parent's own row must not trip the writer-holds guard: the held
+    # stamp is the sibling, and the bare parent stamp is only its PREFIX.
+    assert page._writer_holds_session_files(parent) is False
+    assert page._writer_holds_session_files(sibling) is True
+    page._delete_session(page._record_for_session(parent))
+    # The delete went through (the substring version refused it).
+    assert not list(page._dir.glob(f"livetrans_{parent}_all.txt"))
+
+
+def test_export_button_disabled_in_ui_while_record_is_ending(page):
+    """ENDING disables the export button in the UI (the handler's
+    authoritative check stays as the guard); a closed record keeps it
+    enabled."""
+    page._list.setCurrentRow(0)
+    stamp = page._list.item(0).record["session"]
+    page.set_transcript_writer(_FakeWriter(active=None, ending=stamp))
+    page._ending_session_id = stamp
+    page.on_session_state_changed("ending", stamp)
+    assert page._export_btn.isEnabled() is False
+
+    page.set_transcript_writer(_FakeWriter(active=None, ending=None))
+    page._ending_session_id = None
+    page.on_session_state_changed("idle")
+    assert page._export_btn.isEnabled() is True
+
+
+def test_refresh_with_preserved_selection_updates_detail_in_place(page):
+    """A refresh that preserves the selection must still re-sync the
+    detail pane's data (title, meta) — without switching the tab or
+    resetting the record view, and without touching a running worker."""
+    page._list.setCurrentRow(0)
+    stamp = page._list.item(0).record["session"]
+    # Move to the full-record tab and render entries.
+    page._tabs.setCurrentIndex(1)
+    rendered_before = page._entries_rendered
+    layout_before = page._record_area._layout.count()
+
+    records.set_session_title(page._dir, stamp, "刷新后的标题")
+    page.refresh()
+
+    assert page._title_label.text() == "刷新后的标题"
+    # No tab switch, no record-view reset.
+    assert page._tabs.currentIndex() == 1
+    assert page._entries_rendered == rendered_before
+    assert page._record_area._layout.count() == layout_before
+
+
+# --- app-level end entry (identity through the confirmation dialog) ---------------
+
+
+def test_end_recording_session_re_verifies_the_named_meeting(monkeypatch):
+    """The authoritative end entry re-checks the expected meeting right
+    before the ENDING flip: the caller's confirmation dialog pumps a
+    nested event loop, so an end plus a new begin can land under it. A
+    request naming the old meeting must refuse rather than end the new
+    one; a matching (or absent) identity proceeds."""
+    main = pytest.importorskip(
+        "main", reason="main.py needs torch + PyQt6, which the offline job skips"
+    )
+
+    app = object.__new__(main.LiveTranslateApp)
+    app._session_state = main.SessionState.ACTIVE
+    app._ending_thread = None
+    app._session_generation = 7
+    app._session_ui_callback = None
+
+    class _Writer:
+        def __init__(self, stamp):
+            self._stamp = stamp
+
+        def active_session(self):
+            return self._stamp
+
+    app._transcript = _Writer("20260905_100000")
+
+    started = []
+
+    class _FakeThread:
+        def __init__(self, target=None, name=None, daemon=None):
+            self._target = target
+
+        def start(self):
+            started.append(self._target)
+
+    monkeypatch.setattr(main.threading, "Thread", _FakeThread)
+
+    # A different meeting is open than the one the request named: refused
+    # before the ENDING flip, nothing started.
+    assert app.end_recording_session(expected_session="20260905_090000") is False
+    assert started == []
+    assert app._session_state == main.SessionState.ACTIVE
+
+    # The matching identity flips to ENDING and starts the close.
+    assert app.end_recording_session(expected_session="20260905_100000") is True
+    assert len(started) == 1
+    assert app._session_state == main.SessionState.ENDING
