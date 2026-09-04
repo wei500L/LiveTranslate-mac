@@ -15,6 +15,9 @@ from transcript_writer import TranscriptWriter, delete_session, read_session_met
 def _writer(tmp_path):
     writer = TranscriptWriter(tmp_path)
     writer.set_enabled(True)
+    # Entry writes only auto-open a session while the pipeline records
+    # (the legacy path); explicit begin/end is tested separately.
+    writer.set_recording(True)
     return writer
 
 
@@ -320,11 +323,25 @@ class _SupersededApp:
         self._translator_generation = 99          # newer than the request's
         self._translated = translated
         self.commits = []
+        # _translate_async keys its session-work release to the msg's
+        # generation (session_generation arg, falling back to the current
+        # one) and goes through the tracker; the stub mirrors the app's
+        # fields so that bookkeeping works. On a fresh tracker the
+        # superseded request's release is a no-op (generation unknown),
+        # which is exactly the stub's situation.
+        from main import _SessionWorkTracker
+
+        self._session_generation = 1
+        self._session_work = _SessionWorkTracker()
 
     # The request was snapshotted under an older generation.
     def _commit_translation_result(self, msg_id, text, translated, generation):
         self.commits.append((msg_id, generation))
         return False                              # superseded
+
+    # _translate_async (the wrapper) funnels into the real inner method,
+    # which is bound onto the class below together with the wrapper.
+    _translate_async_inner = None
 
     class _Stub:
         def __init__(self, outer):
@@ -340,6 +357,9 @@ def test_a_superseded_translation_still_closes_out_its_entry(tmp_path):
     the entry must still be released or it stalls every later one."""
     main = pytest.importorskip("main")
     _SupersededApp._translate_async = main.LiveTranslateApp._translate_async
+    _SupersededApp._translate_async_inner = (
+        main.LiveTranslateApp._translate_async_inner
+    )
 
     writer = _writer(tmp_path)
     app = _SupersededApp(writer)
@@ -365,6 +385,9 @@ def test_a_superseded_translation_still_closes_out_its_entry(tmp_path):
 def test_a_superseded_empty_translation_also_closes_out(tmp_path):
     main = pytest.importorskip("main")
     _SupersededApp._translate_async = main.LiveTranslateApp._translate_async
+    _SupersededApp._translate_async_inner = (
+        main.LiveTranslateApp._translate_async_inner
+    )
 
     writer = _writer(tmp_path)
     app = _SupersededApp(writer, translated="")

@@ -107,6 +107,22 @@ QToolButton {{ background: transparent; border: 1px solid transparent; border-ra
 QToolButton:hover {{ background: #2b2b28; border-color: #5a503f; }}
 QHeaderView::section {{ background: #202526; color: {COLORS['muted']}; border: 0; border-bottom: 1px solid #3b4241; padding: 8px; font-weight: 600; }}
 QToolTip {{ background: #1b2530; color: {COLORS['text']}; border: 1px solid #4b6572; padding: 5px; }}
+
+/* Meeting records page */
+QLabel[role="detailTitle"] {{ font-size: 17px; font-weight: 700; color: {COLORS['text']}; }}
+QLabel[role="muted"] {{ color: {COLORS['muted']}; }}
+QLabel[role="statusLabel"] {{ color: {COLORS['accent']}; font-size: 12px; }}
+QPushButton[role="tertiary"] {{ background: transparent; border: 1px solid {COLORS['line']}; }}
+QFrame[role="recordEntry"] {{
+    background: rgba(255, 255, 255, 5);
+    border: 0; border-radius: 7px;
+}}
+QLabel[role="timestamp"] {{ color: {COLORS['accent']}; font-size: 10px; }}
+QLabel[role="recordOriginal"] {{ color: {COLORS['muted']}; font-size: 12px; }}
+QTextBrowser#recordsMinutes, QTextBrowser#recordsInfo {{
+    background: {COLORS['surface']}; border: 1px solid #2c353d; border-radius: 10px;
+    padding: 14px;
+}}
 """
 
 

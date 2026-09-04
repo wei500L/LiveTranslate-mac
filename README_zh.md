@@ -24,6 +24,9 @@ Windows/macOS 实时音频翻译工具。Windows 使用 WASAPI loopback，macOS 
 - **多 ASR 引擎**：faster-whisper、SenseVoice、FunASR Nano、Anime-Whisper、GigaAM（俄语）
 - **远程 ASR**：通过 HTTP 把语音识别放到 GPU 机器上跑 —— 见 [REMOTE_ASR.md](REMOTE_ASR.md)
 - **兼容任意 OpenAI 格式 API**：DeepSeek、Grok、Qwen、GPT、Ollama、vLLM 等
+- **会议记录中心**：每场会议自动存档（原文/译文/Markdown/元数据），可搜索、筛选、重命名，正在记录/已暂停/正在保存/异常中断各有明确标注。一场记录可以随时「结束本次记录」收尾——后台等待最后的识别与翻译完成（最多 30 秒，没等到的按原文保存），不退出应用、不卸载模型；结束后应用停止监听（模型驻留内存），记录立即选中且不再被任何后台结果改动，可生成 AI 纪要或导出 PDF；「开始新记录」先建新会话再恢复监听，同秒连开也不会写串文件
+- **AI 会议纪要**：从你已配置的模型中独立选择供应商，把整场记录生成为结构化 Markdown 纪要（会议/课堂双模板），可编辑、可标记过期后重新生成；长会议自动分块提取再逐级汇总。⚠️ 云端供应商会把完整记录发送给第三方，介意隐私请选本地模型（LM Studio、Ollama 等）
+- **PDF 会议纪要导出**：A4 排版、含标题/元数据/页码的「仅纪要」或「纪要+完整双语记录」两种 PDF，文字可搜索复制
 - **流式翻译显示**：翻译结果逐字实时显示
 - **模型独立配置**：流式传输、结构化输出(JSON)、上下文历史、禁用思考
 - **麦克风混音**：可选将麦克风输入混合到系统音频一起识别
@@ -173,6 +176,11 @@ main.py                 主入口，管线编排
 ├── subtitle_overlay.py PyQt6 透明悬浮窗
 ├── control_panel.py    设置面板 UI (8 个页面，含会议记录)
 ├── transcript_writer.py 会议记录：每场生成文本 + Markdown + 元数据
+├── meeting_records.py  会议记录数据层：列表/解析/标题/纪要存取
+├── meeting_records_page.py 会议记录中心页面（主从布局、搜索筛选）
+├── meeting_records_widgets.py 记录中心的列表行/记录渲染/纪要 HTML 组件
+├── ai_summary_service.py AI 会议纪要：模板、分块汇总、后台线程
+├── pdf_exporter.py     PDF 纪要导出（QTextDocument + QPdfWriter）
 ├── dialogs.py          设置向导、下载、模型配置对话框
 ├── benchmark.py        翻译基准测试
 └── debug_pipeline.py   诊断工具：把音频文件喂进真实管线
