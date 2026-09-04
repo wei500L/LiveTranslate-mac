@@ -171,7 +171,12 @@ transcript_writer.py     Per-session meeting record: original/translation/all te
                          writer still hold" (open, closing, or half-dead) —
                          callers must use it instead of path substrings (a
                          bare stamp is a prefix of its same-second suffixed
-                         siblings). Staged sidecar writes use a
+                         siblings). It shares its condition with
+                         `has_open_resources()` through
+                         `_holds_session_resources_locked()` — one predicate
+                         behind both answers, so the IDLE gate and the
+                         ownership check cannot drift apart. Staged sidecar
+                         writes use a
                          per-call UUID suffix (`.tmp<pid>.<uuid>`): a pid+
                          counter is unique only within one module, and
                          meeting_records stages the same file with the same
@@ -348,7 +353,17 @@ meeting_records_page.py  The records-center page (ControlPanel "Meeting Records"
                          minutes and button states, but never the record
                          view's scroll, never the current tab, and never a
                          running generation's status text) — only a real
-                         session switch does the full load.
+                         session switch does the full load. That in-place
+                         re-sync runs only when the rows carry fresh data:
+                         a pure search/filter change goes through
+                         `_on_filter_changed` and rebuilds the list from the
+                         same `_sessions` snapshot without touching the
+                         detail pane (no minutes re-read or Markdown
+                         re-render per keystroke), and
+                         `refresh(select_session=...)` passes its target
+                         into `_refill_list` so the target row is landed on
+                         directly — the previous selection's detail is never
+                         synced on the way to a different target.
                          Dependency injection is public API:
                          `set_transcript_writer(writer)` /
                          `set_summary_registry(registry)`. Page-owned

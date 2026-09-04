@@ -181,13 +181,15 @@ def list_sessions(base_dir: Path, active_session: str | None = None,
         )
         # The committed state is "the pair loads and verifies" — a meta without
         # a matching body (interrupted commit) must not show as summarized.
-        record["has_summary"] = load_summary(base_dir, record["session"]) is not None
-        if record["has_summary"]:
-            summary_meta = _summary_meta_path(base_dir, record["session"])
-            try:
-                meta = json.loads(summary_meta.read_text(encoding="utf-8"))
-            except (OSError, ValueError):
-                meta = {}
+        # The verified meta is reused rather than re-read from disk: one
+        # read per session per listing, and the edited/stale verdicts then
+        # come from exactly the meta whose hash was checked (a second read
+        # could even observe a *newer* meta than the body it verified).
+        # Only the meta is kept — the minutes body never lands on a record.
+        loaded = load_summary(base_dir, record["session"])
+        record["has_summary"] = loaded is not None
+        if loaded is not None:
+            meta = loaded["meta"]
             record["summary_edited"] = bool(meta.get("edited_by_user"))
             # A session still being recorded grows by definition; a summary
             # snapshot of it is interim, not "stale" noise.
@@ -439,10 +441,6 @@ def source_hash(entries: list[dict]) -> str:
 def _summary_paths(base_dir: Path, stamp: str) -> tuple[Path, Path]:
     base = Path(base_dir) / f"livetrans_{stamp}_summary"
     return (base.with_suffix(".md"), base.with_name(base.name + "_meta.json"))
-
-
-def _summary_meta_path(base_dir: Path, stamp: str) -> Path:
-    return _summary_paths(base_dir, stamp)[1]
 
 
 def load_summary(base_dir: Path, stamp: str) -> dict | None:

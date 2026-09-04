@@ -339,6 +339,33 @@ def test_summary_without_hash_is_not_flagged_stale(tmp_path):
     assert records.summary_state(tmp_path, sessions[0]["session"], sessions[0]) == "ready"
 
 
+def test_list_sessions_reads_each_summary_meta_once(tmp_path, monkeypatch):
+    """list_sessions() reuses the meta load_summary() already read and
+    verified instead of re-reading the same meta JSON — one read per
+    summarized session per listing (it used to be read a second time
+    right after the pair verified)."""
+    from pathlib import Path
+
+    _write_session(tmp_path)
+    sessions = records.list_sessions(tmp_path)
+    stamp = sessions[0]["session"]
+    records.save_summary(tmp_path, stamp, "# m", {"edited_by_user": True})
+    meta_path = tmp_path / f"livetrans_{stamp}_summary_meta.json"
+    reads = []
+    real_read_text = Path.read_text
+
+    def _counting_read_text(self, *args, **kwargs):
+        if self == meta_path:
+            reads.append(self)
+        return real_read_text(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", _counting_read_text)
+    sessions = records.list_sessions(tmp_path)
+    assert sessions[0]["has_summary"] is True
+    assert sessions[0]["summary_edited"] is True
+    assert len(reads) == 1
+
+
 # --- summary persistence -----------------------------------------------------------
 
 

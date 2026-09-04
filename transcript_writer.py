@@ -234,6 +234,23 @@ class TranscriptWriter:
         with self._lock:
             return self._session_open or self._ending
 
+    def _holds_session_resources_locked(self) -> bool:
+        """Lock-held core shared by ``has_open_resources`` and
+        ``held_session``: True when any trace of a session survives — the
+        logical open flag, a close in progress, the opened-file-set flag,
+        live file handles, a session stamp or paths. One implementation so
+        the two public answers cannot drift: the IDLE broadcast gate and
+        the records center's exact file-ownership check must agree about
+        the same half-dead-close states."""
+        return bool(
+            self._session_open
+            or self._ending
+            or self._opened
+            or self._files
+            or self._session_ts is not None
+            or self._paths
+        )
+
     def has_open_resources(self) -> bool:
         """True when anything of a session is still held: the logical open
         flag, a close in progress, the opened-file-set flag, live file
@@ -243,14 +260,7 @@ class TranscriptWriter:
         has_open_session() both answer False. The IDLE broadcast gates on
         this being False."""
         with self._lock:
-            return bool(
-                self._session_open
-                or self._ending
-                or self._opened
-                or self._files
-                or self._session_ts is not None
-                or self._paths
-            )
+            return self._holds_session_resources_locked()
 
     def session_paths(self) -> dict:
         with self._lock:
@@ -279,8 +289,9 @@ class TranscriptWriter:
         """The stamp of the session whose files this writer still holds, or
         None — open, closing, or half-dead after a failed close (the state
         where ``active_session()``/``ending_session()`` answer None but
-        handles and paths survive). Mirrors ``has_open_resources`` for the
-        stamp.
+        handles and paths survive). Answers None exactly when
+        ``has_open_resources`` answers False: both read the shared
+        lock-held predicate, so the two answers cannot drift apart.
 
         Callers must use this instead of inferring ownership from path
         strings: a bare stamp is a *prefix* of its same-second suffixed
@@ -291,14 +302,7 @@ class TranscriptWriter:
         each set/clear the stamp and the paths together under this lock.
         """
         with self._lock:
-            if not (
-                self._session_open
-                or self._ending
-                or self._opened
-                or self._files
-                or self._session_ts is not None
-                or self._paths
-            ):
+            if not self._holds_session_resources_locked():
                 return None
             return self._session_ts
 

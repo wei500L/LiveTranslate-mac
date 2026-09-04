@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-09-05 (round 4)
+- Search and filtering no longer reload the detail pane: every keystroke in the search box (or a filter switch) used to re-read the selected meeting's summary pair, re-render the Markdown and rebuild the provider/language options even though nothing had changed. Search/filter now rebuilds the list rows from the data already in hand; the detail data syncs only on a manual refresh, a session-state change or a completed generation — the current tab, the record view's scroll position and any running summary generation stay untouched, and the fallback selection when the filter removes the current row still loads its detail as before
+- The records list reads each summary meta once: a listing used to read the same meta JSON twice per summarized session (once inside the pair's hash verification, then again right after); it now reuses the verified meta — one read per session per listing, and the edited/stale verdicts come from exactly the meta whose hash was checked
+- Landing on a just-ended meeting loads its detail once: the refresh used to re-sync the previously selected meeting's detail first and then load the target; the target session is now decided up front and the detail is updated once
+- The writer's six-part "still holds session resources" check is now one lock-held private predicate shared by the IDLE broadcast gate and the records center's exact file-ownership query, so the two answers cannot drift apart
+- Static test additions (not executed): zero disk reads on search/filter, the fallback load when the filter removes the selection, a single detail load for the target session, a single read of each summary meta
+
 ## 2026-09-05 (round 3)
 - Closed the end-confirmation race: the end request now carries the target session id all the way into the app's authoritative end entry, re-verified atomically right before the state flips to ENDING — the confirmation dialog pumps a nested event loop, under which the old meeting can end and a new one begin, and the post-dialog call used to be argument-less, ending "whatever happens to be active". The overlay's end button also fixes its target identity before the dialog opens; a mismatch shows a notice instead of acting
 - Fixed rename touching a destroyed list row: a refresh under the rename dialog clears the list and deletes the old row's C++ object, and the post-dialog update on it crashed; the row is now re-located by session id, and a meeting deleted under the dialog refuses the rename (no sidecar resurrected for deleted files, no phantom record)

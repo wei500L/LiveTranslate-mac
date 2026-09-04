@@ -238,7 +238,11 @@ class MeetingRecordsPage(QWidget):
         self._search = QLineEdit()
         self._search.setPlaceholderText(t("records_search_placeholder"))
         self._search.setClearButtonEnabled(True)
-        self._search.textChanged.connect(self._refill_list)
+        # Filter changes rebuild the list only (see _on_filter_changed):
+        # connecting _refill_list directly would re-sync the preserved
+        # selection's detail — a minutes re-read plus a Markdown re-render
+        # on every keystroke — for data that did not change.
+        self._search.textChanged.connect(self._on_filter_changed)
         search_row.addWidget(self._search, 1)
         self._refresh_btn = QPushButton(t("btn_refresh"))
         self._refresh_btn.clicked.connect(self.refresh)
@@ -250,7 +254,7 @@ class MeetingRecordsPage(QWidget):
         for key in ("records_filter_all", "records_filter_summarized",
                     "records_filter_unsummarized"):
             self._filter.addItem(t(key), key)
-        self._filter.currentIndexChanged.connect(self._refill_list)
+        self._filter.currentIndexChanged.connect(self._on_filter_changed)
         filter_row.addWidget(self._filter, 1)
         left_layout.addLayout(filter_row)
 
@@ -623,7 +627,11 @@ class MeetingRecordsPage(QWidget):
         except Exception:
             log.error("Could not list meeting records", exc_info=True)
             self._sessions = []
-        self._refill_list()
+        # The target, when there is one, travels into the refill so the
+        # list lands on it directly — restoring the previous selection
+        # first would load the old meeting's detail only to replace it
+        # with the target's a moment later.
+        self._refill_list(select_session=select_session)
         # After an end, land the user on the meeting that just completed so
         # "generate AI minutes" is one click away.
         if select_session:
@@ -639,8 +647,27 @@ class MeetingRecordsPage(QWidget):
                         self._load_session(item.record)
                     break
 
-    def _refill_list(self):
-        """Rebuild list rows from the search box, filter and session state."""
+    def _refill_list(self, select_session: str | None = None,
+                     sync_detail: bool = True):
+        """Rebuild list rows from the search box, filter and session state.
+
+        ``select_session`` — the row the caller already knows must end up
+        selected (refresh after an end landed). It outranks the preserved
+        selection, and its detail is deliberately *not* re-synced here: the
+        caller loads the target's final state itself, so no intermediate
+        detail load (the previously selected meeting's, or row 0's after a
+        vanished selection) happens on the way. When the target is not
+        among the visible rows (the user's search or filter hides it), the
+        selection falls back to the normal preserve logic.
+
+        ``sync_detail=False`` — a pure search/filter change: the rows are
+        rebuilt from the *same* ``_sessions`` snapshot, so the unchanged
+        selection's detail is already accurate. Skipping the re-sync
+        avoids re-reading the minutes pair from disk, re-rendering the
+        Markdown and rebuilding the provider/language combos on every
+        keystroke; a real selection change (the selected row filtered out,
+        the fallback row 0 selected) still loads its detail as usual.
+        """
         if not hasattr(self, "_list"):
             return
         # The selection survives the rebuild *by session identity*: clear()
@@ -675,26 +702,44 @@ class MeetingRecordsPage(QWidget):
                 else t("records_empty")
             )
             return
-        row = None
-        if previous is not None:
-            for i in range(self._list.count()):
-                if self._list.item(i).record.get("session") == previous:
-                    row = i
-                    break
-        if row is None:
+        # The row to land on: the caller's target when it is visible,
+        # otherwise the preserved selection.
+        target = None
+        if select_session:
+            target = self._list_item_for_session(select_session)
+        if target is None:
+            target = self._list_item_for_session(previous)
+        if target is None:
             # Nothing to preserve (first fill, or the selected session no
             # longer matches the filter): select the top row for real,
             # loading its detail.
             self._list.setCurrentRow(0)
-        else:
-            # Same session re-selected: suppress the *load* (a full reload
-            # would switch the tab, reset the record view's scroll and
-            # re-run generation bookkeeping) — but the row's data is fresh,
-            # so the detail pane's data fields are re-synced in place.
-            self._suppress_selection = True
-            self._list.setCurrentRow(row)
-            self._suppress_selection = False
-            self._refresh_detail_for_record(self._list.item(row).record)
+            return
+        row = self._list.row(target)
+        # Same session re-selected: suppress the *load* (a full reload
+        # would switch the tab, reset the record view's scroll and
+        # re-run generation bookkeeping). The detail pane's data fields
+        # are re-synced in place only when the rows carry fresh data (a
+        # refresh) — and never for the caller's target session, whose
+        # final state the caller loads itself.
+        self._suppress_selection = True
+        self._list.setCurrentRow(row)
+        self._suppress_selection = False
+        if sync_detail and target.record.get("session") != select_session:
+            self._refresh_detail_for_record(target.record)
+
+    def _on_filter_changed(self, *_args):
+        """A search/filter change: rebuild the list, leave the detail alone.
+
+        Only *which* records match changed — the records themselves did
+        not — so the unchanged selection's minutes are not re-read from
+        disk, not re-rendered, the provider/language combos are not
+        rebuilt, and a running generation keeps owning the pane's status
+        text. Connected to both the search box and the filter combo (their
+        signal arguments are swallowed); a real selection change still
+        loads its detail through the normal selection path.
+        """
+        self._refill_list(sync_detail=False)
 
     def _refresh_detail_for_record(self, record: dict):
         """Re-sync the detail pane's *data* to a fresh record, in place.

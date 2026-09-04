@@ -837,6 +837,74 @@ def test_refresh_with_preserved_selection_updates_detail_in_place(page):
     assert page._record_area._layout.count() == layout_before
 
 
+def test_search_and_filter_rebuild_list_without_detail_reload(monkeypatch, page):
+    """A search/filter change rebuilds the list only: the unchanged
+    selection's minutes are not re-read from disk and not re-rendered (one
+    keystroke, zero records-layer reads). A query that filters the
+    selection out is a real selection change and loads the fallback row's
+    detail; a genuine refresh still re-syncs the detail in place."""
+    page._list.setCurrentRow(0)
+    selected = page._current_session()
+    assert selected == "20260102_090000"
+    summary_reads = []
+    real_load_summary = records.load_summary
+    monkeypatch.setattr(
+        records, "load_summary",
+        lambda base_dir, stamp: (
+            summary_reads.append(stamp), real_load_summary(base_dir, stamp))[1],
+    )
+    detail_loads = []
+    monkeypatch.setattr(
+        page, "_load_minutes",
+        lambda record: detail_loads.append(record.get("session")),
+    )
+
+    # A query that keeps the selected row visible: list-only rebuild.
+    page._search.setText("SenseVoice")
+    assert page._list.count() == 2
+    assert page._current_session() == selected  # selection survived
+    assert summary_reads == []
+    assert detail_loads == []
+
+    # A filter switch with the row still visible: same.
+    page._filter.setCurrentIndex(2)  # unsummarized: both rows stay
+    assert page._list.count() == 2
+    assert summary_reads == []
+    assert detail_loads == []
+
+    # A query that filters the selection out is a *real* selection change:
+    # the fallback row 0 loads its detail through the normal path.
+    page._search.setText("20260101")
+    assert page._list.count() == 1
+    assert page._current_session() == "20260101_090000"
+    assert detail_loads == ["20260101_090000"]
+
+    # A genuine refresh (fresh data) re-syncs the preserved selection.
+    page.refresh()
+    assert detail_loads == ["20260101_090000", "20260101_090000"]
+
+
+def test_refresh_selecting_a_target_loads_only_the_target(monkeypatch, page):
+    """refresh(select_session=...) lands on the target meeting with exactly
+    one detail load: the refill must not first re-sync the previously
+    selected meeting's detail (or load row 0 after a vanished selection)
+    only to replace it with the target a moment later."""
+    page._list.setCurrentRow(1)  # the older meeting, not the target
+    older = page._current_session()
+    target = page._list.item(0).record["session"]
+    assert older != target
+    detail_loads = []
+    monkeypatch.setattr(
+        page, "_load_minutes",
+        lambda record: detail_loads.append(record.get("session")),
+    )
+    page.refresh(select_session=target)
+    assert page._current_session() == target
+    # Exactly one load, and it is the target — the older meeting's detail
+    # was never loaded on the way.
+    assert detail_loads == [target]
+
+
 # --- app-level end entry (identity through the confirmation dialog) ---------------
 
 
