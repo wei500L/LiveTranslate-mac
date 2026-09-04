@@ -244,6 +244,40 @@ def test_broken_summary_pair_loads_as_absent(tmp_path):
     assert records.load_summary(tmp_path, "20260101_090000") is None
 
 
+def test_orphan_summary_body_loads_as_absent(tmp_path):
+    """A crash before the meta replace leaves a body with no meta: the meta
+    is the commit marker, so the orphan body is not a committed summary."""
+    (tmp_path / "livetrans_20260101_090000_summary.md").write_text(
+        "# half-written", encoding="utf-8"
+    )
+    assert records.load_summary(tmp_path, "20260101_090000") is None
+
+
+def test_corrupt_summary_meta_loads_as_absent(tmp_path):
+    (tmp_path / "livetrans_20260101_090000_summary.md").write_text(
+        "x", encoding="utf-8"
+    )
+    (tmp_path / "livetrans_20260101_090000_summary_meta.json").write_text(
+        "{not json", encoding="utf-8"
+    )
+    assert records.load_summary(tmp_path, "20260101_090000") is None
+
+
+def test_legacy_summary_without_hash_is_accepted(tmp_path):
+    """Summaries written before content_sha256 existed are valid content —
+    only unverifiable, not broken."""
+    (tmp_path / "livetrans_20260101_090000_summary.md").write_text(
+        "# old minutes", encoding="utf-8"
+    )
+    (tmp_path / "livetrans_20260101_090000_summary_meta.json").write_text(
+        json.dumps({"provider_name": "Old", "generated_at": "2025-12-01"}),
+        encoding="utf-8",
+    )
+    loaded = records.load_summary(tmp_path, "20260101_090000")
+    assert loaded is not None
+    assert loaded["content"] == "# old minutes"
+
+
 def test_load_summary_of_missing_session_is_none(tmp_path):
     assert records.load_summary(tmp_path, "nope") is None
 

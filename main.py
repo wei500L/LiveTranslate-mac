@@ -878,20 +878,53 @@ class LiveTranslateApp:
         self._notify_session_state(SessionState.ENDING, session_id)
 
         def _work():
-            summary = self._run_session_end(generation)
-            if summary is None:
-                # Superseded by a quit (generation moved). The stop() path
-                # owns the final close.
+            summary = None
+            try:
+                summary = self._run_session_end(generation)
+            except Exception:
+                # The close itself failed (I/O error in the flush, the seal,
+                # anywhere). Keep whatever of the meeting is already on disk
+                # — end_session is written so its partial failure cannot
+                # destroy it — and still leave ENDING: a state machine that
+                # parks in ENDING forever locks out every button.
+                log.error(
+                    "Session end failed; record kept as-is, state -> IDLE",
+                    exc_info=True,
+                )
+                # _run_session_end's supersede never ran; retire the
+                # generation here so the tracker drops its CLOSING entry
+                # (the writer may or may not have sealed — either way the
+                # state below makes the generation invalid).
+                self._session_work.supersede(generation)
+            if generation != self._session_generation:
+                # Superseded by a quit (the generation moved under us). The
+                # stop() path owns the final close.
                 return
             self._ending_session_id = None
-            ended = summary.get("session")
+            # Advance the generation so any work the close missed (a timed-
+            # out translation straggler, an ASR result still on the worker)
+            # is unambiguously invalid for the *next* session: the tracker
+            # already superseded this generation, and the bumped generation
+            # means a straggler carrying the old one fails the
+            # identity check at write time.
+            self._session_generation += 1
+            # end_session returns None when there was no open session (the
+            # close raced a stop, or a legacy auto session never opened):
+            # there is no summary to announce, only the state change.
+            ended = summary.get("session") if summary else session_id
             # Meeting over: the pipeline stays *paused*. Audio capture and
             # translation must not keep running on unrecorded audio — the
             # user asked to end the recording, not to keep listening. The
             # ASR model stays loaded; "Start new recording" resumes capture
-            # after its session opens.
+            # after its session opens. summary=None signals "kept as-is"
+            # (close failure or no session); the UI treats it the same as a
+            # completed end — the record is on disk and viewable.
             self._notify_session_state(SessionState.IDLE, ended, summary)
-            log.info("Recording session ended: %s", ended)
+            log.info(
+                "Recording session ended: %s%s",
+                ended,
+                "" if summary else " (no summary; close failed or no session)",
+            )
 
         self._ending_thread = threading.Thread(
             target=_work, name="session-end", daemon=True
@@ -951,12 +984,15 @@ class LiveTranslateApp:
             self._session_work.supersede(generation)
             return summary
         finally:
-            # Meeting over, pipeline stays quiet: pause rather than resume.
-            # set_running(False) visuals are the main() handler's job (it
-            # receives the IDLE notification); the flag itself is paused so
-            # capture stops listening.
-            self.resume_after_session_end()
+            # Order matters: pause first, *then* lift the capture gate. The
+            # gate exists so the ENDING flush owns the VAD buffer; between
+            # "gate lifted" and "_paused observed by the capture thread" the
+            # capture loop would keep consuming audio and feeding VAD — a
+            # short re-listen window on a meeting the user just ended. With
+            # _paused set first, the capture loop's own pause check drops
+            # every chunk before the gate is even consulted.
             self._paused = True
+            self.resume_after_session_end()
 
     def pause_for_session_end(self):
         """Gate the capture loop's VAD feed during ENDING without touching
@@ -996,8 +1032,11 @@ class LiveTranslateApp:
         ordinary capture segments go through the tracker's ``admit``
         (register / pass / drop), the one final flush goes through
         ``register_final`` (allowed while CLOSING, refused once SUPERSEDED).
-        Overflow handling mirrors _enqueue_asr: a dropped victim releases
-        its count, a failed put releases the item's own count.
+        The item carries the writer's current session stamp for the
+        write-time identity check (run before end_session, so the session
+        is still open here). Overflow handling mirrors _enqueue_asr: a
+        dropped victim releases its count, a failed put releases the item's
+        own count.
         """
         if self._stop_event.is_set():
             return
@@ -1005,7 +1044,10 @@ class LiveTranslateApp:
         if not self._session_work.register_final(generation, work_id):
             log.debug("Dropping ENDING flush for superseded generation")
             return
-        item = ("vad_flush", segment, work_id, generation)
+        item = (
+            "vad_flush", segment, work_id, generation,
+            self._transcript.active_session(),
+        )
         try:
             self._asr_queue.put_nowait(item)
             return
@@ -2624,17 +2666,20 @@ class LiveTranslateApp:
         self._paused = False
         log.info("Pipeline resumed")
 
-    def _process_segment(self, speech_segment, work_id=None, generation=None):
+    def _process_segment(self, speech_segment, work_id=None, generation=None,
+                         expected_session=None):
         """Run ASR + translation on a speech segment. Called from ASR thread
-        and stop(). ``work_id``/``generation`` identify this queue item's
-        session work; ``generation`` guards the *stale segment* case — an
-        end+begin racing the queue means the item's session is closed while
-        the writer already has a *new* session open: without this guard the
-        old audio's original would be written into the new meeting's files
-        (ghost cross-session writing). A segment whose session ended but
-        whose generation is still current (end completed, no new begin) is
-        safe to process: the writer itself refuses the write and the
-        tracker refuses the msg count."""
+        and stop(). ``work_id``/``generation``/``expected_session`` identify
+        this queue item's session work and meeting; ``generation`` guards
+        the *stale segment* case — an end+begin racing the queue means the
+        item's session is closed while the writer already has a *new*
+        session open: without this guard the old audio's original would be
+        written into the new meeting's files (ghost cross-session writing).
+        A segment whose session ended but whose generation is still current
+        (end completed, no new begin) is safe to process: the writer itself
+        refuses the write and the tracker refuses the msg count.
+        ``expected_session`` is re-checked by the writer inside its own
+        lock, the final authority for what lands in a session's files."""
         if generation is not None and generation != self._session_generation:
             log.info(
                 "Dropping segment from superseded session generation %s "
@@ -2698,9 +2743,13 @@ class LiveTranslateApp:
             self._overlay.add_message(
                 msg_id, timestamp, original_text, source_lang, asr_ms
             )
+        # expected_session (from the queue item) is the write-time identity
+        # check: the writer refuses the entry inside its own lock when the
+        # session that is open now is not the one this audio belongs to.
         self._transcript.write_original(
             msg_id, timestamp, original_text,
             language=source_lang, duration=seg_len,
+            session=expected_session,
         )
         # Legacy auto-open path: the writer just opened a session because an
         # entry arrived while none was begun explicitly. Adopt it into the
@@ -2924,11 +2973,12 @@ class LiveTranslateApp:
         )
         return unspaced >= len(letters) * 0.6
 
-    def _do_interim_asr(self, generation=None) -> bool:
+    def _do_interim_asr(self, generation=None, expected_session=None) -> bool:
         """Run ASR on current VAD buffer, output complete sentences, trim consumed audio.
-        Returns True if any sentences were committed. ``generation`` is the
-        interim queue item's session generation, threaded into each committed
-        sentence so a session superseded mid-pass cannot receive them."""
+        Returns True if any sentences were committed. ``generation``/
+        ``expected_session`` are the interim queue item's session identity,
+        threaded into each committed sentence so a session superseded
+        mid-pass cannot receive them."""
         with self._vad_lock:
             peek = self._vad.peek_buffer()
         if peek is None:
@@ -3032,7 +3082,8 @@ class LiveTranslateApp:
                 self._interim_pending = ""
 
             self._process_segment_text(text, result_lang, asr_ms,
-                                       generation=generation)
+                                       generation=generation,
+                                       expected_session=expected_session)
             actually_committed = True
             consumed_any = True
 
@@ -3083,12 +3134,13 @@ class LiveTranslateApp:
         self._interim_committed_tail = ""
 
     def _process_segment_text(self, text: str, source_lang: str, asr_ms: float = 0,
-                              work_id=None, generation=None):
+                              work_id=None, generation=None, expected_session=None):
         """Output a text result (from interim or final) — similar to
         _process_segment but skips ASR. ``generation`` guards the stale-
         segment case exactly as in _process_segment (an interim sentence
         committed by a queue item whose session ended while a newer one
-        began must not land in the newer meeting)."""
+        began must not land in the newer meeting); ``expected_session`` is
+        the writer-side identity check for the same purpose."""
         if generation is not None and generation != self._session_generation:
             log.info(
                 "Dropping interim text from superseded session generation %s",
@@ -3118,7 +3170,8 @@ class LiveTranslateApp:
         if self._overlay:
             self._overlay.add_message(msg_id, timestamp, original_text, source_lang, asr_ms)
         self._transcript.write_original(
-            msg_id, timestamp, original_text, language=source_lang
+            msg_id, timestamp, original_text, language=source_lang,
+            session=expected_session,
         )
         # Legacy auto-open adoption (see _process_segment): begin() the
         # tracker for the adopted generation and re-register this msg, so
@@ -3177,7 +3230,8 @@ class LiveTranslateApp:
                 self._finalize_untranslated(
                     msg_id, "translation executor shut down", user_visible=False
                 )
-    def _process_interim_final(self, speech_segment, work_id=None, generation=None):
+    def _process_interim_final(self, speech_segment, work_id=None, generation=None,
+                               expected_session=None):
         """Handle VAD flush after interim outputs were already made."""
         seg_len = len(speech_segment) / 16000
         log.info(f"Interim final segment: {seg_len:.1f}s")
@@ -3199,7 +3253,8 @@ class LiveTranslateApp:
                 if lang == "auto":
                     lang = "unknown"
                 self._process_segment_text(text, lang, work_id=work_id,
-                                            generation=generation)
+                                            generation=generation,
+                                            expected_session=expected_session)
             return
 
         validated = validate_asr_result(result, "interim_final")
@@ -3238,7 +3293,8 @@ class LiveTranslateApp:
             if result_lang == "auto":
                 result_lang = "unknown"
         self._process_segment_text(original_text, result_lang, asr_ms,
-                                   work_id=work_id, generation=generation)
+                                   work_id=work_id, generation=generation,
+                                   expected_session=expected_session)
 
     def _capture_loop(self):
         silence_chunk = np.zeros(
@@ -3350,15 +3406,23 @@ class LiveTranslateApp:
         meeting) the registration is refused, so a segment produced but not
         yet enqueued at that moment is dropped here rather than racing the
         end. The ENDING flush goes through _enqueue_final_segment instead.
+
+        The item carries both the registration generation and the writer's
+        session stamp, snapshotted together, so the ASR result can be
+        identity-checked at write time: a session that ended (and possibly
+        re-opened as a new one) between enqueue and recognition can never
+        receive the old audio's entries.
         """
         if self._stop_event.is_set():
             return
-        # The generation is snapshotted atomically with the admission
-        # decision so the item and its count describe the same session: a
-        # begin/end racing this line can no longer make a queued segment
-        # land under the neighbouring generation.
+        # The generation and the writer's session stamp are snapshotted
+        # atomically with the admission decision so the item, its count and
+        # its expected session describe the same meeting: a begin/end racing
+        # this line can no longer make a queued segment land under the
+        # neighbouring session.
         with self._session_work_lock:
             generation = self._session_generation
+        expected_session = self._transcript.active_session()
         decision = self._session_work.admit(generation)
         if decision == "drop":
             # The user ended this meeting (CLOSING/closed): recognising the
@@ -3371,7 +3435,7 @@ class LiveTranslateApp:
             if not self._session_work.register(generation, work_id, seg_type):
                 return
         # decision == "pass": subtitle-only (no session to count or wait on)
-        item = (seg_type, segment, work_id, generation)
+        item = (seg_type, segment, work_id, generation, expected_session)
         try:
             self._asr_queue.put_nowait(item)
             return
@@ -3434,7 +3498,7 @@ class LiveTranslateApp:
             if item is None:
                 break
 
-            seg_type, segment, work_id, work_generation = item
+            seg_type, segment, work_id, work_generation, expected_session = item
 
             # One bad result must not take the ASR thread down with it: without
             # this the pipeline goes permanently silent while capture keeps
@@ -3451,9 +3515,13 @@ class LiveTranslateApp:
                 if seg_type == "vad_flush":
                     try:
                         if self._interim_active:
-                            self._process_interim_final(segment, work_id, work_generation)
+                            self._process_interim_final(
+                                segment, work_id, work_generation, expected_session
+                            )
                         else:
-                            self._process_segment(segment, work_id, work_generation)
+                            self._process_segment(
+                                segment, work_id, work_generation, expected_session
+                            )
                     finally:
                         self._reset_interim_state()
                 elif seg_type == "interim":
@@ -3462,7 +3530,7 @@ class LiveTranslateApp:
                     # _process_segment_text (keyed to this item's
                     # generation); this queue item's work_id is released by
                     # the finally below, so no hand-off here.
-                    self._do_interim_asr(work_generation)
+                    self._do_interim_asr(work_generation, expected_session)
                     with self._vad_lock:
                         self._last_interim_samples = self._vad._speech_samples
             except ASRProtocolError as exc:
@@ -3492,7 +3560,15 @@ class LiveTranslateApp:
                     if item is None:
                         self._stop_event.set()
                     else:
-                        log.warning("ASR queue full while requeueing %s", item[0])
+                        # The requeue failed: the item is out of the queue and
+                        # will never be processed, so its work count must be
+                        # released here or an ENDING wait would block on it
+                        # until the timeout.
+                        log.warning(
+                            "ASR queue full while requeueing %s; dropping it "
+                            "and releasing its session work", item[0],
+                        )
+                        self._release_queued_work(item)
                 break
             # A duplicate interim request dropped before processing: its
             # work count must go or ENDING would wait for it forever.

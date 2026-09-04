@@ -126,7 +126,13 @@ def list_sessions(base_dir: Path, active_session: str | None = None) -> list[dic
         #   interrupted    — no footer, no active writer: a crash, kill or
         #                    SIGINT left the files behind mid-meeting.
         # Pre-footer sessions (older than the summary footer) count as ended:
-        # a sidecar "ended" timestamp is the same class of evidence.
+        # a sidecar "ended" timestamp is the same class of evidence. The
+        # writer sets "ended" exactly once at the seal (a live session's
+        # sidecar carries no "ended" at all), so a false "cleanly ended" for
+        # a crashed live session is not possible under the current writer;
+        # records from writers that pre-dated that invariant may still show
+        # an "ended" snapshot from a mid-session sidecar rewrite — the
+        # footer check stays authoritative for them.
         record["ended_cleanly"] = (
             _meeting_has_footer(base_dir, stamp)
             or bool(record.get("ended"))
@@ -398,9 +404,17 @@ def load_summary(base_dir: Path, stamp: str) -> dict | None:
 
     Broken pairs are reported as absent — the UI shows the empty state and the
     user can regenerate, rather than an error for a file they cannot fix.
-    A meta whose ``content_sha256`` does not match the body is the signature
-    of a commit interrupted between the two ``os.replace`` calls; the pair is
-    treated as broken, not as a valid summary with new metadata over old text.
+
+    What counts as broken:
+    * a meta whose ``content_sha256`` does not match the body — a commit
+      interrupted between the two ``os.replace`` calls, i.e. new metadata
+      over old text;
+    * a body with **no readable meta** — the signature of a commit
+      interrupted *before* the meta replace (an orphan body). Treating that
+      as "committed" would present a half-written generation as the user's
+      minutes;
+    * a legacy meta **without** ``content_sha256`` is accepted: summaries
+      written before the field existed are valid content, only unverifiable.
     """
     md_path, meta_path = _summary_paths(Path(base_dir), stamp)
     if not md_path.is_file():
@@ -409,14 +423,22 @@ def load_summary(base_dir: Path, stamp: str) -> dict | None:
         content = md_path.read_text(encoding="utf-8")
     except OSError:
         return None
-    meta = {}
-    if meta_path.is_file():
-        try:
-            meta = json.loads(meta_path.read_text(encoding="utf-8"))
-        except (OSError, ValueError):
-            meta = {}
-        if not isinstance(meta, dict):
-            meta = {}
+    if not meta_path.is_file():
+        # Orphan body: the meta is the commit marker (it is written last,
+        # and it carries the body hash); without it this body was never
+        # committed as a summary.
+        log.warning("Summary body without meta for %s — treating as absent", stamp)
+        return None
+    try:
+        meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        # Unreadable/corrupt meta: the commit marker does not verify, so the
+        # pair does not count as a committed summary.
+        log.warning("Unreadable summary meta for %s — treating as absent", stamp)
+        return None
+    if not isinstance(meta, dict):
+        log.warning("Invalid summary meta for %s — treating as absent", stamp)
+        return None
     stored = meta.get("content_sha256")
     if stored:
         digest = hashlib.sha256(content.encode("utf-8")).hexdigest()

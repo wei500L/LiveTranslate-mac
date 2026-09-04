@@ -269,24 +269,43 @@ def _write_entries(
 
 # --- printing ----------------------------------------------------------------------
 
+# Space reserved at the bottom of every page for the footer band, in
+# millimetres. The content area is the page minus this reserve, so a page's
+# last text line can never sit under the footer.
+_FOOTER_RESERVE_MM = 12.0
+
+
 def _print_with_page_numbers(writer: QPdfWriter, doc: QTextDocument, title: str):
     """Two-pass print: paginate once, then draw content + footer per page.
 
-    ``doc.drawContents`` with a clip rect draws only the part of the document
-    inside the rect — each page iterates the whole document but paints just
-    its own slice, so page N never repeats page N-1's content. The document
-    is laid out exactly once against the writer's device resolution before
-    pagination; no per-page clone is needed (a previous version cloned the
-    document per page and never drew the clone — pure waste).
+    Pagination and drawing share one content height: the page height minus
+    the footer reserve. Each page translates the painter by its slice and
+    asks ``drawContents`` for that slice's document rectangle — passing the
+    same top-of-document rect every page (the previous version) re-painted
+    page 1 on every page, because drawContents clips in *document*
+    coordinates and the painter starts every page at the origin.
     """
-    doc.setPageSize(QSizeF(writer.width(), writer.height()))
+    reserve = writer.logicalDpiY() * _FOOTER_RESERVE_MM / 25.4
+    content_width = writer.width()
+    content_height = writer.height() - reserve
+    # Lay the document out against the content box (not the full page), so
+    # pageCount() and the per-page slices agree on where pages break.
+    doc.setPageSize(QSizeF(content_width, content_height))
     page_count = doc.pageCount()
     painter = QPainter(writer)
     try:
         for page in range(page_count):
             if page > 0:
                 writer.newPage()
-            doc.drawContents(painter, _page_rect(writer))
+            top = page * content_height
+            painter.save()
+            # Move this page's slice of the document to the painter origin;
+            # drawContents then paints exactly the clipped slice.
+            painter.translate(0.0, -top)
+            doc.drawContents(
+                painter, QRectF(0.0, top, content_width, content_height)
+            )
+            painter.restore()
             _draw_footer(painter, writer, page + 1, page_count, title)
     finally:
         painter.end()
@@ -302,8 +321,9 @@ def _draw_footer(painter: QPainter, writer: QPdfWriter, page: int, total: int, t
     painter.setFont(font)
     painter.setPen(Qt.GlobalColor.gray)
     rect = _page_rect(writer)
-    # writer.height() is device pixels (1200 dpi default); 8 mm up from the
-    # bottom lands inside the 18 mm margin band, above the page edge.
+    # The footer band sits inside the reserved bottom strip (see
+    # _FOOTER_RESERVE_MM), never over content: 8 mm up from the bottom is
+    # inside the 18 mm margin band and inside the reserve.
     footer_y = rect.height() - writer.logicalDpiY() * 8.0 / 25.4
     band = QRectF(rect.left(), footer_y, rect.width() / 2, 30)
     painter.drawText(

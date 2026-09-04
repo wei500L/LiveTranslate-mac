@@ -584,7 +584,15 @@ class SummaryWorker(QThread):
         self._client = None
 
     def cancel(self):
-        self._cancel.set()
+        # The flag is set under _save_lock so the flag-set linearizes with
+        # the save-and-emit section of run(): a cancel either lands before
+        # that section (which then observes the flag and keeps the old
+        # summary) or after it has fully completed (the new summary is
+        # legitimately saved and announced). There is no window where a
+        # cancel is acknowledged yet the new summary still overwrites the
+        # old one afterwards.
+        with self._save_lock:
+            self._cancel.set()
         # Best-effort interrupt of an in-flight request: httpx closes the
         # connection pool, and the openai SDK's next read off that transport
         # raises instead of waiting out the timeout. Not instantaneous — a
@@ -651,6 +659,12 @@ class SummaryWorker(QThread):
             "entries_count": len(self._entries),
             "generation": self.generation,
         }
+        # Save + announce under the same lock cancel() sets its flag under:
+        # once this section starts, a concurrent cancel waits for it, so a
+        # completed save is announced exactly once and an acknowledged
+        # cancel never sees a newer summary overwrite the old one after the
+        # fact. The emits stay inside the lock: releasing between save and
+        # emit would re-open the window.
         with self._save_lock:
             if self._cancel.is_set():
                 self._close_client_quietly()
@@ -659,11 +673,11 @@ class SummaryWorker(QThread):
                 self._base_dir, self._session, content, meta
             )
             self._saved = ok
-        self._close_client_quietly()
-        if ok:
-            self.succeeded.emit(content, meta)
-        else:
-            self.failed.emit("summary_error_save", "")
+            self._close_client_quietly()
+            if ok:
+                self.succeeded.emit(content, meta)
+            else:
+                self.failed.emit("summary_error_save", "")
 
     def _close_client_quietly(self):
         """Close the run's client once it is no longer needed (every terminal

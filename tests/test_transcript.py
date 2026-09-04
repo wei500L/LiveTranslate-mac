@@ -223,6 +223,98 @@ def test_a_restarted_session_starts_from_a_clean_slate(tmp_path, monkeypatch):
     assert "1 entries" in footer
 
 
+def test_same_second_sessions_get_suffixed_stamps(tmp_path, monkeypatch):
+    """Two sessions begun within the same second must not share a file set:
+    the second gets an _01-suffixed stamp. The stamp probe checks the real
+    file names (with extensions) — extension-less probing never collided
+    and silently let the second session fail its exclusive create."""
+    import transcript_writer as tw
+    from datetime import datetime as real_datetime
+
+    frozen = real_datetime(2026, 1, 1, 9, 0, 0)
+
+    class FrozenDatetime(real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return frozen
+
+    monkeypatch.setattr(tw, "datetime", FrozenDatetime)
+
+    first = TranscriptWriter(tmp_path)
+    first.set_enabled(True)
+    stamp_a = first.begin_session()
+    first.write_original(1, "09:00:00", "first meeting")
+    first.finalize_no_translation(1)
+    first.end_session()
+
+    second = TranscriptWriter(tmp_path)
+    second.set_enabled(True)
+    stamp_b = second.begin_session()
+    second.write_original(1, "09:00:00", "second meeting")
+    second.finalize_no_translation(1)
+    summary = second.end_session()
+
+    assert stamp_a == "20260101_090000"
+    assert stamp_b == "20260101_090000_01", "same-second session must be suffixed"
+    # Each meeting's file carries its own content only.
+    first_all = (tmp_path / f"livetrans_{stamp_a}_all.txt").read_text("utf-8")
+    second_all = (tmp_path / f"livetrans_{stamp_b}_all.txt").read_text("utf-8")
+    assert "first meeting" in first_all and "second meeting" not in first_all
+    assert "second meeting" in second_all and "first meeting" not in second_all
+    assert summary["session"] == stamp_b
+
+
+def test_live_session_sidecar_has_no_ended_and_seal_writes_it_once(tmp_path):
+    """A live session's sidecar must not claim an end time (the records
+    layer reads its absence as "still recording"), and the seal fixes one
+    timestamp shared by the footer, the sidecar and the returned summary."""
+    writer = _writer(tmp_path)
+    writer.write_original(1, "09:00:00", "hello")
+    writer.write_translation(1, "hola")
+
+    live_meta = (tmp_path / f"livetrans_{writer._session_ts}_meta.json").read_text(
+        "utf-8"
+    )
+    assert '"ended": null' in live_meta
+
+    summary = writer.end_session()
+    sealed = json.loads(
+        (tmp_path / f"livetrans_{writer._session_ts}_meta.json").read_text("utf-8")
+    )
+    footer = (
+        tmp_path / f"livetrans_{writer._session_ts}_all.txt"
+    ).read_text("utf-8")
+    assert sealed["ended"] is not None
+    assert sealed["ended"] == summary["ended"]
+    # The footer's "Session ended at" line carries the same instant.
+    ended_line = next(
+        line for line in footer.splitlines() if line.startswith("# Session ended")
+    )
+    assert summary["ended"].replace("T", " ") in ended_line
+
+
+def test_write_original_rejects_entries_from_another_session(tmp_path):
+    """The write-time identity check: audio registered for session A must
+    never land in session B's files, even if B is the session open when the
+    write arrives (an end+begin raced the queue)."""
+    writer = _writer(tmp_path)
+    stamp_a = writer.begin_session()
+    writer.write_original(1, "09:00:00", "belongs to A")
+    writer.end_session()
+
+    stamp_b = writer.begin_session()
+    assert stamp_b != stamp_a
+    # A straggler carrying A's identity arrives while B is open.
+    writer.write_original(2, "09:00:05", "stale from A", session=stamp_a)
+    all_text = (tmp_path / f"livetrans_{stamp_b}_all.txt").read_text("utf-8")
+    assert "stale from A" not in all_text
+    # A None expectation (legacy auto-open callers) is still accepted.
+    writer.write_original(3, "09:00:06", "no expectation")
+    all_text = (tmp_path / f"livetrans_{stamp_b}_all.txt").read_text("utf-8")
+    assert "no expectation" in all_text
+    writer.end_session()
+
+
 def test_disabled_writer_records_nothing(tmp_path):
     writer = TranscriptWriter(tmp_path)
     writer.set_enabled(False)

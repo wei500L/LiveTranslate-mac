@@ -99,12 +99,17 @@ class SummaryTaskRegistry:
         """Drop references to workers whose run() has ended.
 
         Only the reference — deleteLater() is exclusively driven by the
-        finished signal (delivered on the GUI thread after run() returned),
-        so a worker registered but not yet started can never be freed out
-        from under the page that is about to start it.
+        finished signal (delivered on the GUI thread after run() returned).
+        The test is ``isFinished()``, *not* ``not isRunning()``: a worker
+        registered but not yet started is neither running nor finished, and
+        dropping it here would leave a just-started thread with no owner if
+        the page is destroyed moments later — the exact
+        "destroyed while running" abort this registry exists to prevent.
+        isRunning() would also race the run-to-finished transition
+        (isRunning stays True briefly after run() returns).
         """
         with self._lock:
-            dead = [w for w in self._workers.values() if not w.isRunning()]
+            dead = [w for w in self._workers.values() if w.isFinished()]
             for w in dead:
                 self._workers.pop(id(w), None)
 

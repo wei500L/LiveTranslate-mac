@@ -156,13 +156,30 @@ transcript_writer.py     Per-session meeting record: original/translation/all te
                          retranslating history would be a separate feature).
                          Session stamps are conflict-safe
                          (`_unique_stamp`): two meetings in the same second get
-                         `_01`/`_02` suffixes checked against files on disk,
-                         files are opened with `"x"` (exclusive create), and
-                         `stamp_sort_key()` sorts bare-then-suffixed numerically
-                         for the listing. `close()` is the *pipeline* shutdown
-                         path (app stop) and shares `_close_locked()` with
-                         `end_session()` — do not bind `close()` to the
-                         "end recording" button. `active_session()` exposes the
+                         `_01`/`_02` suffixes checked against files on disk
+                         **with their real extensions** (extension-less probing
+                         never collided), files are opened with `"x"` (exclusive
+                         create), and `stamp_sort_key()` sorts bare-then-suffixed
+                         numerically for the listing. `_open_session_locked()`
+                         is all-or-nothing: a partial file set is rolled back
+                         (files closed and unlinked, no phantom session, no
+                         stamp), `_session_open` is set only when every required
+                         file opened, and the first sidecar write is
+                         `create_only` — a fresh session can never overwrite
+                         another session's meta. `write_original(..., session=)`
+                         takes the caller's expected session stamp and verifies
+                         it inside the writer's lock: an entry whose audio
+                         belongs to a session that is no longer open (an end
+                         and a new begin raced the queue) is refused; `None`
+                         means the legacy auto-open path. `close()` is the
+                         *pipeline* shutdown path (app stop) and shares
+                         `_close_locked()` with `end_session()` — do not bind
+                         `close()` to the "end recording" button. The seal
+                         fixes `_ended_at` exactly once before footer/meta/
+                         summary are written (one timestamp everywhere; a live
+                         session's sidecar carries `"ended": null`, which the
+                         records layer relies on to classify crash-left records
+                         as interrupted). `active_session()` exposes the
                          in-flight stamp so the records center can label a
                          still-recording meeting. `_write_meta_locked()` re-reads
                          the existing sidecar and carries the whitelisted user
@@ -177,16 +194,22 @@ meeting_records.py       Records data layer: list_sessions/parse_session (Markdo
                          `content_sha256` in the meta — the meta is the commit
                          marker and `load_summary()` verifies the hash, so an
                          interrupted commit never presents new metadata over an
-                         old body. Summary files are excluded from session
-                         listing by filename (the summary sidecar matches the
-                         writer's `livetrans_*_meta.json` glob). `list_sessions()`
-                         also classifies closed sessions: `ended_cleanly` (the
-                         Markdown `## Summary` footer written by
-                         end_session/close, or a sidecar `ended` timestamp)
-                         vs `interrupted` (crash-left files, no footer, no
-                         active writer) — the records page labels those
-                         "Interrupted" instead of presenting a half-recorded
-                         meeting as complete. Stamp sorting goes through
+                         old body. An orphan body (meta missing or unreadable)
+                         also loads as absent: without the marker there is no
+                         committed summary. A legacy meta without
+                         `content_sha256` is accepted (pre-field summaries are
+                         valid, only unverifiable). Summary files are excluded
+                         from session listing by filename (the summary sidecar
+                         matches the writer's `livetrans_*_meta.json` glob).
+                         `list_sessions()` also classifies closed sessions:
+                         `ended_cleanly` (the Markdown `## Summary` footer
+                         written by end_session/close, or a sidecar `ended`
+                         timestamp — the current writer writes `ended` only at
+                         the seal, never mid-session) vs `interrupted`
+                         (crash-left files, no footer, no active writer) — the
+                         records page labels those "Interrupted" instead of
+                         presenting a half-recorded meeting as complete. Stamp
+                         sorting goes through
                          `transcript_writer.stamp_sort_key` so suffixed stamps
                          (_01/_02) order correctly.
 ai_summary_service.py    AI meeting-minutes pipeline: prompt templates (meeting/
@@ -337,13 +360,28 @@ linearized lifecycle inside one lock/Condition —
    TranslationUnavailable / executor-shutdown excepts in
    `_process_segment`/`_process_segment_text`.
 
-Stale-segment guard: `_process_segment`/`_process_segment_text` drop any
-queue item whose generation is no longer current (an end+begin raced the
-queue) before writing — the old audio cannot land in the new meeting's
-files. Legacy auto-open adoption (`_process_segment`/`_process_segment_text`
-IDLE branch) calls `tracker.begin()` for the adopted generation and
-re-registers the adopting msg, so an adopted session's work is counted the
-same as an explicit one.
+Stale-segment guard, two layers: `_process_segment`/
+`_process_segment_text` drop any queue item whose generation is no longer
+current (an end+begin raced the queue) before writing — the old audio
+cannot land in the new meeting's files — and every queue item carries the
+writer session stamp it was enqueued under (snapshotted with the
+generation), which `write_original(session=...)` re-verifies inside the
+writer's lock as the final authority. A requeue failure in
+`_drain_interim_duplicates` releases the displaced item's work count (an
+unreleased item would hold an ENDING wait until timeout). Legacy auto-open
+adoption (`_process_segment`/`_process_segment_text` IDLE branch) calls
+`tracker.begin()` for the adopted generation and re-registers the adopting
+msg, so an adopted session's work is counted the same as an explicit one.
+
+End-thread fault tolerance: `_run_session_end` is wrapped by its caller —
+a failure anywhere (flush, wait, `end_session`) is logged, the record is
+kept as-is, and the state still advances through IDLE (an ENDING that
+parks forever locks out every button). The `finally` sets `_paused=True`
+*before* lifting the capture gate, so there is no re-listen window between
+"gate open" and "capture observes paused". After the end lands the session
+generation is bumped, so any work the close missed fails the identity
+checks unambiguously. `end_session()` returning None (no open session) is
+handled without touching the summary dict.
 
 Both releases are idempotent (no-op on absent ids), so a timeout that
 superseded the generation cannot be double-released by the straggler's late
@@ -365,13 +403,19 @@ panel for lazy page creation) so it cannot be garbage-collected while a
 worker runs. Page teardown cancels and invalidates but never destroys a
 running QThread; `finished` (delivered on the GUI thread after `run()`
 returns) is the only place references are dropped and `deleteLater()` is
-called. `cancel()` sets the cooperative flag *and closes the worker's
-OpenAI/httpx client* (`SummaryWorker.attach_client`) to interrupt an
-in-flight request promptly. Known limit, stated rather than hidden: closing
-the transport interrupts a request, it does not kill it — a request stuck
-on a hung socket surfaces the error only after the per-request timeout
-(120s). No `terminate()`, no long GUI-thread waits; app exit reaches every
-worker through `cancel_all()` in `on_quit`.
+called. `prune()` tests `isFinished()` — **not** `not isRunning()`, which
+would also match a registered-but-not-yet-started worker and drop the only
+strong reference to it. `cancel()` sets the cooperative flag under the
+worker's `_save_lock` (linearized with run()'s save-and-emit section: an
+acknowledged cancel can never see a newer summary overwrite the old one,
+and a completed save is announced exactly once) *and closes the worker's
+OpenAI/httpx client* (`SummaryWorker.attach_client`; every terminal path
+of `run()` also closes it, so a cancel landing before the first request
+cannot leak the fresh connection pool). Known limit, stated rather than
+hidden: closing the transport interrupts a request, it does not kill it —
+a request stuck on a hung socket surfaces the error only after the
+per-request timeout (120s). No `terminate()`, no long GUI-thread waits;
+app exit reaches every worker through `cancel_all()` in `on_quit`.
 
 
 ### Configuration
