@@ -735,6 +735,54 @@ def test_live_sidecar_carries_active_status(tmp_path):
     assert summary["session_status"] == "completed"
 
 
+def test_rename_live_session_goes_through_the_writer_lock(tmp_path):
+    """Renaming a live session is the writer's job: one lock, one sidecar
+    writer. The rename lands in the sidecar immediately, and the seal's
+    final commit still carries it (the whitelisted user-field merge)."""
+    writer = _writer(tmp_path)
+    stamp = writer._session_ts
+    writer.write_original(1, "09:00:00", "hello")
+
+    assert writer.rename_session("课前准备") is True
+    live = json.loads(
+        (tmp_path / f"livetrans_{stamp}_meta.json").read_text("utf-8")
+    )
+    assert live["title"] == "课前准备"
+
+    # The seal keeps the title: its meta write merges the user fields.
+    summary = writer.end_session()
+    sealed = json.loads(
+        (tmp_path / f"livetrans_{stamp}_meta.json").read_text("utf-8")
+    )
+    assert sealed["title"] == "课前准备"
+    assert sealed["session_status"] == "completed"
+
+    # Refused with no open session, and with an empty title.
+    assert writer.rename_session("x") is False
+    assert writer.begin_session() is not None
+    assert writer.rename_session("   ") is False
+    writer.end_session()
+
+
+def test_rename_refused_while_ending(tmp_path):
+    """ENDING refuses: the seal owns the sidecar then, and a concurrent
+    rename write could overwrite the just-committed status."""
+    writer = _writer(tmp_path)
+    stamp = writer._session_ts
+    writer.write_original(1, "09:00:00", "hello")
+
+    writer._ending = True  # the end_session window
+    try:
+        assert writer.rename_session("nope") is False
+    finally:
+        writer._ending = False
+    writer.end_session()
+    sealed = json.loads(
+        (tmp_path / f"livetrans_{stamp}_meta.json").read_text("utf-8")
+    )
+    assert "title" not in sealed
+
+
 def test_completed_meta_commits_only_after_content_files_closed(tmp_path):
     """The completed verdict must be the last thing committed: when the
     final sidecar is written, every content handle must already be closed

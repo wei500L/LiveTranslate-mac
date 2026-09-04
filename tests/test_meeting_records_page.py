@@ -257,6 +257,104 @@ def test_delete_removes_session_and_summary_together(page, monkeypatch):
     assert page._list.count() == 1
 
 
+# --- per-record permissions ------------------------------------------------------
+
+
+class _FakeWriter:
+    """Stands in for the app's TranscriptWriter for identity queries."""
+
+    def __init__(self, active=None, ending=None):
+        self._active = active
+        self._ending = ending
+
+    def active_session(self):
+        return self._active
+
+    def ending_session(self):
+        return self._ending
+
+    def rename_session(self, title):
+        self.renamed_to = title
+        return True
+
+
+def test_ending_marks_only_its_own_row_and_gates_actions(page):
+    """A global ENDING paints exactly one row (the closing session's); the
+    end button, AI minutes and delete all key on the record's own
+    identity, never on the global state alone."""
+    page._list.setCurrentRow(0)
+    closing = page._list.item(0).record["session"]
+    other = page._list.item(1).record["session"]
+
+    page.set_transcript_writer(_FakeWriter(active=None, ending=closing))
+    page._ending_session_id = closing
+    page.on_session_state_changed("ending", closing)
+
+    # Row identity: only the closing row is ending.
+    by_stamp = {r["session"]: r for r in page._sessions}
+    assert by_stamp[closing]["is_ending"] is True
+    assert by_stamp[other]["is_ending"] is False
+
+    # Permissions on the closing row.
+    assert page._can_summarize(by_stamp[closing]) is False
+    assert page._can_delete(by_stamp[closing]) is False
+    assert page._can_rename(by_stamp[closing]) is False
+    # Permissions on the unrelated history row are unaffected.
+    assert page._can_summarize(by_stamp[other]) is True
+    assert page._can_delete(by_stamp[other]) is True
+    assert page._can_rename(by_stamp[other]) is True
+
+
+def test_delete_of_live_or_ending_session_is_refused(page, monkeypatch):
+    """The identity re-check inside _delete_session is the guard (hiding
+    the menu entry is only a hint): a live or closing session must never
+    be unlinked while the writer holds its files open."""
+    page._list.setCurrentRow(0)
+    stamp = page._list.item(0).record["session"]
+    page.set_transcript_writer(_FakeWriter(active=stamp))
+    page.refresh()
+
+    popped = []
+    monkeypatch.setattr(
+        "meeting_records_page.QMessageBox",
+        type("MB", (), {
+            "warning": staticmethod(lambda *a, **k: popped.append(1) or 16385),
+            "StandardButton": type("SB", (), {"Yes": 16384, "No": 65536}),
+        }),
+    )
+    page._delete_session()
+    # Refused before any confirmation could pass: files still exist.
+    assert popped, "the refusal warning must have been shown"
+    assert list(page._dir.glob(f"livetrans_{stamp}*"))
+
+
+def test_end_button_only_on_the_live_meetings_own_detail(page):
+    """The end button belongs to the live meeting's detail view: selecting
+    a history row hides it; selecting the live row shows it. Clicking on a
+    row that is no longer the live one (a race) emits nothing."""
+    page._list.setCurrentRow(1)  # a history row
+    history_stamp = page._list.item(1).record["session"]
+    page.set_transcript_writer(_FakeWriter(active=history_stamp))
+    page.refresh()
+
+    page._list.setCurrentRow(0)  # the other (history) row
+    page._load_session(page._list.item(0).record)
+    assert page._end_recording_btn.isVisibleTo(page) is False
+
+    page._list.setCurrentRow(1)  # the live row
+    page._load_session(page._list.item(1).record)
+    assert page._end_recording_btn.isVisibleTo(page) is True
+
+    # A stale click (the meeting ended between show and click) emits
+    # nothing and refreshes the button state instead.
+    emitted = []
+    page.end_recording_requested.connect(lambda: emitted.append(1))
+    page.set_transcript_writer(_FakeWriter(active=None))
+    page.refresh()
+    page._on_end_recording_clicked()
+    assert emitted == []
+
+
 # --- worker wiring ----------------------------------------------------------------
 
 

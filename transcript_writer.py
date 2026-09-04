@@ -13,6 +13,7 @@ entry has completed, which is what makes this usable as a meeting record. The
 the one to tail while a session runs.
 """
 
+import itertools
 import json
 import logging
 import os
@@ -31,6 +32,12 @@ def _discard_quietly(path: Path) -> None:
         Path(path).unlink()
     except OSError:
         pass
+
+
+# Per-call suffix for staged meta writes (see
+# TranscriptWriter._staged_meta_path): two concurrent staged writes must
+# never share a temp name.
+_META_STAGE_SEQ = itertools.count()
 
 # Session stamps are "YYYYmmdd_HHMMSS" plus an optional "_NN" suffix used only
 # when two sessions begin within the same second (end one meeting, start the
@@ -277,6 +284,35 @@ class TranscriptWriter:
             self._info.update({k: v for k, v in info.items() if v is not None})
             if self._session_open:
                 self._write_meta_locked()
+
+    def rename_session(self, title: str) -> bool:
+        """Rename the open session, inside the writer's lock.
+
+        This is the single coordinated path for renaming a *live* session:
+        the sidecar then has one writer (the records-layer
+        ``set_session_title`` would race this writer's periodic meta
+        rewrites and the seal's final commit — read-modify-write against
+        read-modify-write loses titles and can roll a committed status
+        back). The title/title_set_at fields ride the same whitelisted
+        merge every meta write uses, so they survive the seal. Refused
+        while ENDING (the seal owns the sidecar) and when no session is
+        open. Returns True when the sidecar now carries the new title.
+        """
+        title = (title or "").strip()
+        if not title:
+            return False
+        with self._lock:
+            if not self._session_open or self._ending:
+                return False
+            # One complete write (summary + merged user fields + the new
+            # title): the sidecar is never reduced to a fields-only stub,
+            # so even a crash right here leaves a readable record.
+            return self._write_meta_locked(
+                extra_user_fields={
+                    "title": title,
+                    "title_set_at": datetime.now().isoformat(timespec="seconds"),
+                }
+            )
 
     # The suffixes actually used on disk, matched with the real extensions —
     # _unique_stamp probes these exact paths. Probing extension-less names
@@ -746,7 +782,8 @@ class TranscriptWriter:
     # smuggle arbitrary keys back into a freshly written sidecar.
     _USER_META_FIELDS = ("title", "title_set_at")
 
-    def _write_meta_locked(self, create_only: bool = False) -> bool:
+    def _write_meta_locked(self, create_only: bool = False,
+                           extra_user_fields: dict | None = None) -> bool:
         """Write the sidecar. Returns True on success.
 
         ``create_only`` (first write of a session) uses a real exclusive
@@ -754,7 +791,11 @@ class TranscriptWriter:
         file can never be overwritten, closing the exists-check→replace
         race the staged-replace path would leave. Regular rewrites (live
         updates, the seal) keep the atomic staged replace, merging the
-        whitelisted user fields from the file on disk.
+        whitelisted user fields from the file on disk;
+        ``extra_user_fields`` (rename_session) supplies new values that
+        take precedence over the on-disk ones. The staged temp file gets a
+        unique suffix per call — two concurrent staged writes must never
+        replace each other's temp.
         """
         path = self._paths.get(self.META_KIND)
         if not path:
@@ -767,7 +808,7 @@ class TranscriptWriter:
                 # it the final name exclusively. A failure *after* the
                 # exclusive open unlinks the file this call created; an
                 # O_EXCL collision leaves the other session's file alone.
-                tmp = Path(path).with_name(Path(path).name + ".tmp")
+                tmp = self._staged_meta_path(path)
                 try:
                     tmp.write_text(
                         json.dumps(meta, ensure_ascii=False, indent=2),
@@ -803,7 +844,11 @@ class TranscriptWriter:
             for key in self._USER_META_FIELDS:
                 if key in old:
                     meta[key] = old[key]
-            tmp = Path(path).with_name(Path(path).name + ".tmp")
+            if extra_user_fields:
+                for key in self._USER_META_FIELDS:
+                    if key in extra_user_fields:
+                        meta[key] = extra_user_fields[key]
+            tmp = self._staged_meta_path(path)
             tmp.write_text(
                 json.dumps(meta, ensure_ascii=False, indent=2),
                 encoding="utf-8",
@@ -813,6 +858,16 @@ class TranscriptWriter:
         except OSError as e:
             log.warning(f"Could not write transcript metadata: {e}")
             return False
+
+    @staticmethod
+    def _staged_meta_path(path) -> Path:
+        """A per-call staged path. A fixed ``.tmp`` name shared by every
+        writer (and by the records layer's rename) let two concurrent
+        staged writes replace each other's temp; the pid+counter suffix
+        keeps them distinct."""
+        return Path(path).with_name(
+            f"{Path(path).name}.tmp{os.getpid()}.{next(_META_STAGE_SEQ)}"
+        )
 
     def close(self):
         """Close the writer outright (app stop / shutdown). Idempotent.

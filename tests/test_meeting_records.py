@@ -179,6 +179,45 @@ def test_records_without_session_status_fall_back_to_footer(tmp_path):
     assert by_stamp["20260102_090000"]["interrupted"] is True
 
 
+def test_ending_session_marks_only_its_own_row(tmp_path):
+    """The closing session's stamp marks exactly one row: identity, not a
+    global flag. During end_session() the writer stops reporting the
+    session active, so ending_session is what keeps the row protected."""
+    _write_status_session(tmp_path, "20260101_090000", {})
+    _write_status_session(tmp_path, "20260102_090000", {})
+    sessions = records.list_sessions(
+        tmp_path,
+        active_session=None,
+        ending_session="20260101_090000",
+    )
+    by_stamp = {s["session"]: s for s in sessions}
+    assert by_stamp["20260101_090000"]["is_ending"] is True
+    assert by_stamp["20260101_090000"]["is_active"] is False
+    assert by_stamp["20260102_090000"]["is_ending"] is False
+    # A row can be ending without being active (the end_session window).
+    assert by_stamp["20260102_090000"]["is_active"] is False
+
+
+def test_state_badge_is_per_record_not_global():
+    """A global "ending" must never paint rows that are not the closing
+    session: the badge keys on the record's own is_ending/is_active, so a
+    history row keeps its own badge while another meeting is ending."""
+    pytest.importorskip("PyQt6.QtCore", reason="badge needs Qt/i18n")
+    from i18n import t
+    from meeting_records_widgets import _state_badge
+
+    ending_row = {"is_ending": True}
+    history_row = {"has_summary": True}
+    active_row = {"is_active": True}
+
+    assert _state_badge(ending_row, "ending") == t("records_state_ending")
+    # The history row carries its own state while a *different* session is
+    # ending: it must not display the ending badge.
+    assert _state_badge(history_row, "ending") == t("records_state_ready")
+    # The active row reflects the app state; a history row never does.
+    assert _state_badge(active_row, "active") == t("records_state_active")
+
+
 # --- parsing -------------------------------------------------------------------
 
 

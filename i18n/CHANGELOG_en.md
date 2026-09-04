@@ -1,5 +1,13 @@
 # Changelog
 
+## 2026-09-05
+- Fixed the ending state painting every record: "Saving" used to display by global state, so while any one meeting finished its close, every history row in the list was badged as saving. The ending state now carries the session stamp, and only the closing meeting shows it (badges, detail view and action permissions all judge by record identity)
+- Fixed the end button appearing on the wrong record: it now shows only in the live meeting's own detail view; the click re-verifies that the selected record is still the live meeting (a stale click after a race emits nothing); history details never show it
+- Fixed AI minutes being generatable during the close: inside the end_session window the record stops being marked "recording", which short-circuited the old guard; the gate now checks both record-level flags, "recording" and "ending"
+- Added delete protection for live/closing records: the identity re-check lives in the handler (a disabled UI entry is only a hint) — a recording or closing meeting cannot be deleted (on macOS, deleting files the writer still holds would keep it writing into unlinked inodes and lose the record); the refusal shows a localized message
+- Eliminated the concurrent dual writers of the session sidecar: renaming a live session now goes through the writer's locked interface (the title survives the seal via the metadata merge), renaming during the close is refused, and closed records keep the old path. Both atomic writers' staged temp files get unique per-call names instead of replacing each other
+- Static test additions (not executed): the ending state marks only its own row; deleting a live record is refused; the end button appears only in the live meeting's detail and a stale click emits nothing; a live session renames through the writer; renaming during the close is refused
+
 ## 2026-09-04 (round 7)
 - Fixed a mechanical-replacement accident in the tests: seven `stamp = stamp` self-assignments (the save line itself had been mangled by the previous round's bulk replace), restored to saving the session stamp before close; the file was swept for further self-assignments or unbound variables
 - Fixed the seal-order defect where the "completed" marker preceded the content flush: the status sidecar used to be written before the file handles were flushed/closed, so a later handle failure left a wrong "completed" commit marker on disk. The order is now: entries → footers → content files flush+fsync+close → decide the status → atomic sidecar commit last; any failure can only commit "interrupted"

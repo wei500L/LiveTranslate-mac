@@ -31,14 +31,12 @@ _CODE_MD = re.compile(r"`([^`]+)`")
 
 
 def _state_badge(record: dict, session_state: str = "idle") -> str:
-    # The page's app-level session state refines "is_active": a recording
-    # session can be actively growing, paused (same meeting), or completing
-    # its final save. The ENDING check comes first because the writer stops
-    # reporting the session as active while it is being closed — the badge
-    # must not flip to "Interrupted" for the seconds the close takes.
-    # Interrupted (crash-left) sessions are labelled as such so a
-    # half-recorded meeting never reads as a completed one.
-    if session_state == "ending":
+    """Per-record badge. The app-level ``session_state`` only refines the
+    row that IS the current session (``is_active``/``is_ending`` on the
+    record, matched by stamp); a global "ending" must never paint unrelated
+    history rows. Interrupted (crash-left) sessions are labelled as such so
+    a half-recorded meeting never reads as a completed one."""
+    if record.get("is_ending"):
         return t("records_state_ending")
     if record.get("is_active"):
         if session_state == "paused":

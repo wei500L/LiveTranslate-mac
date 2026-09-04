@@ -125,6 +125,10 @@ class MeetingRecordsPage(QWidget):
         # App-level session state pushed from LiveTranslateApp ("idle" |
         # "active" | "paused" | "ending"); the page never derives it.
         self._session_state = "idle"
+        # The stamp of the session whose close is in flight (set with the
+        # ENDING push, cleared on IDLE). Record-level identity for the
+        # ending row — a global "ending" must never paint other rows.
+        self._ending_session_id = None
         self._sessions = []
         self._entries = []
         self._entries_rendered = 0
@@ -180,15 +184,17 @@ class MeetingRecordsPage(QWidget):
         """App-level session state push (SessionState constants).
 
         ACTIVE/PAUSED mark the still-growing row and gate AI minutes;
-        ENDING shows the saving state; IDLE after an end refreshes the list
-        and selects the just-finished meeting so the user can summarize it,
-        with a note that listening stopped (model still loaded).
+        ENDING marks the closing row by its stamp (only that row — the
+        badge and action permissions are per-record); IDLE after an end
+        refreshes the list and selects the just-finished meeting so the
+        user can summarize it, with a note that listening stopped (model
+        still loaded).
         """
         self._session_state = state
-        recording = state in ("active", "paused")
-        ending = state == "ending"
-        self._end_recording_btn.setVisible(recording)
-        self._end_recording_btn.setEnabled(not ending)
+        if state == "ending":
+            self._ending_session_id = session_id
+        elif state == "idle":
+            self._ending_session_id = None
         if state == "idle" and session_id:
             # A meeting just completed: refresh onto it, and tell the user
             # the app stopped listening (the model stays loaded) so the
@@ -198,6 +204,9 @@ class MeetingRecordsPage(QWidget):
                 self._status_label.setText(t("session_end_paused_hint"))
         else:
             self.refresh()
+        # Action availability depends on the selected record's role; the
+        # refresh above may have changed the selection.
+        self._update_action_availability()
 
     def _defer_refresh(self):
         """Refresh via the page-owned one-shot timer (see __init__)."""
@@ -325,11 +334,13 @@ class MeetingRecordsPage(QWidget):
         actions.addWidget(self._generate_btn)
 
         # End the current recording: request-only (see end_recording_requested).
-        # Visible only while a session is recording; the app-side state
-        # machine drives visibility through on_session_state_changed().
+        # Visible only in the *live meeting's own* detail view — never on a
+        # selected history row, where clicking it would end a different
+        # meeting than the one on screen. _update_action_availability()
+        # drives it on every selection change and state push.
         self._end_recording_btn = QPushButton(t("records_end_recording"))
         self._end_recording_btn.clicked.connect(
-            self.end_recording_requested.emit
+            self._on_end_recording_clicked
         )
         actions.addWidget(self._end_recording_btn)
         self._end_recording_btn.hide()
@@ -585,13 +596,23 @@ class MeetingRecordsPage(QWidget):
         if ensure_model_ids(self._settings):
             self.settings_updated.emit(self._settings)
         active = None
+        ending = None
         if self._writer is not None:
             try:
                 active = self._writer.active_session()
+                # During end_session() the writer stops reporting the
+                # session as active; ending_session() covers that window.
+                # The app-level stamp covers the rest of ENDING (the wait
+                # before end_session runs) — take whichever is set.
+                ending = self._writer.ending_session() or self._ending_session_id
+                if ending == active:
+                    active = None
             except Exception:
                 log.debug("Could not query active session", exc_info=True)
         try:
-            self._sessions = records.list_sessions(self._dir, active_session=active)
+            self._sessions = records.list_sessions(
+                self._dir, active_session=active, ending_session=ending
+            )
         except Exception:
             log.error("Could not list meeting records", exc_info=True)
             self._sessions = []
@@ -646,10 +667,15 @@ class MeetingRecordsPage(QWidget):
         item = self._list.itemAt(pos)
         if item is None:
             return
+        # Same permission functions as the detail buttons — the menu and
+        # the buttons must never disagree about what a record allows.
+        record = item.record
         menu = QMenu(self)
         rename = menu.addAction(t("records_rename"))
+        rename.setEnabled(self._can_rename(record))
         menu.addSeparator()
         delete = menu.addAction(t("btn_delete_record"))
+        delete.setEnabled(self._can_delete(record))
         action = menu.exec(self._list.mapToGlobal(pos))
         if action == rename:
             self._rename_session(item)
@@ -661,6 +687,13 @@ class MeetingRecordsPage(QWidget):
         if item is None:
             return
         record = item.record
+        # ENDING refuses: the seal owns the sidecar then, and a concurrent
+        # rename write could overwrite the just-committed status.
+        if not self._can_rename(record):
+            QMessageBox.warning(
+                self, t("error_title"), t("records_rename_ending_session")
+            )
+            return
         from PyQt6.QtWidgets import QInputDialog
 
         title, ok = QInputDialog.getText(
@@ -673,7 +706,18 @@ class MeetingRecordsPage(QWidget):
         if not title:
             QMessageBox.warning(self, t("error_title"), t("records_rename_empty"))
             return
-        if records.set_session_title(self._dir, record["session"], title):
+        # Live sessions route through the writer's locked rename so the
+        # sidecar has a single writer (an uncoordinated records-layer write
+        # could race the seal's meta commit and lose the title or roll the
+        # status back). Closed records have no writer contention and use
+        # the records-layer path.
+        if record.get("is_active") and self._writer is not None:
+            renamed = self._writer.rename_session(title)
+        else:
+            renamed = records.set_session_title(
+                self._dir, record["session"], title
+            )
+        if renamed:
             record["title"] = title
             item.setText(title)
             if record.get("session") == self._current_session():
@@ -686,6 +730,80 @@ class MeetingRecordsPage(QWidget):
     def _current_record(self) -> dict | None:
         item = self._list.currentItem()
         return item.record if item else None
+
+    # --- per-record roles and action permissions ----------------------------
+
+    def _session_role(self, record: dict | None) -> str:
+        """The selected record's role in the live lifecycle:
+        "active" | "paused" | "ending" | "none".
+
+        Identity first: only the row whose stamp matches the live session
+        gets a role; the app-level state merely refines *that* row. A
+        global "ending"/"active" must never leak onto history rows."""
+        if record is None:
+            return "none"
+        if record.get("is_ending"):
+            return "ending"
+        if record.get("is_active"):
+            return "paused" if self._session_state == "paused" else "active"
+        return "none"
+
+    def _can_end_recording(self, record: dict | None) -> bool:
+        """The end button belongs to the live meeting's own detail view.
+        Selected history rows never show it — clicking it there would end a
+        *different* meeting than the one on screen."""
+        return self._session_role(record) in ("active", "paused")
+
+    def _can_summarize(self, record: dict | None) -> bool:
+        """AI minutes need a closed record. is_active (still growing) and
+        is_ending (final save in flight — during end_session() the record
+        is no longer is_active, so both flags must be checked) both refuse;
+        interrupted records are closed and therefore allowed."""
+        if record is None:
+            return False
+        return not record.get("is_active") and not record.get("is_ending")
+
+    def _can_delete(self, record: dict | None) -> bool:
+        """Deleting a session whose files the writer still holds open would
+        (on macOS) leave the writer writing into unlinked inodes — the
+        record is lost while the UI shows it gone. Refuse until the seal
+        has fully released the session."""
+        if record is None:
+            return False
+        return not record.get("is_active") and not record.get("is_ending")
+
+    def _can_rename(self, record: dict | None) -> bool:
+        # Renaming is allowed on live sessions too — but routed through the
+        # writer's locked path (see _rename_session) so the sidecar has a
+        # single writer. Only ENDING refuses (the seal owns the sidecar
+        # then).
+        if record is None:
+            return False
+        return not record.get("is_ending")
+
+    def _update_action_availability(self):
+        """One permission pass for every record-scoped control: the end
+        button, and (via the same roles) the context menu. Called on
+        selection change and on every session-state push."""
+        if not hasattr(self, "_end_recording_btn"):
+            return
+        record = self._current_record()
+        self._end_recording_btn.setVisible(self._can_end_recording(record))
+        self._end_recording_btn.setEnabled(
+            self._session_role(record) != "ending"
+        )
+
+    def _on_end_recording_clicked(self):
+        """The end button was clicked on some record's detail view: verify
+        the selected record really is the live meeting before emitting the
+        request — the button only shows for it, but a state change racing
+        the click could have ended the meeting already, and the request
+        must not silently end a different one."""
+        record = self._current_record()
+        if not self._can_end_recording(record):
+            self._update_action_availability()
+            return
+        self.end_recording_requested.emit()
 
     # --- detail loading -------------------------------------------------------
 
@@ -716,6 +834,8 @@ class MeetingRecordsPage(QWidget):
         self._render_more_entries()
         self._load_minutes(record)
         self._tabs.setCurrentIndex(0)
+        # The selected record's role decides the record-scoped controls.
+        self._update_action_availability()
 
     def _meta_line(self, record: dict) -> str:
         parts = []
@@ -743,10 +863,11 @@ class MeetingRecordsPage(QWidget):
         return "  ·  ".join(parts)
 
     def _summary_state_text(self, record: dict) -> str:
-        # ENDING first: the writer stops reporting the session active while
-        # it is being closed, and the state must not flip to "interrupted"
-        # for the seconds the close takes.
-        if self._session_state == "ending":
+        # Record-level ENDING (the row whose stamp is the closing session):
+        # the writer stops reporting it active during end_session(), and the
+        # state must not flip to "interrupted" for the seconds the close
+        # takes. Other rows never inherit the ending state.
+        if record.get("is_ending"):
             return t("records_state_ending")
         if record.get("is_active"):
             if self._session_state == "paused":
@@ -868,11 +989,13 @@ class MeetingRecordsPage(QWidget):
         if record is None or not self._entries:
             self._status_label.setText(t("summary_empty_record"))
             return
-        if record.get("is_active") and self._session_state != "idle":
-            # The record is still growing (ACTIVE/PAUSED) or its final save is
-            # in flight (ENDING); a summary now would be a mid-meeting
-            # snapshot that reads as final minutes. The gate opens when the
-            # end lands and the page refreshes to a closed session.
+        if not self._can_summarize(record):
+            # The record is still growing (is_active) or its final save is
+            # in flight (is_ending — during end_session() the record is no
+            # longer is_active, so the role check must cover both); a
+            # summary now would be a mid-meeting snapshot that reads as
+            # final minutes. The gate opens when the end lands and the page
+            # refreshes to a closed session.
             self._status_label.setText(t("summary_active_session"))
             return
         if record.get("interrupted"):
@@ -1228,6 +1351,15 @@ class MeetingRecordsPage(QWidget):
     def _delete_session(self):
         record = self._current_record()
         if record is None:
+            return
+        # Identity re-check (the UI hides the entry, but hiding is not a
+        # guard): deleting the live or closing session would unlink files
+        # the writer still holds open — on macOS the writer keeps writing
+        # into the unlinked inodes and the record is lost.
+        if not self._can_delete(record):
+            QMessageBox.warning(
+                self, t("error_title"), t("records_delete_live_session")
+            )
             return
         session = record["session"]
         confirm = QMessageBox.warning(

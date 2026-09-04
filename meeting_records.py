@@ -22,13 +22,18 @@ Pure logic: no Qt, no network, so the offline test job covers all of it.
 from __future__ import annotations
 
 import hashlib
+import itertools
 import json
 import logging
+import os
 import re
 from datetime import datetime
 from pathlib import Path
 
 log = logging.getLogger("LiveTranslate.Records")
+
+# Per-call suffix for staged atomic writes (see _atomic_write_text).
+_STAGE_SEQ = itertools.count()
 
 SUMMARY_KIND = "summary"
 SUMMARY_META_KIND = "summary_meta"
@@ -56,7 +61,8 @@ def _entry_chars_total(entries: list[dict]) -> int:
 
 # --- session listing and metadata --------------------------------------------
 
-def list_sessions(base_dir: Path, active_session: str | None = None) -> list[dict]:
+def list_sessions(base_dir: Path, active_session: str | None = None,
+                  ending_session: str | None = None) -> list[dict]:
     """Session metadata rows, newest first, with title and summary state.
 
     Wraps ``read_session_meta`` and adds what the records center needs:
@@ -68,7 +74,10 @@ def list_sessions(base_dir: Path, active_session: str | None = None) -> list[dic
 
     ``active_session`` (the writer's current stamp) marks the row that is
     still being recorded: entries and duration there are a snapshot, not
-    final, and the UI treats it accordingly.
+    final, and the UI treats it accordingly. ``ending_session`` marks the
+    row whose close is in flight — the writer stops reporting it as active
+    the moment ``end_session()`` starts, so the app-level stamp keeps the
+    record identifiable (and protected) through the seal.
     """
     from transcript_writer import read_session_meta
 
@@ -118,6 +127,9 @@ def list_sessions(base_dir: Path, active_session: str | None = None) -> list[dic
         record["title"] = _session_title(record, base_dir)
         record["is_active"] = bool(
             active_session and stamp == active_session
+        )
+        record["is_ending"] = bool(
+            ending_session and stamp == ending_session
         )
         # Closed-state classification, read from the record itself rather
         # than from process state. Two formats:
@@ -212,6 +224,13 @@ def set_session_title(base_dir: Path, stamp: str, title: str) -> bool:
 
     The sidecar is the only writable metadata store that already exists; old
     sessions without one get it on first rename rather than a new file type.
+
+    Coordinated-writer rule: this path is for *closed* sessions only. A
+    live session's rename must go through ``TranscriptWriter.rename_session``
+    (the writer's lock) — two uncoordinated read-modify-write loops over
+    the same sidecar lose titles and can roll a committed status back. The
+    UI routes accordingly; this function cannot tell, so it stays safe for
+    the closed case.
     """
     base_dir = Path(base_dir)
     title = (title or "").strip()
@@ -508,11 +527,16 @@ def delete_summary(base_dir: Path, stamp: str) -> bool:
     """Remove both summary files of one session. True if anything went away."""
     md_path, meta_path = _summary_paths(Path(base_dir), stamp)
     removed = False
-    # Includes the .tmp siblings a crashed commit can leave behind, so a
-    # delete never strands half-written files in the transcripts folder.
-    for path in (md_path, meta_path,
-                 md_path.with_name(md_path.name + ".tmp"),
-                 meta_path.with_name(meta_path.name + ".tmp")):
+    # Includes the staged siblings a crashed commit can leave behind —
+    # both the legacy fixed ".tmp" names and the unique-suffixed staged
+    # names (".tmp<pid>.<n>") — so a delete never strands half-written
+    # files in the transcripts folder.
+    candidates = [md_path, meta_path,
+                  md_path.with_name(md_path.name + ".tmp"),
+                  meta_path.with_name(meta_path.name + ".tmp")]
+    for pattern in (f"{md_path.name}.tmp*", f"{meta_path.name}.tmp*"):
+        candidates.extend(Path(base_dir).glob(pattern))
+    for path in candidates:
         try:
             if path.is_file():
                 path.unlink()
@@ -613,6 +637,12 @@ def _atomic_write_json(path: Path, data: dict):
 
 
 def _atomic_write_text(path: Path, content: str):
-    tmp = path.with_name(path.name + ".tmp")
+    # Unique staged name per call: a fixed ".tmp" shared with the writer's
+    # staged meta writes let two concurrent writers replace each other's
+    # temp file. (The coordinated-writer rule keeps the *final* file
+    # single-writer; this keeps even the staging area collision-free.)
+    tmp = path.with_name(
+        f"{path.name}.tmp{os.getpid()}.{next(_STAGE_SEQ)}"
+    )
     tmp.write_text(content, encoding="utf-8")
     tmp.replace(path)
