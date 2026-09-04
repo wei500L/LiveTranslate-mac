@@ -902,32 +902,32 @@ class LiveTranslateApp:
                 summary = self._run_session_end(generation)
             except Exception:
                 # The close itself failed (I/O error in the flush, the seal,
-                # anywhere). Keep whatever of the meeting is already on disk,
-                # abort the writer's session (handles released, memory
-                # cleared, nothing further written — the records layer will
-                # classify the meeting as interrupted), and still leave
-                # ENDING: a state machine that parks in ENDING forever locks
-                # out every button.
+                # anywhere). Keep whatever of the meeting is already on disk
+                # and abort the writer's session. abort_session never raises
+                # and resets its state in a finally, so after this call the
+                # writer has no session — verified below before IDLE is
+                # announced.
                 log.error(
                     "Session end failed; aborting the session, record kept "
-                    "as-is, state -> IDLE",
+                    "as-is and marked interrupted",
                     exc_info=True,
                 )
-                try:
-                    summary = self._transcript.abort_session() or summary
-                except Exception:
-                    log.error(
-                        "Session abort also failed; writer state unknown",
-                        exc_info=True,
-                    )
+                summary = self._transcript.abort_session() or summary
                 # _run_session_end's supersede never ran; retire the
-                # generation here so the tracker drops its CLOSING entry
-                # (either way the state below makes the generation invalid).
+                # generation here so the tracker drops its CLOSING entry.
                 self._session_work.supersede(generation)
-            # Invariant: from here the writer has either sealed
-            # (_run_session_end's end_session completed) or aborted
-            # (abort_session ran), so announcing IDLE can never leave a live
-            # writer session behind the state machine.
+            # IDLE may only be announced once the writer verifiably has no
+            # session: a state machine claiming "done" over a live writer
+            # session is a lie that strands the meeting's files open.
+            # abort_session's finally guarantees this on the failure path;
+            # _run_session_end's end_session/reset does on the success path.
+            if self._transcript.has_active_session():
+                log.critical(
+                    "Writer still reports an active session after the end "
+                    "path completed; refusing to announce IDLE (staying in "
+                    "ENDING — the app may need a restart)"
+                )
+                return
             with self._session_boundary_lock:
                 if generation != self._session_generation:
                     # Superseded by a quit (the generation moved under us).

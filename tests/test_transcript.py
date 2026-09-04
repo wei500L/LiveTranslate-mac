@@ -618,6 +618,14 @@ def test_abort_session_after_failed_close_keeps_files_and_clears_state(tmp_path)
     assert "kept line" in all_text
     assert "# Session ended" not in all_text
 
+    # The aborted session is marked interrupted in its sidecar, so a footer
+    # that already landed elsewhere cannot make it read as completed.
+    aborted_meta = json.loads(
+        (tmp_path / f"livetrans_{stamp}_meta.json").read_text("utf-8")
+    )
+    assert aborted_meta["session_status"] == "interrupted"
+    assert summary["session_status"] == "interrupted"
+
     # The writer is reusable: a fresh session starts from a clean slate.
     stamp2 = writer.begin_session()
     assert stamp2 is not None
@@ -625,3 +633,103 @@ def test_abort_session_after_failed_close_keeps_files_and_clears_state(tmp_path)
         TranscriptWriter.WRITE_RECORDED
     )
     writer.end_session()
+
+
+def test_failed_original_write_rolls_back_memory_and_counts(tmp_path, monkeypatch):
+    """When the original line cannot reach the file, nothing about the entry
+    may survive in memory: _pending/_order/_entry_sessions hold nothing the
+    seal could re-emit, and speech_seconds never counted it."""
+    writer = _writer(tmp_path)
+    stamp = writer._session_ts
+    writer.write_original(1, "09:00:00", "good line", duration=1.0)
+
+    # Sabotage the file write for the next entry only.
+    real_write = writer._write_locked
+
+    def failing_write(kind, text):
+        if "doomed line" in text:
+            return False
+        return real_write(kind, text)
+
+    monkeypatch.setattr(writer, "_write_locked", failing_write)
+    result = writer.write_original(2, "09:00:05", "doomed line", duration=2.0)
+    monkeypatch.undo()
+
+    assert result == TranscriptWriter.WRITE_FAILED
+    # The seal must not resurrect the failed entry from pending state.
+    assert 2 not in writer._pending
+    assert 2 not in writer._entry_sessions
+    assert 2 not in writer._order
+    # Only the persisted entry's speech time counts.
+    assert writer.summary()["speech_seconds"] == 1.0
+
+    summary = writer.end_session()
+    all_text = (tmp_path / f"livetrans_{stamp}_all.txt").read_text("utf-8")
+    assert "good line" in all_text
+    assert "doomed line" not in all_text, "a failed write must not reappear"
+    assert summary["session_status"] == "completed"
+    assert summary["entries"] == 1
+
+
+def test_footer_write_failure_seals_as_interrupted(tmp_path, monkeypatch):
+    """A footer that cannot be written degrades the seal: the session closes
+    (no exception — the failure is a verdict, not a crash) and the final
+    sidecar carries session_status=interrupted."""
+    writer = _writer(tmp_path)
+    stamp = writer._session_ts
+    writer.write_original(1, "09:00:00", "hello")
+    writer.write_translation(1, "hola")
+
+    def failing_footer():
+        return False
+
+    monkeypatch.setattr(
+        writer, "_write_summary_footer_locked", failing_footer
+    )
+    summary = writer.end_session()
+    monkeypatch.undo()
+
+    assert summary["session_status"] == "interrupted"
+    sealed = json.loads(
+        (tmp_path / f"livetrans_{stamp}_meta.json").read_text("utf-8")
+    )
+    assert sealed["session_status"] == "interrupted"
+    assert sealed["ended"] is not None  # the seal moment is still recorded
+
+
+def test_final_meta_write_failure_leaves_no_completed_verdict(tmp_path, monkeypatch):
+    """When neither the final sidecar nor its interrupted retry can be
+    written, the on-disk sidecar keeps the live "active" status — never a
+    fabricated "completed" — and the returned summary says interrupted."""
+    writer = _writer(tmp_path)
+    stamp = writer._session_ts
+    writer.write_original(1, "09:00:00", "hello")
+
+    monkeypatch.setattr(
+        writer, "_write_meta_locked", lambda *a, **k: False
+    )
+    summary = writer.end_session()
+    monkeypatch.undo()
+
+    assert summary["session_status"] == "interrupted"
+    # The on-disk sidecar is the live version (active, no ended): the seal
+    # could not commit any verdict.
+    sealed = json.loads(
+        (tmp_path / f"livetrans_{stamp}_meta.json").read_text("utf-8")
+    )
+    assert sealed["session_status"] == "active"
+    assert sealed.get("ended") is None
+
+
+def test_live_sidecar_carries_active_status(tmp_path):
+    """A session opened (or auto-opened) writes session_status=active into
+    its sidecar from the very first commit — the records layer's primary
+    signal for "still recording"."""
+    writer = _writer(tmp_path)
+    stamp = writer._session_ts
+    meta = json.loads(
+        (tmp_path / f"livetrans_{stamp}_meta.json").read_text("utf-8")
+    )
+    assert meta["session_status"] == "active"
+    summary = writer.end_session()
+    assert summary["session_status"] == "completed"

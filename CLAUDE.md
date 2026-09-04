@@ -171,20 +171,31 @@ transcript_writer.py     Per-session meeting record: original/translation/all te
                          it inside the writer's lock: an entry whose audio
                          belongs to a session that is no longer open (an end
                          and a new begin raced the queue) is refused; `None`
-                         means the legacy auto-open path. `close()` is the
+                         means the legacy auto-open path. A failed original
+                         write rolls the entry back entirely (nothing in
+                         `_pending`/`_order`/`_entry_sessions`,
+                         `speech_seconds` uncopped) so the seal can never
+                         re-emit it; `_emit_locked` counts an entry only
+                         when every view write succeeded. `close()` is the
                          *pipeline* shutdown path (app stop) and shares
                          `_close_locked()` with `end_session()` — do not bind
                          `close()` to the "end recording" button. The seal
-                         fixes `_ended_at` exactly once before footer/meta/
-                         summary are written (one timestamp everywhere; a live
-                         session's sidecar carries `"ended": null`, which the
-                         records layer relies on to classify crash-left records
-                         as interrupted). `active_session()` exposes the
-                         in-flight stamp so the records center can label a
-                         still-recording meeting. `_write_meta_locked()` re-reads
-                         the existing sidecar and carries the whitelisted user
-                         fields (`title`, `title_set_at`) across every rewrite
-                         — a rename during a live session survives
+                         protocol: fix `_ended_at` exactly once, write the
+                         footers, then decide `session_status` —
+                         `completed` only when no write degraded *and* the
+                         final sidecar committed; otherwise `interrupted`,
+                         with the sidecar rewritten to say so (best effort).
+                         The sidecar carries `session_status: active` from
+                         the first commit; `abort_session()` (never raises,
+                         resets in a finally, marks the sidecar interrupted)
+                         is the fallback for a close that failed. A live
+                         session's sidecar carries `"ended": null`.
+                         `active_session()` exposes the in-flight stamp so
+                         the records center can label a still-recording
+                         meeting. `_write_meta_locked()` re-reads the
+                         existing sidecar and carries the whitelisted user
+                         fields (`title`, `title_set_at`) across every
+                         rewrite — a rename during a live session survives
                          `set_session_info()` and `close()`.
 meeting_records.py       Records data layer: list_sessions/parse_session (Markdown
                          → combined txt → original-only fallback), titles,
@@ -201,15 +212,20 @@ meeting_records.py       Records data layer: list_sessions/parse_session (Markdo
                          valid, only unverifiable). Summary files are excluded
                          from session listing by filename (the summary sidecar
                          matches the writer's `livetrans_*_meta.json` glob).
-                         `list_sessions()` also classifies closed sessions:
-                         `ended_cleanly` (the Markdown `## Summary` footer
-                         written by end_session/close, or a sidecar `ended`
-                         timestamp — the current writer writes `ended` only at
-                         the seal, never mid-session) vs `interrupted`
-                         (crash-left files, no footer, no active writer) — the
-                         records page labels those "Interrupted" instead of
-                         presenting a half-recorded meeting as complete. Stamp
-                         sorting goes through
+                         `list_sessions()` also classifies closed sessions
+                         by the sidecar's `session_status` when present
+                         (the new format): only `completed` counts as
+                         `ended_cleanly`; `active` (a crashed live session —
+                         the seal never committed) and `interrupted`
+                         (aborted or degraded close) read as `interrupted`,
+                         **even when a half-failed seal already wrote a
+                         footer or an `ended` timestamp** — the status is
+                         committed last and outranks them. Sidecars without
+                         the field (older writers) fall back to the footer /
+                         `ended` heuristics unchanged. The records page
+                         labels interrupted sessions "Interrupted" instead
+                         of presenting a half-recorded meeting as complete.
+                         Stamp sorting goes through
                          `transcript_writer.stamp_sort_key` so suffixed stamps
                          (_01/_02) order correctly.
 ai_summary_service.py    AI meeting-minutes pipeline: prompt templates (meeting/

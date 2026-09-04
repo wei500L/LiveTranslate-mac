@@ -104,6 +104,81 @@ def test_summary_files_do_not_surface_as_phantom_sessions(tmp_path):
     assert sessions[0]["has_summary"] is True
 
 
+# --- session_status classification -------------------------------------------
+
+
+def _write_status_session(tmp_path, stamp, meta_extra, with_footer=True):
+    """One session file set with a controllable sidecar and optional footer."""
+    (tmp_path / f"livetrans_{stamp}_all.txt").write_text(
+        "[09:00:00] line\n", encoding="utf-8"
+    )
+    (tmp_path / f"livetrans_{stamp}_meeting.md").write_text(
+        "# Meeting record\n\n**09:00:00**\n\nline\n"
+        + ("---\n\n## Summary\n\n- Ended: 2026-01-01 10:00:00\n"
+           if with_footer else ""),
+        encoding="utf-8",
+    )
+    (tmp_path / f"livetrans_{stamp}_meta.json").write_text(
+        json.dumps(meta_extra, ensure_ascii=False), encoding="utf-8"
+    )
+
+
+def test_session_status_completed_is_the_only_clean_end(tmp_path):
+    """New format: only session_status=completed counts as a normal end —
+    even with a footer and an ended timestamp on disk."""
+    _write_status_session(
+        tmp_path, "20260101_090000",
+        {"session_status": "completed", "ended": "2026-01-01T10:00:00"},
+    )
+    sessions = records.list_sessions(tmp_path)
+    assert sessions[0]["ended_cleanly"] is True
+    assert sessions[0]["interrupted"] is False
+
+
+def test_interrupted_status_outranks_an_already_written_footer(tmp_path):
+    """A half-failed seal can leave a footer in the text files before the
+    status was decided; the sidecar's interrupted verdict must win — the
+    footer alone must not reclassify the record as completed."""
+    _write_status_session(
+        tmp_path, "20260101_090000",
+        {"session_status": "interrupted", "ended": "2026-01-01T10:00:00"},
+        with_footer=True,
+    )
+    sessions = records.list_sessions(tmp_path)
+    assert sessions[0]["ended_cleanly"] is False
+    assert sessions[0]["interrupted"] is True
+
+
+def test_active_status_is_not_a_clean_end(tmp_path):
+    """A crashed live session keeps session_status=active on disk (the seal
+    never committed): it reads as interrupted, not ended."""
+    _write_status_session(
+        tmp_path, "20260101_090000", {"session_status": "active"},
+        with_footer=False,
+    )
+    sessions = records.list_sessions(tmp_path)
+    assert sessions[0]["ended_cleanly"] is False
+    assert sessions[0]["interrupted"] is True
+
+
+def test_records_without_session_status_fall_back_to_footer(tmp_path):
+    """Old format (sidecars from writers before the field existed): the
+    footer/ended heuristics keep working unchanged."""
+    # Footer present -> cleanly ended.
+    _write_status_session(
+        tmp_path, "20260101_090000", {"ended": "2026-01-01T10:00:00"},
+        with_footer=True,
+    )
+    # No footer, no ended -> interrupted.
+    _write_status_session(tmp_path, "20260102_090000", {}, with_footer=False)
+    sessions = records.list_sessions(tmp_path)
+    by_stamp = {s["session"]: s for s in sessions}
+    assert by_stamp["20260101_090000"]["ended_cleanly"] is True
+    assert by_stamp["20260101_090000"]["interrupted"] is False
+    assert by_stamp["20260102_090000"]["ended_cleanly"] is False
+    assert by_stamp["20260102_090000"]["interrupted"] is True
+
+
 # --- parsing -------------------------------------------------------------------
 
 

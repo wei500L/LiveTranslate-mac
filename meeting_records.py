@@ -120,23 +120,31 @@ def list_sessions(base_dir: Path, active_session: str | None = None) -> list[dic
             active_session and stamp == active_session
         )
         # Closed-state classification, read from the record itself rather
-        # than from process state:
-        #   ended normally — the Markdown footer ("## Summary") is the
-        #                    writer's end-of-session mark (close/end_session);
-        #   interrupted    — no footer, no active writer: a crash, kill or
-        #                    SIGINT left the files behind mid-meeting.
-        # Pre-footer sessions (older than the summary footer) count as ended:
-        # a sidecar "ended" timestamp is the same class of evidence. The
-        # writer sets "ended" exactly once at the seal (a live session's
-        # sidecar carries no "ended" at all), so a false "cleanly ended" for
-        # a crashed live session is not possible under the current writer;
-        # records from writers that pre-dated that invariant may still show
-        # an "ended" snapshot from a mid-session sidecar rewrite — the
-        # footer check stays authoritative for them.
-        record["ended_cleanly"] = (
-            _meeting_has_footer(base_dir, stamp)
-            or bool(record.get("ended"))
-        )
+        # than from process state. Two formats:
+        #
+        # New format (session_status in the sidecar): the writer's explicit
+        #   verdict — "completed" is the only "ended normally"; "active" and
+        #   "interrupted" are not, however many footers or "ended" fields a
+        #   half-failed seal happened to write before the status was decided
+        #   (the status is committed last, so it outranks everything).
+        #
+        # Old format (no session_status): the Markdown footer ("## Summary")
+        #   is the writer's end-of-session mark, and a sidecar "ended"
+        #   timestamp is the same class of evidence. The writer sets "ended"
+        #   exactly once at the seal (a live session's sidecar carries no
+        #   "ended" at all), so a false "cleanly ended" for a crashed live
+        #   session is not possible under the current writer; records from
+        #   writers that pre-dated that invariant may still show an "ended"
+        #   snapshot from a mid-session sidecar rewrite — the footer check
+        #   stays authoritative for them.
+        status = record.get("session_status")
+        if status is not None:
+            record["ended_cleanly"] = status == "completed"
+        else:
+            record["ended_cleanly"] = (
+                _meeting_has_footer(base_dir, stamp)
+                or bool(record.get("ended"))
+            )
         record["interrupted"] = bool(
             not record["is_active"] and not record["ended_cleanly"]
         )

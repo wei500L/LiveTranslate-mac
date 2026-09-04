@@ -120,6 +120,15 @@ class TranscriptWriter:
         # sidecar and summary all read this); None while the session is live,
         # so a live session's sidecar carries no "ended" field at all.
         self._ended_at = None
+        # Persistent session status (the sidecar's session_status field):
+        # "active" from open, "completed" only when the seal wrote every
+        # required file and the final sidecar, "interrupted" for an aborted
+        # or degraded close. None = no session.
+        self._session_status = None
+        # Set the moment any required write fails (entry emit, footer, final
+        # sidecar): the seal then records "interrupted" instead of
+        # "completed" however far it got.
+        self._write_degraded = False
 
     # --- session lifecycle ---------------------------------------------
 
@@ -382,12 +391,19 @@ class TranscriptWriter:
             self._paths = {}
             self._session_ts = None
             self._session_started = None
+            self._session_status = None
+            self._write_degraded = False
             self._markdown_header_open = False
             return
 
         self._markdown_header_open = True
         self._opened = True
         self._session_open = True
+        # The sidecar written by create_only carries session_status=active
+        # (see _summary_locked) — the records layer treats a live session by
+        # this field first.
+        self._session_status = "active"
+        self._write_degraded = False
         log.info(f"Transcripts -> {self._base_dir} (session {self._session_ts})")
 
     # --- entry recording -----------------------------------------------
@@ -472,12 +488,22 @@ class TranscriptWriter:
                 "duration": duration,
             }
             self._entry_sessions[msg_id] = current
-            if duration:
-                self._speech_seconds += float(duration)
             wrote = self._write_locked(
                 "original", f"[{timestamp}] {original}\n"
             )
-            return self.WRITE_RECORDED if wrote else self.WRITE_FAILED
+            if not wrote:
+                # The entry is NOT on disk: roll back every trace of it so
+                # the seal cannot resurrect it later from _pending/_order
+                # (a re-emitted entry whose original line never made it to
+                # the file would corrupt the record), and the speech time
+                # never counted it.
+                self._forget_session_entry(msg_id)
+                return self.WRITE_FAILED
+            if duration:
+                # Counted only after the line is on disk: the summary must
+                # reflect persisted speech, not attempted speech.
+                self._speech_seconds += float(duration)
+            return self.WRITE_RECORDED
 
     def write_translation(self, msg_id: int, translation: str,
                           session: str | None = None) -> str:
@@ -569,17 +595,14 @@ class TranscriptWriter:
             if entry is not None:
                 self._emit_locked(entry, translation)
 
-    def _emit_locked(self, entry: dict, translation: str | None):
+    def _emit_locked(self, entry: dict, translation: str | None) -> bool:
+        """Emit one completed entry to every view. Returns True only when
+        every write succeeded; the entry counts are updated only then, so
+        entries/translated/untranslated reflect persisted content. A failed
+        emit marks the session degraded — the seal will classify it
+        interrupted instead of completed."""
         ts = entry["timestamp"]
         original = entry["original"]
-        self._counts["entries"] += 1
-        if translation:
-            self._counts["translated"] += 1
-            self._write_locked("translation", f"[{ts}] {translation}\n")
-            self._write_locked("all", f"[{ts}] {original}\n  -> {translation}\n\n")
-        else:
-            self._counts["untranslated"] += 1
-            self._write_locked("all", f"[{ts}] {original}\n\n")
 
         meta = []
         if entry.get("language"):
@@ -590,7 +613,39 @@ class TranscriptWriter:
         block = f"\n**{ts}**{suffix}\n\n{original}\n"
         if translation:
             block += f"\n> {translation}\n"
-        self._write_locked(self.MARKDOWN_KIND, block)
+
+        ok = True
+        if translation:
+            ok = self._write_locked(
+                "translation", f"[{ts}] {translation}\n"
+            ) and ok
+            ok = self._write_locked(
+                "all", f"[{ts}] {original}\n  -> {translation}\n\n"
+            ) and ok
+        else:
+            ok = self._write_locked(
+                "all", f"[{ts}] {original}\n\n"
+            ) and ok
+        ok = self._write_locked(self.MARKDOWN_KIND, block) and ok
+
+        if not ok:
+            # Some view of this entry is missing from the files: the entry
+            # is consumed (the caller already removed it from pending), the
+            # counts must not include it, and the session can no longer be
+            # sealed as completed.
+            self._write_degraded = True
+            log.warning(
+                "Entry %s could not be written to every view; the session "
+                "will be classified as interrupted", ts,
+            )
+            return False
+
+        self._counts["entries"] += 1
+        if translation:
+            self._counts["translated"] += 1
+        else:
+            self._counts["untranslated"] += 1
+        return True
 
     def _forget_locked(self, msg_id: int):
         self._pending.pop(msg_id, None)
@@ -624,7 +679,12 @@ class TranscriptWriter:
         session's sidecar must not claim an end time (the records layer uses
         its absence/presence to tell "still recording" from "ended", and a
         crash-left record with a pre-filled ``ended`` would pass as cleanly
-        ended instead of interrupted)."""
+        ended instead of interrupted).
+
+        ``session_status`` mirrors the persistent sidecar field:
+        "active" while open, "completed"/"interrupted" once the close has
+        decided — the records layer trusts this field over any footer for
+        records that carry it."""
         started = self._session_started
         if self._ended_at is not None:
             ended = self._ended_at
@@ -638,6 +698,7 @@ class TranscriptWriter:
             )
         return {
             "session": self._session_ts,
+            "session_status": self._session_status,
             "started": started.isoformat(timespec="seconds") if started else None,
             "ended": ended.isoformat(timespec="seconds") if ended else None,
             "duration_seconds": duration,
@@ -745,17 +806,25 @@ class TranscriptWriter:
         end_session(). Returns the final sidecar contents, or None when there
         was no session to close.
 
-        The seal timestamp is fixed exactly once, *before* the footer and
-        sidecar are written, so every artifact (txt footers, Markdown
-        Summary, meta ``ended``, the returned summary) reports the same
-        moment. All per-session state is reset in one place
-        (_reset_session_state_locked), shared with abort_session().
+        Seal protocol (the returned summary's ``session_status`` records the
+        outcome; the sidecar is the last thing written):
+        1. flush pending entries as untranslated (each emit's failure marks
+           the session degraded — the entry is consumed either way, so it
+           can never reappear);
+        2. fix the seal timestamp once, shared by footer/summary;
+        3. write the text footers (a failure marks degraded);
+        4. decide the status: ``completed`` only when nothing was degraded
+           and the final sidecar write succeeds — otherwise ``interrupted``,
+           and the sidecar is rewritten with that status (best effort: a
+           status write that itself fails is logged and the record falls
+           back to the footer/ended heuristics on read).
         """
         if not self._opened:
             return None
         # Anything still waiting on a translation that will never arrive
         # would otherwise be lost, and its original line would sit in the
-        # original file with no counterpart in the record.
+        # original file with no counterpart in the record. A failed emit
+        # marks the session degraded; the entry is consumed regardless.
         while self._order:
             msg_id = self._order.popleft()
             entry = self._pending.pop(msg_id, None)
@@ -764,35 +833,91 @@ class TranscriptWriter:
                 self._entry_sessions.pop(msg_id, None)
         if self._ended_at is None:
             self._ended_at = datetime.now()
-        self._write_summary_footer_locked()
-        self._write_meta_locked()
+        if not self._write_summary_footer_locked():
+            self._write_degraded = True
+        self._session_status = (
+            "interrupted" if self._write_degraded else "completed"
+        )
+        # The final sidecar is the commit marker: with its write included in
+        # the status decision, "completed" can only appear on disk when
+        # every required artifact made it.
+        if not self._write_meta_locked():
+            # The final sidecar could not be written: the session cannot be
+            # called completed. Retry once with the interrupted status so
+            # the record says so; if even that fails, the on-disk sidecar
+            # keeps the live "active" status and the readers fall back to
+            # the footer heuristic (which will not see a footer-only seal as
+            # cleanly ended whenever the footer itself failed, and will for
+            # the degraded-entry case — the remaining risk is documented).
+            self._write_degraded = True
+            self._session_status = "interrupted"
+            if not self._write_meta_locked():
+                log.error(
+                    "Could not write the final sidecar for session %s; the "
+                    "record's status is unknown from the sidecar alone",
+                    self._session_ts,
+                )
         summary = self._summary_locked()
         self._reset_session_state_locked()
         return summary
 
     def abort_session(self) -> dict | None:
-        """Best-effort abort of a session whose close failed.
+        """Best-effort abort of a session whose close failed. Never raises.
 
-        Used when ``end_session``/``close`` raised mid-seal: the record is
-        kept exactly as far as it got (nothing new is written — a seal that
-        did not complete leaves no footer and no final ``ended``, so the
-        records layer classifies the meeting as interrupted rather than
-        cleanly ended), file handles are released, and every piece of
-        in-memory session state is cleared by the same reset the normal
-        close uses. Returns the last known summary snapshot, or None when
-        there was no session.
+        The record is kept exactly as far as it got, and the sidecar is
+        rewritten (best effort) with ``session_status=interrupted`` so no
+        footer that already landed can make the half-sealed meeting read as
+        completed — the status field outranks the footer for readers of this
+        format. Handles are released and every piece of in-memory session
+        state is cleared by the same reset the normal close uses, in a
+        ``finally`` so even an internal failure cannot leave a live session
+        behind. Returns the last known summary snapshot (carrying the
+        interrupted status), or None when there was no session.
         """
         with self._lock:
             if not self._session_open and not self._opened:
                 return None
-            summary = self._summary_locked() if self._session_ts else None
-            log.error(
-                "Aborting session %s after a failed close; the record stays "
-                "as written and will be classified as interrupted",
-                self._session_ts,
-            )
-            self._reset_session_state_locked()
-            return summary
+            try:
+                summary = (
+                    self._summary_locked() if self._session_ts else None
+                )
+                log.error(
+                    "Aborting session %s after a failed close; the record "
+                    "stays as written and is marked interrupted",
+                    self._session_ts,
+                )
+                self._session_status = "interrupted"
+                # Mark the half-sealed record: the sidecar's status field is
+                # what readers of this format trust (a footer may already be
+                # in the text files from the failed seal). A failure here is
+                # logged, not raised — the abort must still complete.
+                if self._session_ts:
+                    try:
+                        if not self._write_meta_locked():
+                            log.error(
+                                "Could not mark session %s interrupted in "
+                                "its sidecar", self._session_ts,
+                            )
+                    except Exception:
+                        log.error(
+                            "Marking session %s interrupted failed",
+                            self._session_ts, exc_info=True,
+                        )
+                if summary is not None:
+                    summary["session_status"] = "interrupted"
+                return summary
+            finally:
+                # Whatever happened above, the writer ends with no session:
+                # handles closed, memory cleared, the next begin starts
+                # clean. Swallow close-time errors — a half-dead handle must
+                # not propagate out of an abort.
+                try:
+                    self._reset_session_state_locked()
+                except Exception:
+                    log.error(
+                        "Session state reset failed during abort",
+                        exc_info=True,
+                    )
 
     def _reset_session_state_locked(self):
         """The single tail for every close path (seal, pipeline close,
@@ -816,6 +941,8 @@ class TranscriptWriter:
         self._session_ts = None
         self._session_started = None
         self._ended_at = None
+        self._session_status = None
+        self._write_degraded = False
         self._markdown_header_open = False
         self._opened = False
         self._session_open = False
@@ -827,7 +954,10 @@ class TranscriptWriter:
         self._speech_seconds = 0.0
         self._info = {}
 
-    def _write_summary_footer_locked(self):
+    def _write_summary_footer_locked(self) -> bool:
+        """Write the end-of-session footers. Returns True only when every
+        footer landed; a False return marks the seal degraded (the session
+        will be classified interrupted, not completed)."""
         summary = self._summary_locked()
         minutes, seconds = divmod(summary["duration_seconds"], 60)
         hours, minutes = divmod(minutes, 60)
@@ -845,8 +975,9 @@ class TranscriptWriter:
             f"# Duration {length}, {summary['entries']} entries "
             f"({summary['translated']} translated)\n"
         )
+        ok = True
         for kind in self.KINDS:
-            self._write_locked(kind, footer)
+            ok = self._write_locked(kind, footer) and ok
 
         lines = [
             "",
@@ -868,7 +999,10 @@ class TranscriptWriter:
         ):
             if summary.get(key):
                 lines.append(f"- {label}: {summary[key]}")
-        self._write_locked(self.MARKDOWN_KIND, "\n".join(lines) + "\n")
+        ok = self._write_locked(
+            self.MARKDOWN_KIND, "\n".join(lines) + "\n"
+        ) and ok
+        return ok
 
 
 def read_session_meta(base_dir: Path) -> list[dict]:

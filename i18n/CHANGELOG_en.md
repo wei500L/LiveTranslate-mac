@@ -1,5 +1,12 @@
 # Changelog
 
+## 2026-09-04 (round 6)
+- Fixed "failed entries reappearing": an original line whose write failed used to stay in the pending queue, and the seal would re-emit it as an untranslated entry. A failed write now rolls the entry back completely (no trace in memory, speech time never counted), and the end-of-session statistics reflect only entries that actually reached disk
+- Explicit persistent session state: the sidecar now carries a session_status field — "active" from open, "completed" committed only when every required file and the final sidecar wrote successfully, "interrupted" for an abort or any failed required write. Records without the field (older format) keep the footer/ended heuristics
+- Fixed "a half-failed seal misread as cleanly ended": a record whose footer landed but whose final sidecar failed and was then aborted used to pass as ended because of the footer. For the new format the interrupted status outranks the footer — only status=completed counts as a clean end
+- Hardened the abort path: abort never raises (state cleanup in a finally) and best-effort writes the interrupted mark back into the sidecar; the app broadcasts "idle" only after verifying the writer has no active session — the "writer state unknown yet claiming done" branch is gone
+- Static test additions (not executed): memory rollback after a failed original write; footer/final-meta write failures seal as interrupted; an interrupted record with a footer is not misclassified; the writer is reusable after an abort; old records without session_status stay compatible
+
 ## 2026-09-04 (round 5)
 - Fixed a blocking syntax error (a duplicated def and broken indentation in the writer's summary function — the module could not be imported)
 - Session file-set creation is now truly atomic: a failed header write closes and unlinks that file immediately; the initial metadata sidecar is part of the success condition (a real exclusive create, closing the check-then-write overwrite race); any failure rolls the whole set back, and "Start new recording" no longer returns a phantom success
