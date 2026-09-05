@@ -128,14 +128,29 @@ class _CacheScanThread(QThread):
     Scanning several GB of model directories took seconds, and _on_tab_changed
     started a fresh bare thread on every switch to the cache page — so flipping
     tabs a few times had several full traversals running at once.
+
+    Cancellable: app quit joins this thread for a bounded wait only, and a
+    scan that cannot be interrupted outlives that wait — the thread is a
+    child of the panel, so tearing the application down underneath a live
+    scan is Qt's fatal "Destroyed while thread is still running" abort.
+    stop_background_tasks sets cancel_event; the walk checks it per entry.
     """
 
     result = pyqtSignal(list)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("CacheScanThread")
+        self.cancel_event = threading.Event()
 
     def run(self):
         entries = []
         try:
             for name, path in get_cache_entries():
+                if self.cancel_event.is_set():
+                    # Abandoned scan: emit nothing (the UI keeps the last
+                    # listing) and let the thread end promptly for quit.
+                    return
                 entries.append((name, str(path), dir_size(path)))
         except Exception:
             log.error("Cache scan failed", exc_info=True)
@@ -1424,7 +1439,6 @@ class ControlPanel(QWidget):
         self._cache_list.clear()
         self._cache_total.setText(t("scanning"))
         task = _CacheScanThread(self)
-        task.setObjectName("CacheScanThread")
         self._cache_task = task
         task.result.connect(self._cache_result.emit)
         task.finished.connect(self._on_cache_scan_finished)
