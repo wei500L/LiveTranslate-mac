@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-09-05 (round 15)
+- Fixed PDF export collapsing a whole meeting onto a single page: the QTextDocument layout was never bound to the QPdfWriter, so point-size fonts were interpreted at a default ~96 DPI while the page box was in 1200-DPI device pixels — every glyph rendered ~12x too small and 160 bilingual entries shrank onto one page. The layout is now bound to the writer before pagination (the same step QTextDocument::print_ performs); long meetings paginate again (160 entries → 9 pages), pinned by a regression test: multiple pages, the first entry appearing only on page one, correct footer numbering
+- Real-widget GUI verification (offscreen): the records center driven through the full session lifecycle — end/generate/delete/export/edit button availability asserted state by state across history/live/paused/saving/sealed (29/29 passing), badges (Recording/Paused/Saving) updating with each push, search/filter and wide/narrow layout switching working, screenshots archived
+- Real PDF rendering verified: mixed Chinese/Russian/English multi-page export, text selectable and searchable, footer numbering correct per page; a few CJK glyphs extract as Kangxi-radical code points at the text-extraction layer (visually identical glyphs — a Qt/font ToUnicode quirk, not a code issue)
+
 ## 2026-09-05 (round 14)
 - Fixed the diagnostic pipeline failing unconditionally on the GigaAM engine: the worker restart state it assembles lacked the `gigaam_model_key`, so after the ASR worker itself loaded fine, activating it raised KeyError — every `debug_pipeline.py` run with GigaAM died before recognition
 - Fixed a false-negative verdict in the diagnostic report: it queried the writer for its session file paths only after `stop()` had already closed and reset the writer, so a run that recorded perfectly was reported as "no transcript session was opened" FAIL — the paths are now snapshotted before the stop and handed to the report

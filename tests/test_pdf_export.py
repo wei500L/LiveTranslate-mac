@@ -61,6 +61,42 @@ def test_pdf_file_is_generated_with_expected_sections(tmp_path, app):
     assert out.read_bytes().startswith(b"%PDF")
 
 
+def test_long_record_paginates_at_real_font_size(tmp_path, app):
+    """[round-15 regression] The document layout must be bound to the
+    QPdfWriter before paginating. Without ``setPaintDevice`` the layout
+    interpreted point sizes at ~96 DPI while the page box was in 1200-DPI
+    device pixels, so every font rendered ~12x too small and a whole
+    meeting collapsed onto a single page (160 bilingual entries -> 1 page).
+    A long record must produce multiple pages whose first page is not
+    re-painted on the later ones."""
+    pytest.importorskip("PyQt6.QtPdf", reason="pagination check reads the PDF back")
+    from PyQt6.QtPdf import QPdfDocument
+
+    out = tmp_path / "long.pdf"
+    entries = [
+        {
+            "timestamp": f"{9 + i // 60:02d}:{i % 60:02d}:00",
+            "original": f"Запись {i} по повестке дня.",
+            "translation": f"第{i}条记录：语音识别系统的性能优化与权衡。",
+        }
+        for i in range(160)
+    ]
+    assert pe.export_pdf(
+        out, title="长会议", meta_rows=[("条目", "160")],
+        summary_markdown=None, entries=entries, show_original=True,
+    )
+    doc = QPdfDocument(None)
+    doc.load(str(out))
+    pages = doc.pageCount()
+    texts = [doc.getAllText(p).text() for p in range(pages)]
+    assert pages > 1, "160 entries collapsed onto a single page (shrink bug)"
+    # The first entry lives on page 1 only — the per-page slice must not
+    # repaint the top of the document everywhere.
+    hits = sum(1 for t in texts if "第0条记录" in t)
+    assert hits == 1, f"first entry painted on {hits} pages"
+    assert texts[0] != texts[1]
+
+
 def test_pdf_text_is_searchable_in_chinese_and_russian(tmp_path, app):
     out = tmp_path / "bilingual.pdf"
     ok = pe.export_pdf(

@@ -288,6 +288,13 @@ def _print_with_page_numbers(writer: QPdfWriter, doc: QTextDocument, title: str)
     reserve = writer.logicalDpiY() * _FOOTER_RESERVE_MM / 25.4
     content_width = writer.width()
     content_height = writer.height() - reserve
+    # Bind the layout to the writer BEFORE paginating: QTextDocument's
+    # layout otherwise interprets point-size fonts at a default ~96 DPI,
+    # while QPdfWriter's logical resolution is 1200 DPI and the page size
+    # below is in those (much finer) device pixels — every font would render
+    # ~12x too small and a whole meeting collapsed onto a single page.
+    # This is the same step QTextDocument::print_ performs internally.
+    doc.documentLayout().setPaintDevice(writer)
     # Lay the document out against the content box (not the full page), so
     # pageCount() and the per-page slices agree on where pages break.
     doc.setPageSize(QSizeF(content_width, content_height))
