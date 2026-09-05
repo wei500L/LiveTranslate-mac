@@ -1046,7 +1046,13 @@ def _lightweight_recorder(page, monkeypatch):
 def test_pause_resume_pushes_stay_in_memory(page, monkeypatch):
     """[per-4] PAUSED and back to ACTIVE for the cached live row: no
     records.list_sessions call, no full refresh, the badge source flags
-    (is_active) are unchanged and disk-derived flags are untouched."""
+    (is_active) are unchanged and disk-derived flags are untouched.
+
+    The summary-state keys are compared with .get(): a record without a
+    committed summary pair legitimately *lacks* them (list_sessions only
+    writes summary_stale/summary_edited when a summary exists), so a
+    missing key before AND after the push is exactly the "untouched"
+    contract — indexing would turn the absence into a KeyError."""
     page._list.setCurrentRow(0)
     stamp = page._list.item(0).record["session"]
     page.set_transcript_writer(_FakeWriter(active=stamp))
@@ -1063,7 +1069,7 @@ def test_pause_resume_pushes_stay_in_memory(page, monkeypatch):
     after = page._record_for_session(stamp)
     for key in ("summary_stale", "summary_edited", "has_summary",
                 "ended_cleanly", "interrupted", "is_active", "is_ending"):
-        assert after[key] == before[key], key
+        assert after.get(key) == before.get(key), key
 
 
 def test_ending_push_stays_in_memory_and_marks_only_target(page, monkeypatch):
@@ -1160,16 +1166,29 @@ def test_lightweight_push_does_not_cancel_running_worker(page, monkeypatch):
 def test_lightweight_push_preserves_stale_and_edited_badges(page, monkeypatch):
     """[per-9] The stale/edited (and ready) flags are disk-derived state:
     a lightweight pause/ending push must carry them through the list
-    rebuild unchanged — rows and badges re-render, the data does not."""
+    rebuild unchanged — rows and badges re-render, the data does not.
+
+    The live row's flags are set directly on the cached record rather
+    than through a writer + refresh: a session the writer reports active
+    has its stale badge suppressed by design (list_sessions forces
+    summary_stale=False while a meeting is still growing — a summary of a
+    growing meeting is interim, not stale), so asserting True through
+    that path would contradict the product semantics. The lightweight
+    path never re-derives any of these flags; pinning them on the cache
+    and asserting they survive the push is the real contract."""
     page._list.setCurrentRow(0)
     stamp = page._list.item(0).record["session"]
-    page.set_transcript_writer(_FakeWriter(active=stamp))
-    page.refresh()
-    # A stale summary (hash mismatch) on the live meeting's record.
+    # A committed (stale) summary and an edited flag on the record, plus
+    # the live row the pushes will target.
     records.save_summary(page._dir, stamp, "# old", {"source_hash": "bogus"})
     page.refresh()
     live = page._record_for_session(stamp)
-    assert live["summary_stale"] is True
+    assert live["has_summary"] is True
+    # Stamp the cache the way a live session with a stale summary looks:
+    # the summary exists, its hash no longer matches, the meeting is live.
+    live["is_active"] = True
+    live["summary_stale"] = True
+    live["summary_edited"] = False
 
     full_refreshes, listing, summary_reads = _lightweight_recorder(page, monkeypatch)
     page.on_session_state_changed("paused")
