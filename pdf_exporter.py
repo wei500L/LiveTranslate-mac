@@ -46,7 +46,18 @@ def safe_filename(title: str, when: str, ext: str = "pdf") -> str:
 
 
 def _default_font() -> QFont:
-    """A font with honest CJK coverage on both platforms."""
+    """A font with honest CJK coverage on both platforms.
+
+    QFontDatabase is only usable while a QGuiApplication exists: calling it
+    from a plain script (no Qt app, or one already torn down) is a Qt fatal
+    ("Must construct a QGuiApplication before accessing QFontDatabase"),
+    not an exception. Degrade to the default font instead — the caller gets
+    platform-default rendering rather than an abort.
+    """
+    from PyQt6.QtGui import QGuiApplication
+
+    if QGuiApplication.instance() is None:
+        return QFont()
     families = QFontDatabase.families()
     # Windows-first names resolve there, the PingFang/Hiragino ones on macOS;
     # Noto covers Linux. Cross-platform order: any hit wins on its platform.

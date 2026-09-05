@@ -5,6 +5,7 @@ offscreen against a real QApplication — no network, no model.
 """
 
 import re
+from pathlib import Path
 
 import pytest
 
@@ -95,6 +96,34 @@ def test_long_record_paginates_at_real_font_size(tmp_path, app):
     hits = sum(1 for t in texts if "第0条记录" in t)
     assert hits == 1, f"first entry painted on {hits} pages"
     assert texts[0] != texts[1]
+
+
+def test_font_resolution_outside_a_qt_application_does_not_abort(tmp_path):
+    """[round-18 regression] QFontDatabase is a Qt fatal, not an exception,
+    when used without a QGuiApplication ("Must construct a QGuiApplication
+    before accessing QFontDatabase"). A diagnostic or batch script that
+    imports pdf_exporter and asks for the default font (the shape of a real
+    crash report: pyrun_file -> QFontDatabase::families -> fatal) must get
+    the platform-default font instead of aborting the process. Driven in a
+    subprocess because the fatal aborts the interpreter."""
+    import subprocess
+    import sys
+
+    code = (
+        "import sys; sys.path.insert(0, {root!r}); "
+        "import pdf_exporter as pe; "
+        "f = pe._default_font(); "
+        "print('OK' if f is not None else 'NONE')"
+    ).format(root=str(Path(__file__).resolve().parent.parent))
+    result = subprocess.run(
+        [sys.executable, "-c", code],
+        capture_output=True, text=True, timeout=60,
+    )
+    assert result.returncode == 0, (
+        f"process aborted/failed: rc={result.returncode} "
+        f"stderr={result.stderr[-400:]}"
+    )
+    assert "OK" in result.stdout
 
 
 def test_pdf_text_is_searchable_in_chinese_and_russian(tmp_path, app):

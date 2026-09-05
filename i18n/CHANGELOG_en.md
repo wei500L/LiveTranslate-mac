@@ -1,5 +1,8 @@
 # Changelog
 
+## 2026-09-05 (round 18)
+- Fixed a process abort when the font database is queried without a Qt application context: the PDF export's default-font resolution unconditionally queried QFontDatabase, which is a Qt fatal (an abort, not a Python exception) when no QGuiApplication exists — any diagnostic or batch script importing the module and resolving a font without creating a Qt app was killed outright (a real crash report carried exactly this stack). It now degrades to the platform default font when no application instance exists, pinned by a subprocess-level regression test
+
 ## 2026-09-05 (round 17)
 - Propagated the proven QThread destruction race fix to every same-pattern site: the connection-test thread (model edit dialog) and the AI-minutes worker (both the task registry and the records page) also deleted immediately on finished, inside the same window against the worker's running-flag cleanup — all now defer the delete one beat (100ms timer)
 - Fixed a crash hazard on the download dialogs' cancel path: the first-launch wizard and the missing-models dialog set the cancel flag but let the close proceed without waiting for the download thread to unwind — and the dialog owns that thread as a child, so the caller's scheduled destruction would destroy a still-running QThread (the same fatal as the previous round's startup abort). Close requests now stay pending until the thread has finished; the cancel button and close semantics are unchanged apart from the bounded wait
