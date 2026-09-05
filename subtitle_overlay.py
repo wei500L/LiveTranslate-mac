@@ -333,22 +333,33 @@ class ChatMessage(QWidget):
         export_both = export_menu.addAction(t("export_all"))
         menu.addSeparator()
         clear_list = menu.addAction(t("clear_list"))
-        action = menu.exec(event.globalPos())
-        if action == copy_orig:
-            QApplication.clipboard().setText(self._original)
-        elif action == copy_trans:
-            QApplication.clipboard().setText(self._translated)
-        elif action == copy_all:
-            QApplication.clipboard().setText(f"{self._original}\n{self._translated}")
-        elif action == clear_list:
-            overlay = self.window()
-            if hasattr(overlay, '_on_clear'):
-                overlay._on_clear()
-        elif action in (export_orig, export_trans, export_both):
-            mode = {export_orig: "original", export_trans: "translation", export_both: "both"}[action]
-            overlay = self.window()
-            if hasattr(overlay, "export_messages"):
-                overlay.export_messages(mode, parent=self)
+        try:
+            action = menu.exec(event.globalPos())
+            # Dispatch inside the try: the handlers run before the menu's
+            # release is even scheduled. The menu is already hidden once
+            # exec returns, so nothing below depends on it staying alive.
+            if action == copy_orig:
+                QApplication.clipboard().setText(self._original)
+            elif action == copy_trans:
+                QApplication.clipboard().setText(self._translated)
+            elif action == copy_all:
+                QApplication.clipboard().setText(f"{self._original}\n{self._translated}")
+            elif action == clear_list:
+                overlay = self.window()
+                if hasattr(overlay, '_on_clear'):
+                    overlay._on_clear()
+            elif action in (export_orig, export_trans, export_both):
+                mode = {export_orig: "original", export_trans: "translation", export_both: "both"}[action]
+                overlay = self.window()
+                if hasattr(overlay, "export_messages"):
+                    overlay.export_messages(mode, parent=self)
+        finally:
+            # The popup is per-invocation, but QMenu(self) transfers the C++
+            # ownership to this widget — a dropped Python reference does NOT
+            # free it, so every right-click would otherwise leave the menu
+            # (and its actions) alive as a child until teardown. Cancel,
+            # selection and exception paths all land here.
+            menu.deleteLater()
 
 
 def _escape(text: str) -> str:
@@ -614,6 +625,11 @@ class DragHandle(QWidget):
     clear_clicked = pyqtSignal()
     hide_clicked = pyqtSignal()
     quit_clicked = pyqtSignal()
+    # Meeting-recording lifecycle button ("End this recording" / "Start new
+    # recording"). Emits with no payload; the app-side state machine is the
+    # single authority and pushes the label/state back through
+    # set_session_state().
+    session_toggle_clicked = pyqtSignal()
     mode_changed = pyqtSignal(str)  # "full" or "compact"
     position_changed = pyqtSignal()
 
@@ -672,6 +688,13 @@ class DragHandle(QWidget):
         self._clear_btn = _btn(t("clear"))
         self._clear_btn.clicked.connect(self.clear_clicked.emit)
         row1.addWidget(self._clear_btn)
+
+        # Meeting-session button: label and colour follow the app-level
+        # session state (IDLE/ACTIVE/PAUSED/ENDING), never local state.
+        self._session_state = "idle"
+        self._session_btn = _btn(t("session_btn_start"))
+        self._session_btn.clicked.connect(self.session_toggle_clicked.emit)
+        row1.addWidget(self._session_btn)
 
         # Mode toggle button
         self._mode_btn = _btn(t("mode_full"))
@@ -834,6 +857,60 @@ class DragHandle(QWidget):
     ).replace(
         "color: #e8dfd2", "color: #d6efdb"
     )
+    # Session button states: recording=green, paused=amber, ending=light
+    # progress look, idle=neutral grey. Same replace-chain pattern as above.
+    _SESSION_ACTIVE_CSS = _BTN_CSS.replace(
+        "rgba(42, 39, 34, 230)", "rgba(38, 74, 46, 235)"
+    ).replace(
+        "rgba(174, 143, 91, 100)", "rgba(140, 200, 150, 150)"
+    ).replace(
+        "color: #e8dfd2", "color: #d6efdb"
+    )
+    _SESSION_PAUSED_CSS = _BTN_CSS.replace(
+        "rgba(42, 39, 34, 230)", "rgba(94, 70, 30, 235)"
+    ).replace(
+        "rgba(174, 143, 91, 100)", "rgba(231, 185, 111, 160)"
+    ).replace(
+        "color: #e8dfd2", "color: #ffe2ae"
+    )
+    _SESSION_ENDING_CSS = _BTN_CSS.replace(
+        "rgba(42, 39, 34, 230)", "rgba(58, 54, 48, 235)"
+    ).replace(
+        "rgba(174, 143, 91, 100)", "rgba(231, 185, 111, 120)"
+    ).replace(
+        "color: #e8dfd2", "color: #e7b96f"
+    )
+    _SESSION_IDLE_CSS = _BTN_CSS.replace(
+        "rgba(42, 39, 34, 230)", "rgba(50, 48, 45, 235)"
+    ).replace(
+        "rgba(174, 143, 91, 100)", "rgba(120, 112, 100, 90)"
+    ).replace(
+        "color: #e8dfd2", "color: #b0a89a"
+    )
+
+    # state -> (label key, css). ENDING is disabled: the close is running.
+    _SESSION_BUTTONS = {
+        "idle": ("session_btn_start", None),          # uses _SESSION_IDLE_CSS
+        "active": ("session_btn_end", "_SESSION_ACTIVE_CSS"),
+        "paused": ("session_btn_end", "_SESSION_PAUSED_CSS"),
+        "ending": ("session_btn_ending", "_SESSION_ENDING_CSS"),
+    }
+
+    def set_session_state(self, state: str):
+        """Reflect the app-level session state onto the header button."""
+        self._session_state = state
+        entry = self._SESSION_BUTTONS.get(state, self._SESSION_BUTTONS["idle"])
+        label_key, css_attr = entry
+        self._session_btn.setText(t(label_key))
+        css = (
+            self._SESSION_IDLE_CSS if css_attr is None
+            else getattr(self, css_attr)
+        )
+        self._session_btn.setStyleSheet(css)
+        # "Ending…" is a progress state, not an action — a second click must
+        # not re-enter the end path (the state machine guards, the button
+        # stays honest too).
+        self._session_btn.setEnabled(state != "ending")
 
     def set_target_language(self, lang: str):
         idx = self._target_lang.findData(lang)
@@ -885,6 +962,7 @@ class DragHandle(QWidget):
         self._row2_widget.setVisible(not compact)
         self._clear_btn.setVisible(not compact)
         self._subtitle_btn.setVisible(not compact)
+        self._session_btn.setVisible(not compact)
         self._mode_btn.setText(t("mode_compact") if compact else t("mode_full"))
         self.setFixedHeight(24 if compact else 62)
 
@@ -918,6 +996,7 @@ class SubtitleOverlay(QWidget):
     stop_requested = pyqtSignal()
     hide_requested = pyqtSignal()
     quit_requested = pyqtSignal()
+    session_toggle_requested = pyqtSignal()
     subtitle_toggled = pyqtSignal()
     mode_changed = pyqtSignal(str)  # "full" or "compact"
     position_changed = pyqtSignal()
@@ -1012,6 +1091,9 @@ class SubtitleOverlay(QWidget):
         self._handle.hide_clicked.connect(self.hide_requested.emit)
         self._handle.clear_clicked.connect(self._on_clear)
         self._handle.quit_clicked.connect(self.quit_requested.emit)
+        self._handle.session_toggle_clicked.connect(
+            self.session_toggle_requested.emit
+        )
         self._handle.mode_changed.connect(self._on_mode_changed)
         self._handle.position_changed.connect(self.position_changed)
         container_layout.addWidget(self._handle)
@@ -1081,6 +1163,9 @@ class SubtitleOverlay(QWidget):
 
     def set_running(self, running: bool):
         self._handle.set_running(running)
+
+    def set_session_state(self, state: str):
+        self._handle.set_session_state(state)
 
     def _set_topmost(self, enabled: bool):
         self._topmost_enabled = enabled

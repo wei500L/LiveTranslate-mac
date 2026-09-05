@@ -20,7 +20,7 @@ start.bat                           # Windows
 ./start.sh                          # macOS
 ```
 
-Tests: `python -m pytest -q` (82 offline tests, no network or model downloads). This must pass before any commit — CI runs the same command on macOS arm64 and every release-producing job gates on it.
+Tests: `python -m pytest -q` (463 offline tests, no network or model downloads; 4 skipped where torch/Qt optional pieces are absent). This must pass before any commit — CI runs the same command on macOS arm64 and every release-producing job gates on it.
 
 Linter: `ruff` is **not** bundled with the venv. When it is available, run `python -m ruff check --select F,E,W --ignore E501,E402 *.py`. E402 is intentionally ignored because `main.py` requires torch before PyQt6. When ruff is unavailable, fall back to `python -m compileall -q .` plus the test suite, and say so rather than reporting a lint pass that did not happen.
 
@@ -133,6 +133,288 @@ transcript_writer.py     Per-session meeting record: original/translation/all te
                          Entries are released in utterance order (translations
                          finish out of order on the worker pool), and read_session_meta()
                          / delete_session() back the Meeting Records panel page.
+                         `delete_session()` enumerates a session's files by
+                         exact name (`_STAMP_KIND_SUFFIXES` + the summary
+                         pair + each exact name's `.tmp*` staged siblings)
+                         — never a `livetrans_{stamp}_*` prefix glob: a bare
+                         stamp is the prefix of its same-second suffixed
+                         siblings (`_01`), and the glob deleted the sibling
+                         meeting's whole file set along with the target's.
+                         Explicit session lifecycle: `begin_session()` /
+                         `end_session()` / `active_session()` /
+                         `has_active_session()`; `set_recording(True/False)`
+                         mirrors the *pipeline's* start/stop and re-arms the
+                         legacy auto-open path (an entry arriving while the
+                         pipeline records, with no explicit session, opens one
+                         and `main.py` adopts it into the state machine).
+                         `_enabled` (the auto-save preference) is deliberately
+                         separate from session state — ending a meeting never
+                         flips the user's setting, and after `end_session()`
+                         `write_original()` refuses to auto-open a ghost
+                         session (`_explicitly_ended`): only `begin_session()`
+                         ("Start new recording") or a fresh pipeline start
+                         opens the next meeting. Every entry carries its
+                         session stamp (`_entry_sessions`); a result whose
+                         entry session is closed (timed-out end or a newer
+                         session) is *discarded* by `_complete()` — completed
+                         meetings are immutable, their files are never
+                         reopened and nothing is appended after the Summary
+                         footer (order, counts and source_hash stay stable;
+                         retranslating history would be a separate feature).
+                         Session stamps are conflict-safe
+                         (`_unique_stamp`): two meetings in the same second get
+                         `_01`/`_02` suffixes checked against files on disk
+                         **with their real extensions** (extension-less probing
+                         never collided), files are opened with `"x"` (exclusive
+                         create), and `stamp_sort_key()` sorts bare-then-suffixed
+                         numerically for the listing. `_open_session_locked()`
+                         is all-or-nothing: a partial file set is rolled back
+                         (files closed and unlinked, no phantom session, no
+                         stamp), `_session_open` is set only when every required
+                         file opened, and the first sidecar write is
+                         `create_only` — a fresh session can never overwrite
+                         another session's meta. `held_session()` is the
+                         exact, lock-held answer to "whose files does the
+                         writer still hold" (open, closing, or half-dead) —
+                         callers must use it instead of path substrings (a
+                         bare stamp is a prefix of its same-second suffixed
+                         siblings). It shares its condition with
+                         `has_open_resources()` through
+                         `_holds_session_resources_locked()` — one predicate
+                         behind both answers, so the IDLE gate and the
+                         ownership check cannot drift apart. Staged sidecar
+                         writes use a
+                         per-call UUID suffix (`.tmp<pid>.<uuid>`): a pid+
+                         counter is unique only within one module, and
+                         meeting_records stages the same file with the same
+                         name shape, so two counters could agree. `rename_session(title,
+                         expected_session=)` verifies the expected stamp
+                         inside the lock — an end+begin racing the rename
+                         dialog must not retitle the new meeting.
+                         `write_original(..., session=)`
+                         takes the caller's expected session stamp and verifies
+                         it inside the writer's lock: an entry whose audio
+                         belongs to a session that is no longer open (an end
+                         and a new begin raced the queue) is refused; `None`
+                         means the legacy auto-open path. A failed original
+                         write rolls the entry back entirely (nothing in
+                         `_pending`/`_order`/`_entry_sessions`,
+                         `speech_seconds` uncopped) so the seal can never
+                         re-emit it; `_emit_locked` counts an entry only
+                         when every view write succeeded. `close()` is the
+                         *pipeline* shutdown path and shares the seal with
+                         `end_session()` — on failure it runs the *same*
+                         abort fallback (`_abort_locked`) and is idempotent;
+                         do not bind `close()` to the "end recording"
+                         button. Seal order (the verdict commits last):
+                         entries → footer → **content seal**
+                         (`_seal_content_files_locked`: flush + fsync +
+                         close every handle; OSError *and* ValueError count
+                         as file-state failures) → decide `session_status`
+                         (`completed` only when nothing degraded) → atomic
+                         sidecar commit (a failure downgrades to
+                         `interrupted` and retries once) → memory reset
+                         (cleanup only — the reset is never the verdict).
+                         The sidecar carries `session_status: active` from
+                         the first commit; `abort_session()` (never raises,
+                         resets in a finally, marks the sidecar interrupted)
+                         is the fallback for a close that failed.
+                         `has_open_resources()` is the strictest liveness
+                         check (logical open, closing, `_opened`, live
+                         handles, stamp or paths — catches the
+                         `_opened=True, _session_open=False` half-dead
+                         state) and gates the IDLE broadcast; a live
+                         session's sidecar carries `"ended": null`.
+                         `active_session()` exposes the in-flight stamp so
+                         the records center can label a still-recording
+                         meeting. `_write_meta_locked()` re-reads the
+                         existing sidecar and carries the whitelisted user
+                         fields (`title`, `title_set_at`) across every
+                         rewrite — a rename during a live session survives
+                         `set_session_info()` and `close()`.
+meeting_records.py       Records data layer: list_sessions/parse_session (Markdown
+                         → combined txt → original-only fallback), titles,
+                         source_hash staleness, and the AI-summary pair
+                         `livetrans_{session}_summary.md` + `_summary_meta.json`.
+                         The pair is committed body-first, meta last, with
+                         `content_sha256` in the meta — the meta is the commit
+                         marker and `load_summary()` verifies the hash, so an
+                         interrupted commit never presents new metadata over an
+                         old body. Both files stage under uniquely-suffixed
+                         names (`.tmp<pid>.<uuid>`), and the whole
+                         staged-write-replace sequence is serialized by a
+                         module lock (`_SUMMARY_SAVE_LOCK`): unique staged
+                         names prevent temp collisions, but only mutual
+                         exclusion prevents two racing saves (a generation
+                         finishing while a manual edit saves) from
+                         interleaving their final replaces into one save's
+                         body under the other's meta — which the hash check
+                         then reads as "no summary", losing both. The lock
+                         is in-process only; two OS processes sharing a
+                         transcripts directory are outside this app's file
+                         protocol. `delete_summary()` globs `.tmp*` so a
+                         crashed commit's staged siblings never linger. An
+                         orphan body (meta missing or unreadable)
+                         also loads as absent: without the marker there is no
+                         committed summary. A legacy meta without
+                         `content_sha256` is accepted (pre-field summaries are
+                         valid, only unverifiable). Summary files are excluded
+                         from session listing by filename (the summary sidecar
+                         matches the writer's `livetrans_*_meta.json` glob).
+                         `list_sessions()` also classifies closed sessions
+                         by the sidecar's `session_status` when present
+                         (the new format): only `completed` counts as
+                         `ended_cleanly`; `active` (a crashed live session —
+                         the seal never committed) and `interrupted`
+                         (aborted or degraded close) read as `interrupted`,
+                         **even when a half-failed seal already wrote a
+                         footer or an `ended` timestamp** — the status is
+                         committed last and outranks them. Sidecars without
+                         the field (older writers) fall back to the footer /
+                         `ended` heuristics unchanged. `interrupted` is
+                         mutually exclusive with `is_ending`: a mid-close
+                         record (writer no longer reports it active, sidecar
+                         still `active` until the seal commits) is ending,
+                         NOT interrupted — one record carrying both made
+                         filters/exports/permissions misread a meeting
+                         mid-close as a crash-left one. The records page
+                         labels interrupted sessions "Interrupted" instead
+                         of presenting a half-recorded meeting as complete.
+                         Stamp sorting goes through
+                         `transcript_writer.stamp_sort_key` so suffixed stamps
+                         (_01/_02) order correctly.
+ai_summary_service.py    AI meeting-minutes pipeline: prompt templates (meeting/
+                         classroom), chunked map-reduce with hierarchical merge
+                         when extracted parts exceed the budget, error
+                         classification to i18n kinds, and `SummaryWorker`
+                         (QThread) with cooperative cancel, a generation token
+                         and a 120s per-request timeout. `ensure_model_ids()`
+                         stamps stable ids on model entries and migrates the
+                         legacy `ai_summary_provider` index. `make_chat_fn()`
+                         reuses the app's client factory but NOT the translation
+                         profile: no translation prompt/history, token floor
+                         `SUMMARY_MIN_MAX_TOKENS` (a translation model's
+                         max_tokens=128 must not truncate minutes),
+                         scalar-only extra_body pass-through.
+meeting_records_page.py  The records-center page (ControlPanel "Meeting Records"):
+                         master-detail QSplitter, search/filter/rename, three
+                         detail tabs, summary generation orchestration with
+                         session+generation token validation so a stale worker
+                         can never update the current view, PDF/MD/TXT export.
+                         Responsive threshold measured on the page's own
+                         contentsRect() (the panel's 170px nav column is not
+                         page width). App-level session state arrives via
+                         `on_session_state_changed(state, session_id)`
+                         (from LiveTranslateApp's bridge); the page never
+                         derives it, and AI minutes are refused while
+                         ACTIVE/PAUSED/ENDING. IDLE pushes always run one
+                         full refresh (the seal just wrote final counts and
+                         status) with `select_session`; every other push —
+                         the pipeline's ACTIVE↔PAUSED toggles and the ENDING
+                         flip — is applied *in memory* when the target
+                         session is already a cached live row
+                         (`_apply_lightweight_state_update`: flags updated
+                         by exact session id, rows rebuilt from the same
+                         snapshot, zero records-layer reads), falling back
+                         to one full refresh whenever the identity is
+                         missing/unresolvable, the session is not cached, or
+                         the cached flags contradict the transition —
+                         re-reading beats guessing. Disk-derived record
+                         fields (`summary_stale`, `summary_edited`,
+                         `ended_cleanly`, `has_summary`) are never written
+                         by the lightweight path, and an ENDING row is
+                         never marked `interrupted`. `end_recording_requested` is a
+                         request-only signal carrying the target session id —
+                         the app's `end_recording_session(expected_session)`
+                         is the single implementation, and the expected id is
+                         re-verified *inside* it, immediately before the
+                         ENDING flip: both entry points (records page and
+                         the overlay toggle) reach it through a confirmation
+                         dialog that pumps a nested event loop, so the
+                         meeting open when the dialog closes may differ from
+                         the one the user clicked on — the check and the
+                         flip are one synchronous GUI-thread sequence.
+                         Every record-scoped operation carries its target
+                         explicitly and validates it twice: the cached record
+                         flags (from the last refresh) gate the UI
+                         (`_update_action_availability` covers end/generate/
+                         edit/delete/export in one pass, export disabled
+                         while the cached record is ENDING; a running
+                         worker's controls stay disabled), and the handler
+                         re-asks the writer at click time
+                         (`_live_session_role`: the app-level ENDING stamp
+                         outranks a writer still reporting the session
+                         active). Delete also refuses while the writer's
+                         `held_session()` equals the record's stamp — the
+                         exact ownership answer, never a path substring (a
+                         bare stamp is a prefix of its same-second suffixed
+                         siblings). Rename routes live sessions through the
+                         writer's `rename_session(title, expected_session)`
+                         and never touches a pre-dialog list item: rows are
+                         destroyed by every rebuild, so post-dialog row
+                         updates go through `_list_item_for_session()`.
+                         Manual minutes edits fix the session identity and
+                         the original content hash at editor open and
+                         revalidate both at save (`_save_edited_summary`):
+                         a selection switched by a background refresh, a
+                         generation that completed under the dialog, or the
+                         summary pair vanishing under the dialog all refuse
+                         the save rather than writing another meeting's
+                         files, discarding newer content or resurrecting
+                         deleted minutes. Export refuses while
+                         the record is ENDING in both the UI and the
+                         handler (a mid-seal file set can miss the final
+                         entries; an active record stays exportable and is
+                         flagged as a snapshot). The list
+                         rebuild preserves the selection by session identity
+                         (`_refill_list`): clear() resets currentItem, so an
+                         unconditional setCurrentRow(0) re-fired the load on
+                         every refresh — which cancelled a running summary
+                         worker; the suppressed re-select instead re-syncs
+                         the detail pane's data in place
+                         (`_refresh_detail_for_record`: title/meta/info/
+                         minutes and button states, but never the record
+                         view's scroll, never the current tab, and never a
+                         running generation's status text) — only a real
+                         session switch does the full load. That in-place
+                         re-sync runs only when the rows carry fresh data:
+                         a pure search/filter change goes through
+                         `_on_filter_changed` and rebuilds the list from the
+                         same `_sessions` snapshot without touching the
+                         detail pane (no minutes re-read or Markdown
+                         re-render per keystroke), and
+                         `refresh(select_session=...)` passes its target
+                         into `_refill_list` so the target row is landed on
+                         directly — the previous selection's detail is never
+                         synced on the way to a different target.
+                         Dependency injection is public API:
+                         `set_transcript_writer(writer)` (idempotent: a
+                         re-injection of the same writer schedules nothing —
+                         every records-tab visit re-forwards the panel's
+                         writer, and `refresh()` supersedes any pending
+                         deferred refresh, so one tab entry is exactly one
+                         full refresh) /
+                         `set_summary_registry(registry)`. Page-owned
+                         single-shot QTimers (`_layout_settle_timer`,
+                         `_deferred_refresh_timer`) replace bare
+                         `QTimer.singleShot(0, self, ...)` calls. Summary
+                         workers are owned by `SummaryTaskRegistry`
+                         (summary_task_registry.py): registered there (which
+                         also detaches them from the page), cancelled
+                         cooperatively at page teardown, held until `run()`
+                         ends, freed once via the finished signal — no
+                         re-parenting to QApplication, no `terminate()`, no
+                         long GUI-thread waits, and the app's `on_quit` reaches
+                         every live worker through the registry's
+                         `cancel_all()`.
+meeting_records_widgets.py Leaf widgets split from the page: SessionItem list
+                         rows, RecordScrollArea incremental record renderer,
+                         minutes_html Markdown→HTML (input escaped before
+                         reintroducing our tags).
+pdf_exporter.py          PDF minutes export via QTextDocument + QPdfWriter (A4,
+                         mm margins, two-pass print: paginate once then draw
+                         per-page with footer; no per-page doc clone). Fonts
+                         resolved from system availability with CJK fallback.
 torch_backend.py         Device capability layer (mps/cuda availability, device normalization)
 ui_theme.py              Shared Qt styling
 i18n.py                  t() lookup, LANGUAGES list, system language detection
@@ -151,8 +433,251 @@ platform_fonts.py        Default UI/mono font families per platform
 - **ASR queue thread**: `_asr_loop` drains VAD segments and calls `ASRClient.transcribe()`
 - **ASR worker process**: `asr_worker.py` owns the concrete ASR backend/model and runs inference over `multiprocessing.Pipe`
 - **ASR loading**: `_switch_asr_engine()` stops the current worker, then starts the target worker in a background thread; if target loading fails, it restarts the previous worker from its saved config
+- **Session-end thread**: `end_recording_session()` (main.py) runs the ENDING
+  workload — VAD flush hand-off, bounded wait for in-flight ASR/translation
+  (30s), then `TranscriptWriter.end_session()` — off the Qt thread; state
+  transitions reach the UI through a queued signal bridge
+  (`_SessionBridge.state_changed`), never direct widget calls
 - Cross-thread UI updates use **Qt signals** (e.g., `add_message_signal`, `update_translation_signal`)
 - ASR readiness tracked by `_asr_ready` flag; pipeline drops segments while no ready worker exists
+
+### Recording Session Lifecycle (SessionState)
+
+A *meeting record* is independent of the *pipeline*: pausing the pipeline
+pauses the meeting (same session resumes); ending the meeting closes the
+record, leaves the pipeline **paused** (windows and the ASR model stay — no
+unload, no restart) and stops listening — the app must not keep recognising
+audio and calling the translation API once nothing is being recorded;
+"Start new recording" creates the writer session *first* and resumes the
+pipeline *second* (a failed start cannot leave a running pipeline or an
+empty active meeting); quitting stops everything. `LiveTranslateApp` owns
+the single state machine (`SessionState.IDLE/ACTIVE/PAUSED/ENDING`); the
+overlay button, the records page and the tray read it through the signal
+bridge — none keeps its own copy. Pause/resume of the pipeline
+(`on_pause`/`on_resume` in `main()`) is ignored while ENDING runs (the end
+thread owns the pipeline's quiet window); on_resume with no session asks
+whether to start a new recording (i18n `session_resume_no_session_*`).
+Transitions:
+
+- `begin_recording_session()` — "Start new recording": IDLE→ACTIVE,
+  `begin_session()`, `_session_work.begin(generation)`, then `resume()` if
+  paused. Entries arriving with no explicit session while the pipeline
+  records (legacy auto-open) are adopted into the state machine as ACTIVE
+  from the ASR thread.
+- `end_recording_session()` — "End this recording": ACTIVE/PAUSED→ENDING on
+  a background thread, then →IDLE with the ended session id (the records
+  page refreshes, selects it and lifts the AI-minutes gate).
+- `stop()` — app exit: supersedes an in-flight ENDING (generation bump),
+  `discard_all()` on the work tracker, closes the writer through `close()`.
+
+#### Session work tracking (the ENDING drain)
+
+The ENDING wait never uses `Queue.empty()`: an item the ASR thread already
+*took* makes the queue empty while recognition has not returned, which
+closed meetings early and lost the last utterance. Instead
+`_SessionWorkTracker` (main.py) gives each session generation a
+linearized lifecycle inside one lock/Condition —
+
+* `OPEN` — accepting registrations (session recording);
+* `CLOSING` — `start_closing()` flips this in the end thread *before* the
+  final VAD flush; ordinary (capture-thread) registrations are refused
+  from that point, under the same lock, so the "capture thread produced a
+  segment but had not enqueued it when the user clicked end" interleaving
+  resolves deterministically: the registration either precedes the flip
+  (counted — the last utterance is waited on and kept) or follows it
+  (refused — the segment is dropped, no ghost session);
+* `SUPERSEDED` — `supersede()` after `end_session()` (or on timeout/quit);
+  releases become no-ops and the entry is retired so the map stays
+  proportional to live sessions, not session history.
+
+— and counts, per generation:
+
+1. **queue-item work** — the capture thread's segments go through
+   `admit(generation)`, which returns `"register"` (OPEN: count + enqueue),
+   `"pass"` (no session exists — the subtitle-only mode, recognition for the
+   live overlay with nothing recorded; the item is *still counted*:
+   `register()` auto-creates the unknown generation as OPEN, because a
+   legacy auto-open session adopted moments later reuses this same
+   generation and those in-flight items are that meeting's opening work —
+   with no session ever adopted the counts drain normally and nothing waits
+   on them), or `"drop"` (CLOSING/SUPERSEDED: the segment is discarded
+   before the queue). Items carry their registration generation as the
+   fourth tuple element; `_asr_loop`'s `finally` releases the count under
+   *that* generation (a begin racing the queue can neither steal the
+   release nor hang the new session's wait on it). Dropped-on-overflow and
+   deduplicated interim items release through `_release_queued_work`, also
+   keyed to the item's own generation. The ENDING flush enqueues through
+   `_enqueue_final_segment`/`register_final` — the only new work a CLOSING
+   generation accepts. `_enqueue_final_segment` returns whether the item
+   reached the queue: on success `_flush_for_session_end` hands the
+   interim state over with the segment and does **not** reset it — the
+   ASR loop's vad_flush `finally` owns that reset (the same ownership
+   `pause()` relies on), because the loop's dispatch between
+   `_process_interim_final` and `_process_segment` reads
+   `_interim_active`, and `_process_interim_final` needs
+   `_interim_pending` (the trimmed-away fragments' only remaining copy)
+   and `_interim_committed_tail` (echo dedup). A producer-side reset
+   early-cleared both and routed the final segment down the plain
+   `_process_segment` branch, losing the fragments and duplicating the
+   committed prefix. The flush **never** resets — not even on its
+   unqueued paths (ASR not ready, nothing remaining, superseded
+   generation, stop begun, queue rejecting the item after dropping one):
+   `remaining is None` proves only that *this* flush produced no segment,
+   not that no *earlier* vad_flush (a pause hand-off, a natural VAD flush
+   that raced the end gate) is still queued unconsumed — its consumer
+   owns the same interim state, and a reset under it lost the fragments
+   the same way. The one reset belongs to `_run_session_end`'s queue-drain
+   phase: after the flush, a **two-phase wait over one shared monotonic
+   30s deadline** (the ENDING cap is not doubled) first drains the
+   generation's *queue* work only (`wait_idle(..., queue_only=True)` —
+   waiting for network translations first would burn the budget on the
+   wrong work), then resets the interim state (a no-op on the normal
+   path, where the consumer's `finally` already ran), then waits for the
+   translations with whatever budget remains. On timeout the reset still
+   runs — bounded, logged, and stragglers fail the generation guards; the
+   abort path (`_run_session_end` raised) resets after `supersede()`. So
+   the state is never cleared under a live consumer, never leaked into
+   the next session, and the seal/IDLE only happen after it. `pause()`
+   follows the same ownership with a **queue-ordered cleanup marker**
+   instead of a wait (it runs on the Qt thread): its whole
+   flush→enqueue→reset decision runs under the boundary fence, and when
+   no audio of its own reached the queue (`_enqueue_asr` now returns
+   whether it did) it enqueues a `("vad_flush", None, …)` marker whose
+   handler skips recognition (`segment is None`) but whose `finally`
+   performs the one reset. The ASR loop is a single-consumer FIFO, so the
+   marker runs strictly after every pre-pause item (queued *or* in
+   flight, including an interim pass still writing state) and before
+   anything enqueued after the resume — "the pre-pause remainder finishes,
+   the next utterance starts clean" holds by ordering, not by resetting
+   early under a consumer. Only when the marker itself is refused (stop
+   begun, a closing generation, the queue rejecting even after dropping a
+   victim) does pause reset inline — the bounded last resort.
+2. **translation work** — `register_msg` when recognition produces a
+   message (before the job is submitted), keyed to the *segment's*
+   generation; released by the `finally` in `_translate_async` (which
+   receives the generation through `_submit_translation`), or inline on
+   the paths that never submit a job: same-language finalize and the
+   TranslationUnavailable / executor-shutdown excepts in
+   `_process_segment`/`_process_segment_text`.
+
+Producer fence (`_session_boundary_lock`, an RLock): the capture thread
+holds it across "gate check → VAD `process_chunk` → enqueue", and the end
+thread holds it across "gate up → `start_closing`". Speech the VAD accepted
+before the end is therefore enqueued and counted under the still-OPEN
+generation — the last utterance is kept, never silently dropped; audio
+after the end never reaches the VAD. `_session_snapshot()` reads the
+generation and the writer's session stamp together under the same lock, and
+every writer of `_session_generation` (begin, the end's bump, `stop()`)
+holds it, so a queue item's identity pair can never straddle a boundary.
+
+Stale-segment guard, three layers: `_process_segment`/
+`_process_segment_text` drop any queue item whose generation is no longer
+current (an end+begin raced the queue) — checked at entry (before ASR) and
+**again inside the session boundary fence right before the write**: the
+entry check cannot be the last word, because recognition runs for seconds
+after it and the writer's `session=None` (the legacy auto-open wildcard)
+accepts whatever session is open. The whole identity resolution — re-check
+→ `write_original` (and the auto-open it may perform) → `register_msg` →
+adoption — is one linearized section under the boundary fence, so an
+explicit begin either fully precedes it (the fence re-check refuses the
+pre-begin audio: it must not land in the new meeting) or fully follows it
+(the write auto-opened, the adoption claimed the session under the same
+generation, and the later begin finds ACTIVE and refuses). Only short local
+work runs under that fence (a queued signal emit, buffered file appends,
+tracker set-adds) — never ASR, translation or network; the lock order stays
+boundary→writer / boundary→tracker. Every queue item
+carries the writer session stamp it was enqueued under, which
+`write_original(session=...)` re-verifies inside the writer's lock as the
+final authority; and the writer returns an explicit WRITE_* state
+(`recorded` / `skipped` / `mismatch` / `failed`) that the caller uses to
+decide the entry's translation — only a `recorded` entry registers a
+translation count and submits a job, a `mismatch` closes the overlay entry
+as untranslated and drops the translation outright (its late result could
+not be written anywhere). `write_translation`/`finalize_no_translation`
+take the same `session=` argument; `_complete` has **no orphan-write path**
+(a translation without a recorded original is discarded — that path was how
+a refused entry's late translation could land in the next meeting's files).
+A requeue failure in `_drain_interim_duplicates` releases the displaced
+item's work count. Legacy auto-open adoption is *one* authoritative helper,
+`_adopt_auto_opened_session` (called by both `_process_segment` and
+`_process_segment_text` after a recorded write, inside their fence): it
+reuses the **current**
+generation — adoption never bumps it, because items enqueued before the
+auto-open carry that generation and are the same meeting's opening speech (a
+bump made the stale-segment guard discard them, silently losing speech).
+`begin()` adopts an auto-created entry in place, so the pre-adoption queue
+counts survive into the ENDING wait. Every branch of the helper decides
+under the boundary lock *with a generation comparison* — there is no
+unlocked early return on "a session is live": a live session under the
+entry's own generation is the fast path (the count is already keyed
+correctly), a live session under a **different** generation means an
+explicit begin claimed the writer session this entry recorded into
+(`begin_session()` returns an open session unchanged), so the count
+migrates — release under the old generation, register under the live one,
+exactly once — or the live generation's ENDING would never wait for that
+translation. `begin_recording_session` flips to
+ACTIVE *inside* the boundary lock, so adoption and an explicit begin can
+never both claim the session — exactly one ACTIVE notification and one live
+tracker generation. `_process_segment_text` returns False only when an
+identity guard refused the sentence; `_do_interim_asr` then treats the
+refused sentence as *not consumed* — excluded from the committed prefix, so
+neither the audio trim nor the echo-tail update accounts for it and a later
+pass can still commit it. Buffered fragments (`_interim_pending`) spliced
+into a refused sentence are snapshotted before the splice and restored on
+the refusal: their audio was already trimmed by the pass that buffered
+them, so the pending text is the only copy — clearing it before the commit
+(the old code) lost it forever. The pending is cleared only after a
+confirmed commit, and only confirmed-committed text participates in the
+trim, the echo tail and `_interim_active`.
+
+End-thread fault tolerance: `_run_session_end` is wrapped by its caller —
+a failure anywhere (flush, wait, `end_session`) is logged, the writer is
+**aborted** (`TranscriptWriter.abort_session()`: handles released, memory
+cleared, nothing further written — the records layer classifies the meeting
+as interrupted), and the state still advances through IDLE (an ENDING that
+parks forever locks out every button). The IDLE notification is sent only
+after the writer has sealed *or* aborted, so the state machine can never
+claim idle while a writer session is still open. The `finally` sets
+`_paused=True` *before* lifting the capture gate, so there is no re-listen
+window between "gate open" and "capture observes paused". After the end
+lands the session generation is bumped, so any work the close missed fails
+the identity checks unambiguously. `end_session()` returning None (no open
+session) is handled without touching the summary dict.
+
+Both releases are idempotent (no-op on absent ids), so a timeout that
+superseded the generation cannot be double-released by the straggler's late
+callback. `wait_idle` blocks on a `Condition` on the ENDING thread only,
+bounded by `ENDING_TIMEOUT_S` (30s), and is sound only after
+`start_closing` (the end thread always orders them so). A timed-out end
+closes the meeting with its pending entries flushed as untranslated
+originals and calls `supersede(generation)`: late results find their
+generation closed and are discarded — `TranscriptWriter._complete` drops
+them (completed meetings are immutable: no reopened files, no appends
+after the Summary footer, no ghost sessions; retranslating history would
+be a separate feature), and the tracker no-ops their releases.
+
+#### AI-summary task registry (summary_task_registry.py)
+
+`SummaryTaskRegistry` is owned by the app object
+(`live_trans._summary_task_registry` in `main()`, also referenced by the
+panel for lazy page creation) so it cannot be garbage-collected while a
+worker runs. Page teardown cancels and invalidates but never destroys a
+running QThread; `finished` (delivered on the GUI thread after `run()`
+returns) is the only place references are dropped and `deleteLater()` is
+called. `prune()` tests `isFinished()` — **not** `not isRunning()`, which
+would also match a registered-but-not-yet-started worker and drop the only
+strong reference to it. `cancel()` sets the cooperative flag under the
+worker's `_save_lock` (linearized with run()'s save-and-emit section: an
+acknowledged cancel can never see a newer summary overwrite the old one,
+and a completed save is announced exactly once) *and closes the worker's
+OpenAI/httpx client* (`SummaryWorker.attach_client`; every terminal path
+of `run()` also closes it, so a cancel landing before the first request
+cannot leak the fresh connection pool). Known limit, stated rather than
+hidden: closing the transport interrupts a request, it does not kill it —
+a request stuck on a hung socket surfaces the error only after the
+per-request timeout (120s). No `terminate()`, no long GUI-thread waits;
+app exit reaches every worker through `cancel_all()` in `on_quit`.
+
 
 ### Configuration
 

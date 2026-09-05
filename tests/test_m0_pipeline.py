@@ -45,6 +45,8 @@ def test_fake_m0_pipeline_reaches_streaming_ui_and_transcript(tmp_path: Path):
     source = FakeAudioCapture([np.ones(512, dtype=np.float32)])
     vad, asr, translator, ui = _FakeVAD(), _FakeASR(), _FakeTranslator(), _FakeUI()
     writer = TranscriptWriter(tmp_path)
+    # Entry writes only auto-open a session while the pipeline records.
+    writer.set_recording(True)
 
     source.start()
     audio, mic_rms = source.get_audio(timeout=1)

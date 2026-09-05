@@ -171,6 +171,76 @@ _CACHE_MODELS = [
     ("GigaAM (ru)", "gigaam"),
 ]
 
+# GigaAM model profiles. GigaAM-v3 (the shipped engine) is Russian-only:
+# the e2e_rnnt variant transcribes Russian speech and the engine reports
+# "ru" for every result, so the app locks the source language to Russian
+# while it is active. A multilingual variant would carry
+# ``russian_only: False`` and unlock the language picker.
+GIGAAM_MODEL_PROFILES = {
+    "gigaam-v3": {
+        "display_name": "GigaAM (ru)",
+        "modelscope_id": "ai-sage/GigaAM-v3",
+        "huggingface_id": "ai-sage/GigaAM-v3",
+        "revision": "e2e_rnnt",
+        "estimated_bytes": 1_200_000_000,
+        "russian_only": True,
+    },
+}
+
+DEFAULT_GIGAAM_MODEL = "gigaam-v3"
+
+GIGAAM_LEGACY_MODEL_ALIASES = {
+    # Legacy spellings a saved user_settings.json may carry: the bare
+    # engine name, the raw HF repo id, and the previous variant label.
+    "gigaam": "gigaam-v3",
+    "ai-sage/GigaAM-v3": "gigaam-v3",
+    "gigaam_v3": "gigaam-v3",
+}
+
+
+def normalize_gigaam_model_key(model_key: str | None) -> str:
+    """Map a persisted GigaAM model selection to a known profile key.
+
+    Same shape as :func:`normalize_funasr_model_key`: unknown/missing keys
+    (and pre-profile settings) fall back to the shipped default rather
+    than propagating a value no profile describes.
+    """
+    if model_key in GIGAAM_MODEL_PROFILES:
+        return model_key
+    if model_key in GIGAAM_LEGACY_MODEL_ALIASES:
+        return GIGAAM_LEGACY_MODEL_ALIASES[model_key]
+    return DEFAULT_GIGAAM_MODEL
+
+
+def gigaam_profile(model_key: str | None) -> dict:
+    return GIGAAM_MODEL_PROFILES[
+        normalize_gigaam_model_key(model_key)
+    ]
+
+
+def gigaam_display_name(model_key: str | None) -> str:
+    return gigaam_profile(model_key)["display_name"]
+
+
+def gigaam_is_russian_only(model_key: str | None) -> bool:
+    """True when the GigaAM variant cannot transcribe anything but Russian.
+
+    The caller gates the source-language UI and pins the language hint to
+    "ru" on this answer, so an unknown key must stay on the safe side:
+    the default profile is Russian-only and the fallback keeps it there.
+    """
+    return bool(gigaam_profile(model_key)["russian_only"])
+
+
+def gigaam_model_id(model_key: str | None) -> str:
+    """The HF repo id of the variant (part of the engine signature)."""
+    return gigaam_profile(model_key)["huggingface_id"]
+
+
+def gigaam_revision(model_key: str | None) -> str:
+    """The pinned snapshot revision of the variant (engine signature)."""
+    return gigaam_profile(model_key)["revision"]
+
 
 def normalize_funasr_model_key(model_key: str | None) -> str:
     if model_key in FUNASR_MODEL_PROFILES:

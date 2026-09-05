@@ -16,16 +16,41 @@ main = pytest.importorskip(
 )
 
 
+class _NoSessionWriter:
+    """TranscriptWriter stand-in: no session open, nothing recorded."""
+
+    @staticmethod
+    def active_session():
+        return None
+
+
 class Pipeline:
-    """Minimal stand-in exposing exactly what the methods under test use."""
+    """Minimal stand-in exposing exactly what the methods under test use.
+
+    The enqueue path carries the session-lifecycle bookkeeping now: the
+    producer fence (`_session_boundary_lock`), the identity snapshot
+    (`_session_snapshot`: generation + writer session), the work tracker
+    (`_SessionWorkTracker`, driven directly) and the per-item work ids. The
+    queue items are 5-tuples ``(seg_type, segment, work_id, generation,
+    expected_session)``; assertions compare the first two fields.
+    """
 
     def __init__(self, maxsize=4):
         self._asr_queue = queue.Queue(maxsize=maxsize)
         self._stop_event = threading.Event()
+        self._session_boundary_lock = threading.RLock()
+        self._session_generation = 0
+        self._transcript = _NoSessionWriter()
+        self._session_work = main._SessionWorkTracker()
+        self._session_work_lock = threading.Lock()
+        self._session_work_seq = 0
 
     _enqueue_asr = main.LiveTranslateApp._enqueue_asr
     _requeue_stop_sentinel = main.LiveTranslateApp._requeue_stop_sentinel
     _drain_interim_duplicates = main.LiveTranslateApp._drain_interim_duplicates
+    _session_snapshot = main.LiveTranslateApp._session_snapshot
+    _next_session_work_id = main.LiveTranslateApp._next_session_work_id
+    _release_queued_work = main.LiveTranslateApp._release_queued_work
 
 
 def _drain(q):
@@ -37,12 +62,19 @@ def _drain(q):
             return items
 
 
+def _payloads(q):
+    """(seg_type, segment) of every queued item — the identity fields vary."""
+    return [(item[0], item[1]) for item in _drain(q)]
+
+
 def test_enqueue_drops_the_oldest_segment_when_the_queue_is_full():
     p = Pipeline(maxsize=2)
     p._enqueue_asr("vad_flush", "a")
     p._enqueue_asr("vad_flush", "b")
     p._enqueue_asr("vad_flush", "c")
-    assert _drain(p._asr_queue) == [("vad_flush", "b"), ("vad_flush", "c")]
+    assert _payloads(p._asr_queue) == [("vad_flush", "b"), ("vad_flush", "c")]
+    # The evicted victim's work count was released: nothing waits on it.
+    assert p._session_work.pending_count(p._session_generation) == 2
 
 
 def test_enqueue_does_not_dereference_the_stop_sentinel():
@@ -65,11 +97,15 @@ def test_enqueue_is_a_noop_once_stopping():
 
 def test_drain_interim_duplicates_keeps_the_first_non_interim_item():
     p = Pipeline(maxsize=8)
-    p._asr_queue.put_nowait(("interim", None))
-    p._asr_queue.put_nowait(("interim", None))
+    # Full item shape; a dropped interim's work count is released, so a
+    # real item carries a work_id for _release_queued_work to key on.
+    p._enqueue_asr("interim", None)
+    p._enqueue_asr("interim", None)
     p._asr_queue.put_nowait(("vad_flush", "seg"))
     p._drain_interim_duplicates()
-    assert _drain(p._asr_queue) == [("vad_flush", "seg")]
+    assert _payloads(p._asr_queue) == [("vad_flush", "seg")]
+    # Both dropped interims released their counts.
+    assert p._session_work.pending_count(p._session_generation) == 0
 
 
 def test_drain_interim_duplicates_puts_the_sentinel_back():
@@ -88,6 +124,14 @@ class StoppableApp:
         self._stopped = False
         self._running = True
         self._stop_event = threading.Event()
+        # Session-lifecycle state stop() touches: the boundary fence, the
+        # state machine (IDLE already → no notify needed), the gate flag and
+        # the work tracker (discard_all).
+        self._session_boundary_lock = threading.RLock()
+        self._session_state = main.SessionState.IDLE
+        self._session_end_gating = False
+        self._session_work = main._SessionWorkTracker()
+        self._session_ui_callback = None
         self._asr_queue = queue.Queue(maxsize=1)
         self._capture_thread = None
         self._asr_thread = None
@@ -98,10 +142,22 @@ class StoppableApp:
         self._interim_committed_tail = ""
         self._tl_executor = self._recorder("tl_executor.shutdown")
         self._extra_tl_executor = self._recorder("extra_executor.shutdown")
-        self._transcript = self._recorder("transcript.close", attr="close")
+        self._transcript = self._transcript_stub()
         self._mem_periodic_timer = None
         self._mlx_service = self._recorder("mlx.stop", attr="stop")
         self._audio = self._recorder("audio.stop", attr="stop")
+
+    def _transcript_stub(self):
+        app = self
+
+        class _Transcript:
+            def set_recording(self, recording):
+                app.calls.append("transcript.set_recording")
+
+            def close(self):
+                app.calls.append("transcript.close")
+
+        return _Transcript()
 
     def _recorder(self, label, attr="shutdown"):
         calls = self.calls
@@ -130,6 +186,7 @@ def test_stop_runs_cleanup_in_the_contracted_order():
     app = StoppableApp()
     app.stop()
     assert app.calls == [
+        "transcript.set_recording",
         "audio.stop",
         "flush",
         "tl_executor.shutdown",
@@ -185,11 +242,14 @@ def test_a_failing_cleanup_step_does_not_skip_the_rest():
 
 class PausableApp:
     """pause() over stubs: it runs on the Qt thread and only touches VAD,
-    the ASR queue and the overlay."""
+    the ASR queue, the session bookkeeping and the overlay."""
 
     pause = main.LiveTranslateApp.pause
     _enqueue_asr = main.LiveTranslateApp._enqueue_asr
     _requeue_stop_sentinel = main.LiveTranslateApp._requeue_stop_sentinel
+    _session_snapshot = main.LiveTranslateApp._session_snapshot
+    _next_session_work_id = main.LiveTranslateApp._next_session_work_id
+    _release_queued_work = main.LiveTranslateApp._release_queued_work
 
     def __init__(self, buffered_segment, interim_active=False, asr_ready=True):
         self._paused = False
@@ -200,6 +260,12 @@ class PausableApp:
         self._asr_queue = queue.Queue(maxsize=8)
         self._stop_event = threading.Event()
         self._vad_lock = threading.RLock()
+        self._session_boundary_lock = threading.RLock()
+        self._session_generation = 0
+        self._transcript = _NoSessionWriter()
+        self._session_work = main._SessionWorkTracker()
+        self._session_work_lock = threading.Lock()
+        self._session_work_seq = 0
         self._vad = self._FakeVAD(buffered_segment)
 
     class _FakeVAD:
@@ -229,7 +295,7 @@ def test_pause_hands_off_the_in_flight_utterance():
     app.pause()
     assert app._paused is True
     assert app._vad.flushed == "flush"
-    assert app._asr_queue.get_nowait() == ("vad_flush", "half a sentence")
+    assert _payloads(app._asr_queue) == [("vad_flush", "half a sentence")]
 
 
 def test_pause_uses_force_flush_while_interim_is_active():
@@ -238,21 +304,29 @@ def test_pause_uses_force_flush_while_interim_is_active():
     app = PausableApp(buffered_segment="remainder", interim_active=True)
     app.pause()
     assert app._vad.flushed == "force_flush"
-    assert app._asr_queue.get_nowait() == ("vad_flush", "remainder")
+    assert _payloads(app._asr_queue) == [("vad_flush", "remainder")]
 
 
-def test_pause_with_an_empty_buffer_queues_nothing():
+def test_pause_with_an_empty_buffer_queues_the_cleanup_marker():
+    """No audio of *this* pause reached the queue, but the interim state may
+    still be owned by an earlier queued vad_flush — pause never resets it
+    inline. It enqueues a no-audio cleanup marker instead: the ASR loop is a
+    single-consumer FIFO, so the marker's handler runs after every pre-pause
+    item and performs the one reset."""
     app = PausableApp(buffered_segment=None)
     app.pause()
-    assert app._asr_queue.empty()
-    assert app._interim_pending == ""
+    payloads = _payloads(app._asr_queue)
+    assert payloads == [("vad_flush", None)]  # the marker, no audio
+    # The state stays with the queued consumer until the marker runs.
+    assert app._interim_pending == "pending text"
 
 
-def test_pause_without_asr_still_clears_the_interim_state():
-    """No worker to send it to; the buffer is still cleared by flush()."""
+def test_pause_without_asr_still_empties_the_vad_buffer():
+    """No worker to send it to; the buffer is still cleared by flush(), and
+    the state hand-off still goes through the queue-ordered marker."""
     app = PausableApp(buffered_segment="orphan", asr_ready=False)
     app.pause()
-    assert app._asr_queue.empty()
-    assert app._interim_active is False
-    assert app._interim_pending == ""
+    assert _payloads(app._asr_queue) == [("vad_flush", None)]  # marker only
+    assert app._interim_active is False  # never was active in this scenario
+    assert app._interim_pending == "pending text"  # consumer owns the reset
     assert app._vad.segment is None  # flush() emptied it regardless

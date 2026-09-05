@@ -89,6 +89,9 @@ class _MLXTaskThread(QThread):
 
     def __init__(self, manager, action, parent=None):
         super().__init__(parent)
+        # The object name surfaces in Qt's fatal "Destroyed while thread is
+        # still running" message, so a startup abort names its thread.
+        self.setObjectName("MLXTaskThread")
         self.manager = manager
         self.action = action
         self.cancel_event = threading.Event()
@@ -125,14 +128,29 @@ class _CacheScanThread(QThread):
     Scanning several GB of model directories took seconds, and _on_tab_changed
     started a fresh bare thread on every switch to the cache page — so flipping
     tabs a few times had several full traversals running at once.
+
+    Cancellable: app quit joins this thread for a bounded wait only, and a
+    scan that cannot be interrupted outlives that wait — the thread is a
+    child of the panel, so tearing the application down underneath a live
+    scan is Qt's fatal "Destroyed while thread is still running" abort.
+    stop_background_tasks sets cancel_event; the walk checks it per entry.
     """
 
     result = pyqtSignal(list)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setObjectName("CacheScanThread")
+        self.cancel_event = threading.Event()
 
     def run(self):
         entries = []
         try:
             for name, path in get_cache_entries():
+                if self.cancel_event.is_set():
+                    # Abandoned scan: emit nothing (the UI keeps the last
+                    # listing) and let the thread end promptly for quit.
+                    return
                 entries.append((name, str(path), dir_size(path)))
         except Exception:
             log.error("Cache scan failed", exc_info=True)
@@ -153,6 +171,9 @@ class _MLXHealthThread(QThread):
 
     def __init__(self, manager, parent=None):
         super().__init__(parent)
+        # Named for Qt's fatal "Destroyed while thread is still running"
+        # message (see _MLXTaskThread).
+        self.setObjectName("MLXHealthThread")
         self.manager = manager
 
     def run(self):
@@ -199,30 +220,6 @@ def active_index_after_removal(removed: int, active: int, remaining: int) -> int
     else:
         index = active
     return max(0, min(index, remaining - 1))
-
-
-def _format_session_row(session: dict) -> str:
-    """One line per recorded session, for the transcripts list."""
-    started = session.get("started") or ""
-    try:
-        when = datetime.fromisoformat(started).strftime("%Y-%m-%d %H:%M")
-    except (TypeError, ValueError):
-        when = session.get("session", "?")
-
-    parts = [when]
-    entries = session.get("entries")
-    if entries is not None:
-        key = "transcript_entries_one" if entries == 1 else "transcript_entries"
-        parts.append(t(key).format(count=entries))
-    seconds = int(session.get("duration_seconds") or 0)
-    if seconds:
-        minutes, seconds = divmod(seconds, 60)
-        hours, minutes = divmod(minutes, 60)
-        parts.append(f"{hours}:{minutes:02d}:{seconds:02d}" if hours else f"{minutes}:{seconds:02d}")
-    for key in ("asr_engine", "translation_model"):
-        if session.get(key):
-            parts.append(str(session[key]))
-    return "  ·  ".join(parts)
 
 
 def _open_folder(path):
@@ -282,6 +279,12 @@ class ControlPanel(QWidget):
     # The panel asks the app to quit; it must not quit the Qt application
     # itself, which would skip the pipeline cleanup entirely.
     delete_cache_and_quit_requested = pyqtSignal(list)
+    # The records page's end-recording button: request-only. The app's
+    # end_recording_session() is the single implementation; the panel just
+    # forwards the request. The session id rides along so the app can
+    # refuse when the meeting open at handling time is not the one the
+    # user clicked on.
+    end_recording_requested = pyqtSignal(str)
 
     def __init__(self, config, saved_settings=None):
         super().__init__()
@@ -293,6 +296,13 @@ class ControlPanel(QWidget):
         self._mlx_task = None
         self._mlx_health_task = None
         self._mlx_task_target_index = None
+        # The records page reads the transcript writer's live state (which
+        # session is still recording) through this; set by main.py after the
+        # app object exists. None until then — every record shows as closed.
+        self._transcript_writer = None
+        # The app's summary-worker registry, injected with the writer; kept
+        # here so the lazily created records page can adopt it at creation.
+        self._summary_registry = None
         # Filled by _MLXHealthThread; None means "not probed yet".
         self._mlx_status_cache = None
         self._cache_task = None
@@ -1340,162 +1350,87 @@ class ControlPanel(QWidget):
             self._refresh_cache()
         elif index == self._transcripts_tab_index:
             self._refresh_transcripts()
+            # Refresh the model picker once the page is visible: models may
+            # have been edited on the translation page before first visit.
+            self._notify_records_models_changed()
 
     # ── Transcripts / meeting records ──
 
     def _create_transcripts_tab(self):
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
+        """The meeting-records center lives in its own module; the panel only
+        mounts it and persists the settings it asks to save."""
+        from meeting_records_page import MeetingRecordsPage
 
-        top = QHBoxLayout()
-        self._transcript_summary = QLabel("")
-        self._transcript_summary.setFont(
-            QFont(default_mono_font_family(), 9, QFont.Weight.Bold)
+        self._records_page = MeetingRecordsPage(
+            TRANSCRIPTS_DIR, self._current_settings,
+            transcript_writer=self._transcript_writer, parent=self
         )
-        top.addWidget(self._transcript_summary, 1)
-        refresh_btn = QPushButton(t("btn_refresh"))
-        refresh_btn.clicked.connect(self._refresh_transcripts)
-        top.addWidget(refresh_btn)
-        open_btn = QPushButton(t("btn_open_transcripts"))
-        open_btn.clicked.connect(self._open_transcripts_folder)
-        top.addWidget(open_btn)
-        layout.addLayout(top)
+        self._records_page.settings_updated.connect(self._on_records_settings)
+        # Request forwarding, not a second implementation: the app owns the
+        # end-meeting state machine.
+        self._records_page.end_recording_requested.connect(
+            self.end_recording_requested.emit
+        )
+        # Late injection for a lazily created page: the registry/writer may
+        # have been registered before the tab was ever visited.
+        registry = getattr(self, "_summary_registry", None)
+        if registry is not None:
+            self._records_page.set_summary_registry(registry)
+        self._records_page.refresh()
+        return self._records_page
 
-        split = QHBoxLayout()
-        self._transcript_list = QListWidget()
-        self._transcript_list.setFont(QFont(default_mono_font_family(), 9))
-        self._transcript_list.setAlternatingRowColors(True)
-        self._transcript_list.setMinimumWidth(260)
-        self._transcript_list.currentRowChanged.connect(self._on_transcript_selected)
-        split.addWidget(self._transcript_list, 1)
+    # --- app dependency injection (public, replaces reaching into fields) ---
 
-        self._transcript_preview = QTextEdit()
-        self._transcript_preview.setReadOnly(True)
-        self._transcript_preview.setFont(QFont(default_mono_font_family(), 9))
-        self._transcript_preview.setLineWrapMode(QTextEdit.LineWrapMode.WidgetWidth)
-        split.addWidget(self._transcript_preview, 2)
-        layout.addLayout(split, 1)
+    def set_transcript_writer(self, writer):
+        """Inject the live TranscriptWriter after app construction.
 
-        buttons = QHBoxLayout()
-        buttons.addStretch()
-        self._transcript_export_btn = QPushButton(t("btn_export_record"))
-        self._transcript_export_btn.clicked.connect(self._export_transcript)
-        buttons.addWidget(self._transcript_export_btn)
-        self._transcript_delete_btn = QPushButton(t("btn_delete_record"))
-        self._transcript_delete_btn.clicked.connect(self._delete_transcript)
-        buttons.addWidget(self._transcript_delete_btn)
-        layout.addLayout(buttons)
+        Replaces main.py's direct ``panel._transcript_writer = ...`` write:
+        the panel forwards to the records page (which refreshes its
+        active-row marking immediately) and keeps its own reference for
+        later lazy page creation.
+        """
+        self._transcript_writer = writer
+        if hasattr(self, "_records_page"):
+            self._records_page.set_transcript_writer(writer)
 
-        self._transcript_sessions = []
-        self._set_transcript_buttons_enabled(False)
-        return widget
+    def set_summary_registry(self, registry):
+        """Inject the app's summary-worker registry (strong refs + exit).
 
-    def _set_transcript_buttons_enabled(self, enabled: bool):
-        self._transcript_export_btn.setEnabled(enabled)
-        self._transcript_delete_btn.setEnabled(enabled)
+        Stored even when the records page is not created yet (it is built
+        lazily on first tab visit), and handed over at creation time.
+        """
+        self._summary_registry = registry
+        if hasattr(self, "_records_page"):
+            self._records_page.set_summary_registry(registry)
+
+    def on_session_state_changed(self, state: str, session_id=None):
+        """App-level session state push (from LiveTranslateApp)."""
+        if hasattr(self, "_records_page"):
+            self._records_page.on_session_state_changed(state, session_id)
+
+    def _on_records_settings(self, settings):
+        _save_settings(self._current_settings)
 
     def _refresh_transcripts(self):
-        from transcript_writer import read_session_meta
+        if not hasattr(self, "_records_page"):
+            return
+        # Pick up a writer registered after panel construction through the
+        # injection API (also refreshes the page's active-row state).
+        # set_transcript_writer is idempotent for an unchanged writer, and
+        # the direct refresh() below supersedes any deferred refresh it
+        # might have scheduled — one tab entry, exactly one full refresh.
+        self._records_page.set_transcript_writer(self._transcript_writer)
+        self._records_page.refresh()
 
-        self._transcript_list.clear()
-        self._transcript_preview.clear()
-        self._set_transcript_buttons_enabled(False)
+    def _notify_records_models_changed(self):
+        """Model list changed elsewhere in the panel: update summary provider
+        choices (the records page stores an id, not an index)."""
+        if not hasattr(self, "_records_page"):
+            return
         try:
-            sessions = read_session_meta(TRANSCRIPTS_DIR)
+            self._records_page._populate_provider_combo()
         except Exception:
-            log.error("Could not list transcripts", exc_info=True)
-            sessions = []
-        self._transcript_sessions = sessions
-
-        if not sessions:
-            self._transcript_summary.setText(t("no_transcripts"))
-            return
-
-        total_entries = sum(int(s.get("entries") or 0) for s in sessions)
-        self._transcript_summary.setText(
-            t("transcript_total").format(count=len(sessions), entries=total_entries)
-        )
-        for session in sessions:
-            self._transcript_list.addItem(_format_session_row(session))
-        self._transcript_list.setCurrentRow(0)
-
-    def _selected_session(self):
-        row = self._transcript_list.currentRow()
-        if 0 <= row < len(self._transcript_sessions):
-            return self._transcript_sessions[row]
-        return None
-
-    def _on_transcript_selected(self, _row):
-        session = self._selected_session()
-        self._set_transcript_buttons_enabled(session is not None)
-        if session is None:
-            self._transcript_preview.clear()
-            return
-        files = session.get("files") or {}
-        # The Markdown record is the readable one; fall back to the combined
-        # text file for sessions recorded before it existed.
-        path = files.get("meeting") or files.get("all") or files.get("original")
-        if not path:
-            self._transcript_preview.setPlainText(t("transcript_files_missing"))
-            return
-        try:
-            text = Path(path).read_text(encoding="utf-8", errors="replace")
-        except OSError as exc:
-            self._transcript_preview.setPlainText(str(exc))
-            return
-        # Previewing a multi-hour session should not freeze the panel.
-        if len(text) > 200_000:
-            text = text[:200_000] + "\n\n…"
-        self._transcript_preview.setPlainText(text)
-
-    def _export_transcript(self):
-        session = self._selected_session()
-        if session is None:
-            return
-        files = session.get("files") or {}
-        source = files.get("meeting") or files.get("all")
-        if not source:
-            QMessageBox.warning(self, t("error_title"), t("transcript_files_missing"))
-            return
-        suffix = Path(source).suffix
-        target, _ = QFileDialog.getSaveFileName(
-            self,
-            t("btn_export_record"),
-            f"meeting_{session['session']}{suffix}",
-            t("export_filter"),
-        )
-        if not target:
-            return
-        try:
-            shutil.copyfile(source, target)
-        except OSError as exc:
-            QMessageBox.critical(
-                self, t("error_title"), t("export_failed").format(error=str(exc))
-            )
-
-    def _delete_transcript(self):
-        from transcript_writer import delete_session
-
-        session = self._selected_session()
-        if session is None:
-            return
-        confirm = QMessageBox.warning(
-            self,
-            t("btn_delete_record"),
-            t("dialog_delete_record").format(session=session["session"]),
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-            QMessageBox.StandardButton.No,
-        )
-        if confirm != QMessageBox.StandardButton.Yes:
-            return
-        failures = delete_session(TRANSCRIPTS_DIR, session["session"])
-        if failures:
-            QMessageBox.critical(
-                self,
-                t("error_title"),
-                t("cache_delete_failed").format(paths="\n".join(failures)),
-            )
-        self._refresh_transcripts()
+            log.debug("Could not refresh summary provider combo", exc_info=True)
 
     def _refresh_cache(self):
         if self._cache_task is not None and self._cache_task.isRunning():
@@ -1513,7 +1448,9 @@ class ControlPanel(QWidget):
         task = self._cache_task
         self._cache_task = None
         if task is not None:
-            task.deleteLater()
+            # Same one-beat deferral as the MLX threads (the scan's
+            # result.emit also fires from inside run()).
+            QTimer.singleShot(100, task.deleteLater)
 
     def _on_cache_result(self, results):
         self._cache_list.clear()
@@ -1680,10 +1617,18 @@ class ControlPanel(QWidget):
         from dialogs import ModelDownloadDialog
 
         dlg = ModelDownloadDialog(missing, hub=hub, parent=self)
-        if dlg.exec() == dlg.DialogCode.Accepted:
-            self._update_whisper_size_label()
-            # Switch to Whisper engine with the downloaded size
-            self._auto_save()
+        try:
+            if dlg.exec() != dlg.DialogCode.Accepted:
+                return
+        finally:
+            # Per-invocation dialog parented to the panel: exec() only hides
+            # it and the panel owns the C++ object — without an explicit
+            # release every download attempt leaves the dialog tree alive
+            # until panel teardown.
+            dlg.deleteLater()
+        self._update_whisper_size_label()
+        # Switch to Whisper engine with the downloaded size
+        self._auto_save()
 
     # ── Model Management ──
 
@@ -1858,6 +1803,10 @@ class ControlPanel(QWidget):
         self._update_mlx_controls()
 
     def closeEvent(self, event):
+        # The records page's summary worker must stop before the widget tree
+        # it reports to goes away.
+        if hasattr(self, "_records_page"):
+            self._records_page.cleanup()
         task = self._mlx_task
         health_task = self._mlx_health_task
         if (task is not None and task.isRunning()) or (health_task is not None and health_task.isRunning()):
@@ -1873,7 +1822,9 @@ class ControlPanel(QWidget):
         task = self._mlx_task
         self._mlx_task = None
         if task is not None:
-            task.deleteLater()
+            # Same one-beat deferral as _on_mlx_health_finished: deleting on
+            # finished delivery races the worker's running-flag cleanup.
+            QTimer.singleShot(100, task.deleteLater)
         # prepare/start just changed the very state the cache describes.
         self._mlx_status_cache = None
         self._update_mlx_controls()
@@ -1899,7 +1850,13 @@ class ControlPanel(QWidget):
         task = self._mlx_health_task
         self._mlx_health_task = None
         if task is not None:
-            task.deleteLater()
+            # Delete one beat later: QThread emits finished() from the
+            # worker thread BEFORE it clears its internal running flag, so
+            # a deleteLater delivered on finished can race a preempted
+            # worker and abort with "Destroyed while thread is still
+            # running" (reproduced on MLXHealthThread at startup). The
+            # timer keeps the reference alive until the flag is clear.
+            QTimer.singleShot(100, task.deleteLater)
         self._maybe_close_after_mlx_tasks()
 
     def stop_background_tasks(self, timeout_ms: int = 3000):
@@ -1938,16 +1895,28 @@ class ControlPanel(QWidget):
         models = self._current_settings.get("models", [])
         active_idx = self._current_settings.get("active_model", 0)
         self.models_list_changed.emit(models, active_idx)
+        # The records page's summary provider combo is id-based; a model list
+        # edit changes what those ids resolve to.
+        self._notify_records_models_changed()
 
     def _add_model(self):
         dlg = ModelEditDialog(self)
-        if dlg.exec():
+        try:
+            if not dlg.exec():
+                return
             data = dlg.get_data()
-            if data["name"] and data["model"]:
-                self._models().append(data)
-                self._refresh_model_list()
-                _save_settings(self._current_settings)
-                self._emit_models_list_changed()
+        finally:
+            # Per-invocation dialog parented to the panel (same release
+            # contract as the other model dialogs).
+            dlg.deleteLater()
+        if data["name"] and data["model"]:
+            self._models().append(data)
+            from ai_summary_service import ensure_model_ids
+
+            ensure_model_ids(self._current_settings)  # stamp the new id now
+            self._refresh_model_list()
+            _save_settings(self._current_settings)
+            self._emit_models_list_changed()
 
     def _edit_model(self):
         row = self._model_list.currentRow()
@@ -1955,17 +1924,28 @@ class ControlPanel(QWidget):
         if row < 0 or row >= len(models):
             return
         dlg = ModelEditDialog(self, models[row])
-        if dlg.exec():
+        try:
+            if not dlg.exec():
+                return
             data = dlg.get_data()
-            if data["name"] and data["model"]:
-                models[row] = data
-                self._refresh_model_list()
-                _save_settings(self._current_settings)
-                self._emit_models_list_changed()
-                # Re-apply if editing the active model
-                active = self._current_settings.get("active_model", 0)
-                if row == active:
-                    self.model_changed.emit(data)
+        finally:
+            # Per-invocation dialog parented to the panel (same release
+            # contract as the other model dialogs).
+            dlg.deleteLater()
+        if data["name"] and data["model"]:
+            # Editing changes the model's parameters, not its identity:
+            # keep the stable id so summary-provider references and any
+            # persisted id lookup keep pointing at this same entry.
+            if isinstance(models[row], dict) and "id" in models[row]:
+                data["id"] = models[row]["id"]
+            models[row] = data
+            self._refresh_model_list()
+            _save_settings(self._current_settings)
+            self._emit_models_list_changed()
+            # Re-apply if editing the active model
+            active = self._current_settings.get("active_model", 0)
+            if row == active:
+                self.model_changed.emit(data)
 
     def _models(self) -> list:
         """The persisted model list, creating it if absent.
@@ -1981,8 +1961,17 @@ class ControlPanel(QWidget):
         if row < 0 or row >= len(models):
             return
         dup = dict(models[row])
+        # A duplicate is a new model, not an alias: carrying the source's id
+        # would make two entries share one identity, and the summary provider
+        # (resolved by id) could silently flip between them.
+        dup.pop("id", None)
         dup["name"] = dup["name"] + " (copy)"
         models.append(dup)
+        # Stamp the copy with a fresh id right away so anything reading the
+        # list by id (records page, worker) never sees an id-less or shared entry.
+        from ai_summary_service import ensure_model_ids
+
+        ensure_model_ids(self._current_settings)
         self._refresh_model_list()
         _save_settings(self._current_settings)
         self._emit_models_list_changed()

@@ -140,7 +140,10 @@ class InterimFinal:
     def _get_asr_language_setting(self):
         return self._language
 
-    def _process_segment_text(self, text, lang, asr_ms=0):
+    def _process_segment_text(self, text, lang, asr_ms=0, **session_identity):
+        # The production signature also carries the queue item's session
+        # identity (work_id / generation / expected_session); the interim
+        # stand-in only asserts on the emitted text.
         self.emitted.append(text)
 
 
