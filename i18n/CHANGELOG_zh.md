@@ -1,5 +1,8 @@
 # 更新日志
 
+## 2026-09-06 (第二十轮)
+- 新增 PR 级 CI：此前唯一的测试工作流只在打 tag 或手动触发时运行，普通 push 与 PR 无任何机器检查——上一条特性分支带着 26 个测试失败与一个导入级致命错误长期无人发现。现在 `ci.yml` 在每个 PR 与 push 到 main 时于 macos-14 / Python 3.12 运行与本地完全相同的 `python -m pytest -q`；依赖在 release.yml 已验证配方（numpy/pytest/yasbd-lib/PyYAML）之上按测试导入面补齐：PyQt6、torch/torchaudio 2.8.0、silero-vad、soundfile、openai、httpx、psutil、PyAudio、pyobjc（PyAudio 在 macOS 无 wheel，先 brew 装 portaudio 再源码构建），fastapi 刻意不装以保持与本地一致的跳过集合。CI 套件达到 466 通过 / 4 跳过（缺 fastapi 的 asr_server 用例 1 个 + 需项目 .venv 的打包测试 3 个），与本地全量环境一致；首轮真实运行全程约 1 分钟（依赖安装 38 秒、测试 10 秒），`[WIP][UNTESTED]` 分支要等打 tag 才会被机器检验的日子就此结束
+
 ## 2026-09-05 (第十九轮)
 - AI 会议纪要全链路首次真实运行验证（本地 HY-MT MLX 作为纪要 provider，零代码改动）：选中已完结记录 → 生成（worker 真实请求本地服务）→ 结构化中文纪要按模板六小节产出 → 双文件提交（正文+元数据含 provider/模板/源哈希）→ 页面状态即时更新（有纪要/未过期、纪要页渲染、按钮转「重新生成」、编辑可用）；重新生成覆盖路径与**生成中取消**路径同样验证——取消后旧纪要逐字保留（内容哈希一致）、worker 引用清理、按钮与状态复位。至此分支全部功能路径均经真实运行覆盖
 
