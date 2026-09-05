@@ -1483,9 +1483,12 @@ class MeetingRecordsPage(QWidget):
         self._worker = None
         self._worker_session = None
         # The registry drops its reference on finished; the QThread object
-        # itself is freed here, on the GUI thread, after run() returned.
+        # itself is freed here, on the GUI thread, after run() returned —
+        # deferred one beat: QThread clears its running flag after emitting
+        # finished, and deleting inside that window aborts (see the panel's
+        # MLXHealthThread race).
         if worker is not None:
-            worker.deleteLater()
+            QTimer.singleShot(100, worker.deleteLater)
         self._cancel_btn.hide()
         self._generate_btn.setEnabled(True)
         # A cancel leaves "Cancelling…" behind — run() emits nothing on that

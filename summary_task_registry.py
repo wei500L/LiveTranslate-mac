@@ -75,16 +75,21 @@ class SummaryTaskRegistry:
     def _on_worker_finished_signal(self, worker) -> None:
         """finished hook: prune the registry, free the QThread once.
 
-        deleteLater() from a finished signal is the documented-safe way to
-        free a QThread object (run() has returned by the time finished is
-        delivered on the GUI thread).
+        deleteLater is scheduled one beat later via a 0ms-safe deferral:
+        QThread emits finished() from the worker thread *before* it clears
+        its internal running flag, and a delete delivered on finished can
+        race a preempted worker into Qt's fatal "Destroyed while thread is
+        still running" abort (reproduced on the panel's MLXHealthThread).
+        The timer holds the reference until the flag is provably clear.
         """
         if worker is None:
             return
         with self._lock:
             self._workers.pop(id(worker), None)
         try:
-            worker.deleteLater()
+            from PyQt6.QtCore import QTimer
+
+            QTimer.singleShot(100, worker.deleteLater)
         except Exception:
             pass
 

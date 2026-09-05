@@ -485,6 +485,13 @@ class SetupWizardDialog(QDialog):
         self._capture.restore()
         self._cancel_btn.hide()
         self._cancel_btn.setEnabled(True)
+        if getattr(self, "_close_requested", False):
+            # A close/reject arrived while the thread was still unwinding;
+            # perform it now that it has finished. One beat later: QThread
+            # clears its running flag after emitting finished, and closing
+            # inside that window would destroy the thread (a child of this
+            # dialog).
+            QTimer.singleShot(100, self.reject)
 
     def _on_failed(self, message):
         self._error = message
@@ -524,12 +531,24 @@ class SetupWizardDialog(QDialog):
         QTimer.singleShot(500, self.accept)
 
     def closeEvent(self, event):
-        self._cancel_download()
+        # The dialog owns its download QThread as a child: closing (and the
+        # deleteLater our callers schedule after exec) while the thread is
+        # still unwinding destroys a running QThread — the same startup abort
+        # the panel threads raced. Refuse to close until the thread has
+        # finished; the finished slot performs the pending close.
+        if self._download_thread is not None and self._download_thread.isRunning():
+            self._download_thread.cancel_event.set()
+            self._close_requested = True
+            event.ignore()
+            return
         self._capture.restore()
         super().closeEvent(event)
 
     def reject(self):
-        self._cancel_download()
+        if self._download_thread is not None and self._download_thread.isRunning():
+            self._download_thread.cancel_event.set()
+            self._close_requested = True
+            return
         self._capture.restore()
         super().reject()
 
@@ -638,6 +657,10 @@ class ModelDownloadDialog(QDialog):
     def _on_finished(self):
         self._capture.restore()
         self._cancel_btn.hide()
+        if getattr(self, "_close_requested", False):
+            # Same one-beat deferral as the wizard: the close was deferred
+            # while the thread unwound, finish it now.
+            QTimer.singleShot(100, self.reject)
 
     def _on_failed(self, message):
         self._error = message
@@ -649,13 +672,21 @@ class ModelDownloadDialog(QDialog):
         QTimer.singleShot(500, self.accept)
 
     def closeEvent(self, event):
-        self._cancel_download()
+        # Same guard as the wizard's: never destroy a running download
+        # QThread (a child of this dialog) by closing underneath it.
+        if self._download_thread is not None and self._download_thread.isRunning():
+            self._download_thread.cancel_event.set()
+            self._close_requested = True
+            event.ignore()
+            return
         self._capture.restore()
         super().closeEvent(event)
 
     def reject(self):
         if self._download_thread is not None and self._download_thread.isRunning():
             self._download_thread.cancel_event.set()
+            self._close_requested = True
+            return
         self._capture.restore()
         super().reject()
 
@@ -952,7 +983,10 @@ class ModelEditDialog(QDialog):
         self._connection_thread = None
         self._test_connection_btn.setEnabled(True)
         if thread is not None:
-            thread.deleteLater()
+            # One beat later: QThread clears its running flag after emitting
+            # finished, and deleting on finished delivery races that cleanup
+            # (the same abort the panel's MLXHealthThread hit at startup).
+            QTimer.singleShot(100, thread.deleteLater)
         if getattr(self, "_close_after_connection_test", False):
             QTimer.singleShot(0, self.reject)
 
