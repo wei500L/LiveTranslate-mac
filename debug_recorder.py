@@ -129,20 +129,32 @@ class DiagnosticRecorder:
     def warnings(self) -> list[dict]:
         return [r for r in self._collector.records if r["level"] == "WARNING"]
 
-    def finish(self, observer, app, *, expect_translation: bool = False):
+    def finish(self, observer, app, *, expect_translation: bool = False,
+               transcript_paths: dict | None = None):
         """Snapshot what the run produced, once the pipeline has stopped.
 
         A stage that was asked to do work and produced nothing is a failure, not
         a quiet OK — that silence is exactly the symptom this whole diagnostic
         exists to catch.
+
+        ``transcript_paths`` is the caller's pre-stop snapshot of the writer's
+        open session (``session_paths()`` taken *before* ``stop()`` runs): by
+        the time this method executes, stop() has already closed and reset the
+        writer, so asking it now would always report "no session" — a false
+        failure verdict for a run that recorded fine. When not supplied the
+        writer is queried as before (for callers that have not stopped yet).
         """
-        transcript_paths = {}
-        try:
-            transcript_paths = {
-                kind: str(path) for kind, path in app._transcript.session_paths().items()
-            }
-        except Exception:
-            pass
+        if transcript_paths is None:
+            transcript_paths = {}
+            try:
+                transcript_paths = {
+                    kind: str(path)
+                    for kind, path in app._transcript.session_paths().items()
+                }
+            except Exception:
+                pass
+        else:
+            transcript_paths = dict(transcript_paths)
         self.summary = {
             "segments": len(observer.segments),
             "segment_seconds": round(sum(observer.segments), 1),

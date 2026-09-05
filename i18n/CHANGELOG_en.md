@@ -1,5 +1,10 @@
 # Changelog
 
+## 2026-09-05 (round 14)
+- Fixed the diagnostic pipeline failing unconditionally on the GigaAM engine: the worker restart state it assembles lacked the `gigaam_model_key`, so after the ASR worker itself loaded fine, activating it raised KeyError — every `debug_pipeline.py` run with GigaAM died before recognition
+- Fixed a false-negative verdict in the diagnostic report: it queried the writer for its session file paths only after `stop()` had already closed and reset the writer, so a run that recorded perfectly was reported as "no transcript session was opened" FAIL — the paths are now snapshotted before the stop and handed to the report
+- End-to-end diagnostic passed for real (macOS/MPS, the user's actual configuration): 24.8s of Russian speech → VAD into 4 segments → GigaAM recognition (plus one interim probe) → the HY-MT MLX local service (ready in 2.5s) translating all 4 lines into Chinese → all four views written in order → sealed with `session_status=completed` and `asr_engine="GigaAM (ru)"` (produced by the model-manager symbols added this round). The `--no-translate` fully-local chain also reports Verdict OK
+
 ## 2026-09-05 (round 13)
 - Fixed an import error that made the app impossible to start: main.py imported six GigaAM helper symbols (default model key, normalization, display name, Russian-only check, model/revision ids) that were never committed alongside the model-manager side — main.py and every test module importing it crashed at import. The model manager now provides them: a GigaAM-v3 profile (e2e_rnnt revision, Russian-only), normalization for legacy spellings (bare engine name / raw repo id / old variant label), and a safe fallback to the default profile for unknown keys
 - Fixed a live session's first metadata sidecar carrying a null session_status: the flag was set only after the create_only write, but the records layer identifies a still-recording session by this field — a null on the first commit read as the legacy format and fell back to the footer heuristics. The status is now set to "active" before the sidecar is created

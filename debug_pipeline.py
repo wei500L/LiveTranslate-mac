@@ -169,12 +169,18 @@ def resolve_worker_config(args, settings: dict, config: dict) -> tuple[dict, dic
     if engine == "gigaam":
         language = "ru"
 
+    gigaam_model = settings.get("gigaam_model")
+
     device = args.device or settings.get("asr_device") or "cpu"
     hub = settings.get("hub", "ms")
 
     display = ASR_DISPLAY_NAMES.get(engine, engine)
     if engine == "funasr":
         display = funasr_display_name(funasr_model)
+    elif engine == "gigaam":
+        from model_manager import gigaam_display_name
+
+        display = gigaam_display_name(gigaam_model)
 
     worker_config = {
         "engine_type": engine,
@@ -200,6 +206,7 @@ def resolve_worker_config(args, settings: dict, config: dict) -> tuple[dict, dic
         "signature": (engine, cache_key, device, hub, config["asr"]["compute_type"]),
         "device": device,
         "funasr_model_key": funasr_model,
+        "gigaam_model_key": gigaam_model,
         "whisper_model_size": model_size,
         "config": worker_config,
         "display_name": display,
@@ -331,9 +338,26 @@ def run(args) -> int:
     translating = configure_translator(app, args, settings, recorder) is not None
 
     exit_code = 0
+    # Snapshot the writer's open session BEFORE stop(): stop() closes and
+    # resets the writer, so a post-stop query would report "no session" for
+    # a run that recorded fine (the recorder's false-failure guard).
+    pre_stop_paths = {}
+    try:
+        pre_stop_paths = {
+            kind: str(path)
+            for kind, path in app._transcript.session_paths().items()
+        }
+    except Exception:
+        pass
     try:
         app.start()
         _wait_for_completion(app, source, recorder, args.timeout)
+        # Refresh the snapshot: the session may have opened during the run
+        # (the legacy auto-open path) and closed entries only exist now.
+        pre_stop_paths = {
+            kind: str(path)
+            for kind, path in app._transcript.session_paths().items()
+        }
     except Exception as exc:
         recorder.problem(f"pipeline raised: {exc}")
         log.error("Pipeline error", exc_info=True)
@@ -346,7 +370,10 @@ def run(args) -> int:
             log.error("stop() failed", exc_info=True)
             exit_code = 1
 
-    recorder.finish(observer, app, expect_translation=translating)
+    recorder.finish(
+        observer, app, expect_translation=translating,
+        transcript_paths=pre_stop_paths,
+    )
     recorder.report(sys.stdout)
     if args.json:
         Path(args.json).write_text(
