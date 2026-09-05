@@ -1594,10 +1594,18 @@ class ControlPanel(QWidget):
         from dialogs import ModelDownloadDialog
 
         dlg = ModelDownloadDialog(missing, hub=hub, parent=self)
-        if dlg.exec() == dlg.DialogCode.Accepted:
-            self._update_whisper_size_label()
-            # Switch to Whisper engine with the downloaded size
-            self._auto_save()
+        try:
+            if dlg.exec() != dlg.DialogCode.Accepted:
+                return
+        finally:
+            # Per-invocation dialog parented to the panel: exec() only hides
+            # it and the panel owns the C++ object — without an explicit
+            # release every download attempt leaves the dialog tree alive
+            # until panel teardown.
+            dlg.deleteLater()
+        self._update_whisper_size_label()
+        # Switch to Whisper engine with the downloaded size
+        self._auto_save()
 
     # ── Model Management ──
 
@@ -1862,16 +1870,22 @@ class ControlPanel(QWidget):
 
     def _add_model(self):
         dlg = ModelEditDialog(self)
-        if dlg.exec():
+        try:
+            if not dlg.exec():
+                return
             data = dlg.get_data()
-            if data["name"] and data["model"]:
-                self._models().append(data)
-                from ai_summary_service import ensure_model_ids
+        finally:
+            # Per-invocation dialog parented to the panel (same release
+            # contract as the other model dialogs).
+            dlg.deleteLater()
+        if data["name"] and data["model"]:
+            self._models().append(data)
+            from ai_summary_service import ensure_model_ids
 
-                ensure_model_ids(self._current_settings)  # stamp the new id now
-                self._refresh_model_list()
-                _save_settings(self._current_settings)
-                self._emit_models_list_changed()
+            ensure_model_ids(self._current_settings)  # stamp the new id now
+            self._refresh_model_list()
+            _save_settings(self._current_settings)
+            self._emit_models_list_changed()
 
     def _edit_model(self):
         row = self._model_list.currentRow()
@@ -1879,22 +1893,28 @@ class ControlPanel(QWidget):
         if row < 0 or row >= len(models):
             return
         dlg = ModelEditDialog(self, models[row])
-        if dlg.exec():
+        try:
+            if not dlg.exec():
+                return
             data = dlg.get_data()
-            if data["name"] and data["model"]:
-                # Editing changes the model's parameters, not its identity:
-                # keep the stable id so summary-provider references and any
-                # persisted id lookup keep pointing at this same entry.
-                if isinstance(models[row], dict) and "id" in models[row]:
-                    data["id"] = models[row]["id"]
-                models[row] = data
-                self._refresh_model_list()
-                _save_settings(self._current_settings)
-                self._emit_models_list_changed()
-                # Re-apply if editing the active model
-                active = self._current_settings.get("active_model", 0)
-                if row == active:
-                    self.model_changed.emit(data)
+        finally:
+            # Per-invocation dialog parented to the panel (same release
+            # contract as the other model dialogs).
+            dlg.deleteLater()
+        if data["name"] and data["model"]:
+            # Editing changes the model's parameters, not its identity:
+            # keep the stable id so summary-provider references and any
+            # persisted id lookup keep pointing at this same entry.
+            if isinstance(models[row], dict) and "id" in models[row]:
+                data["id"] = models[row]["id"]
+            models[row] = data
+            self._refresh_model_list()
+            _save_settings(self._current_settings)
+            self._emit_models_list_changed()
+            # Re-apply if editing the active model
+            active = self._current_settings.get("active_model", 0)
+            if row == active:
+                self.model_changed.emit(data)
 
     def _models(self) -> list:
         """The persisted model list, creating it if absent.

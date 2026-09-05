@@ -2082,13 +2082,20 @@ class LiveTranslateApp:
                 dlg = ModelDownloadDialog(
                     missing, hub=hub, proxy=download_proxy, parent=parent
                 )
-                if dlg.exec() != QDialog.DialogCode.Accepted:
-                    log.info(f"Download cancelled/failed: {engine_type}")
-                    with self._asr_lock:
-                        self._asr_ready = (
-                            self._asr is not None and self._asr.status == "ready"
-                        )
-                    return
+                try:
+                    if dlg.exec() != QDialog.DialogCode.Accepted:
+                        log.info(f"Download cancelled/failed: {engine_type}")
+                        with self._asr_lock:
+                            self._asr_ready = (
+                                self._asr is not None and self._asr.status == "ready"
+                            )
+                        return
+                finally:
+                    # Per-switch dialog parented to the panel/overlay: the
+                    # parent owns the C++ object and exec() only hides it —
+                    # schedule the release so repeated switches do not
+                    # accumulate dialog trees on the parent.
+                    dlg.deleteLater()
 
         with self._asr_lock:
             old_asr = self._asr
@@ -2167,7 +2174,14 @@ class LiveTranslateApp:
         poll_timer.timeout.connect(_check)
         poll_timer.start()
 
-        dlg.exec()
+        try:
+            dlg.exec()
+        finally:
+            # Per-switch dialog parented to the panel/overlay: exec() only
+            # hides it and the parent owns the C++ object — without an
+            # explicit release every engine switch leaves the dialog tree
+            # alive until that parent is destroyed.
+            dlg.deleteLater()
         poll_timer.stop()
 
         def _activate_asr(client, state):

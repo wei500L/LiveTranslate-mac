@@ -333,22 +333,33 @@ class ChatMessage(QWidget):
         export_both = export_menu.addAction(t("export_all"))
         menu.addSeparator()
         clear_list = menu.addAction(t("clear_list"))
-        action = menu.exec(event.globalPos())
-        if action == copy_orig:
-            QApplication.clipboard().setText(self._original)
-        elif action == copy_trans:
-            QApplication.clipboard().setText(self._translated)
-        elif action == copy_all:
-            QApplication.clipboard().setText(f"{self._original}\n{self._translated}")
-        elif action == clear_list:
-            overlay = self.window()
-            if hasattr(overlay, '_on_clear'):
-                overlay._on_clear()
-        elif action in (export_orig, export_trans, export_both):
-            mode = {export_orig: "original", export_trans: "translation", export_both: "both"}[action]
-            overlay = self.window()
-            if hasattr(overlay, "export_messages"):
-                overlay.export_messages(mode, parent=self)
+        try:
+            action = menu.exec(event.globalPos())
+            # Dispatch inside the try: the handlers run before the menu's
+            # release is even scheduled. The menu is already hidden once
+            # exec returns, so nothing below depends on it staying alive.
+            if action == copy_orig:
+                QApplication.clipboard().setText(self._original)
+            elif action == copy_trans:
+                QApplication.clipboard().setText(self._translated)
+            elif action == copy_all:
+                QApplication.clipboard().setText(f"{self._original}\n{self._translated}")
+            elif action == clear_list:
+                overlay = self.window()
+                if hasattr(overlay, '_on_clear'):
+                    overlay._on_clear()
+            elif action in (export_orig, export_trans, export_both):
+                mode = {export_orig: "original", export_trans: "translation", export_both: "both"}[action]
+                overlay = self.window()
+                if hasattr(overlay, "export_messages"):
+                    overlay.export_messages(mode, parent=self)
+        finally:
+            # The popup is per-invocation, but QMenu(self) transfers the C++
+            # ownership to this widget — a dropped Python reference does NOT
+            # free it, so every right-click would otherwise leave the menu
+            # (and its actions) alive as a child until teardown. Cancel,
+            # selection and exception paths all land here.
+            menu.deleteLater()
 
 
 def _escape(text: str) -> str:

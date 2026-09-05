@@ -551,15 +551,23 @@ class SubtitleSettingsWidget(QWidget):
         cfg = item.data(Qt.ItemDataRole.UserRole)
         row = self._lines_list.row(item)
         dlg = LineEditDialog(cfg, self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            new_cfg = dlg.get_config()
-            lines = self._lines()[:]
-            if not 0 <= row < len(lines):
+        try:
+            if dlg.exec() != QDialog.DialogCode.Accepted:
                 return
-            lines[row] = new_cfg
-            self._settings["lines"] = lines
-            self._refresh_lines_list()
-            self._schedule_emit()
+            new_cfg = dlg.get_config()
+        finally:
+            # Per-invocation dialog parented to this one: exec() hides but
+            # does not free it, and the parent owns the C++ object — without
+            # an explicit release every line edit would leave a whole dialog
+            # tree alive until this settings dialog is destroyed.
+            dlg.deleteLater()
+        lines = self._lines()[:]
+        if not 0 <= row < len(lines):
+            return
+        lines[row] = new_cfg
+        self._settings["lines"] = lines
+        self._refresh_lines_list()
+        self._schedule_emit()
 
     def _edit_current_line(self):
         item = self._lines_list.currentItem()
@@ -585,12 +593,20 @@ class SubtitleSettingsWidget(QWidget):
             "animation_duration": 300,
         }
         dlg = LineEditDialog(new_line, self)
-        if dlg.exec() == QDialog.DialogCode.Accepted:
-            lines = self._lines()[:]
-            lines.append(dlg.get_config())
-            self._settings["lines"] = lines
-            self._refresh_lines_list()
-            self._schedule_emit()
+        try:
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            new_cfg = dlg.get_config()
+        finally:
+            # Same per-invocation lifetime as _edit_line: the parent owns
+            # the C++ object, exec() only hides it — schedule the release
+            # on every path.
+            dlg.deleteLater()
+        lines = self._lines()[:]
+        lines.append(new_cfg)
+        self._settings["lines"] = lines
+        self._refresh_lines_list()
+        self._schedule_emit()
 
     def _remove_line(self):
         row = self._lines_list.currentRow()
