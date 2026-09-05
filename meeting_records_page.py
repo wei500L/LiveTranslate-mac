@@ -890,11 +890,23 @@ class MeetingRecordsPage(QWidget):
         menu.addSeparator()
         delete = menu.addAction(t("btn_delete_record"))
         delete.setEnabled(self._can_delete(record))
-        action = menu.exec(self._list.mapToGlobal(pos))
-        if action == rename:
-            self._rename_session(item)
-        elif action == delete:
-            self._delete_session(record)
+        try:
+            action = menu.exec(self._list.mapToGlobal(pos))
+            # Dispatch inside the try: the handler (rename/delete can open
+            # modal dialogs of their own) runs before the deletion is even
+            # scheduled. The menu is already hidden once exec returns, so
+            # nothing later in this method depends on it staying alive.
+            if action == rename:
+                self._rename_session(item)
+            elif action == delete:
+                self._delete_session(record)
+        finally:
+            # The popup is per-invocation, but QMenu(self) transfers the
+            # C++ ownership to this page — a dropped Python reference does
+            # NOT free it, so every right-click would otherwise leave one
+            # menu (+ its actions) alive as a page child until teardown.
+            # Cancel, selection and exception paths all land here.
+            menu.deleteLater()
 
     def _rename_session(self, item=None):
         item = item or self._list.currentItem()
@@ -1526,9 +1538,16 @@ class MeetingRecordsPage(QWidget):
         buttons.accepted.connect(dlg.accept)
         buttons.rejected.connect(dlg.reject)
         layout.addWidget(buttons)
-        if dlg.exec() != QDialog.DialogCode.Accepted:
-            return
-        content = editor.toPlainText().strip()
+        try:
+            if dlg.exec() != QDialog.DialogCode.Accepted:
+                return
+            content = editor.toPlainText().strip()
+        finally:
+            # The editor dialog is per-invocation and parented to this page;
+            # exec() hides but does not free it, and a dropped Python
+            # reference leaves the C++ widget tree as a page child. Schedule
+            # the release on every path (cancel, save, exception).
+            dlg.deleteLater()
         if not content:
             QMessageBox.warning(self, t("error_title"), t("summary_error_empty"))
             return
@@ -1606,9 +1625,19 @@ class MeetingRecordsPage(QWidget):
         menu.addSeparator()
         menu.addAction(t("records_export_md"), lambda: self._export("md"))
         menu.addAction(t("records_export_txt"), lambda: self._export("txt"))
-        menu.exec(self._export_btn.mapToGlobal(
-            self._export_btn.rect().bottomLeft()
-        ))
+        try:
+            # Dispatch is via the actions' triggered lambdas, which fire
+            # inside exec's event loop; after exec returns there is no
+            # further use of the menu.
+            menu.exec(self._export_btn.mapToGlobal(
+                self._export_btn.rect().bottomLeft()
+            ))
+        finally:
+            # Same per-invocation lifetime as the context menu: QMenu(self)
+            # is owned by the page, so without an explicit release every
+            # export click would leave the menu (and the actions holding
+            # their Python lambdas) alive until page teardown.
+            menu.deleteLater()
 
     def _export(self, kind: str):
         record = self._current_record()

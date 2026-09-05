@@ -1203,6 +1203,68 @@ def test_lightweight_push_preserves_stale_and_edited_badges(page, monkeypatch):
     assert after["has_summary"] == live["has_summary"]
 
 
+# --- temporary menus schedule their own release -------------------------------------
+
+
+class _FakeAction:
+    def setEnabled(self, _enabled):
+        pass
+
+
+class _RecordingMenu:
+    """Stands in for QMenu: records every instance created by the page and
+    whether deleteLater() was scheduled on it. exec() never opens a real
+    popup (returns None = the cancel path), so the test drives the pure
+    lifecycle contract: after the handler returns, the temporary menu it
+    built must have a release scheduled — no reliance on Qt child counts
+    or event-loop timing."""
+
+    instances = []
+
+    def __init__(self, parent=None):
+        self.scheduled_delete = False
+        _RecordingMenu.instances.append(self)
+
+    def addAction(self, *_args):
+        return _FakeAction()
+
+    def addSeparator(self):
+        return None
+
+    def exec(self, *_args, **_kwargs):
+        return None
+
+    def deleteLater(self):
+        self.scheduled_delete = True
+
+
+def test_context_menu_schedules_release_after_invocation(page, monkeypatch):
+    """Each right-click builds a QMenu(self) whose C++ ownership goes to the
+    page; exec() hides but does not free it, so without deleteLater every
+    invocation would leave the menu alive until page teardown. The handler
+    must schedule the release on the cancel path too."""
+    monkeypatch.setattr("meeting_records_page.QMenu", _RecordingMenu)
+    _RecordingMenu.instances.clear()
+    rect = page._list.visualItemRect(page._list.item(0))
+    page._list_context_menu(rect.center())
+    menus = _RecordingMenu.instances
+    assert len(menus) == 1
+    assert menus[0].scheduled_delete is True
+
+
+def test_export_menu_schedules_release_after_invocation(page, monkeypatch):
+    """The export dropdown is the same per-invocation menu (its actions
+    even hold Python lambdas): after the click handler returns, the menu
+    must have a release scheduled rather than surviving as a page child."""
+    page._list.setCurrentRow(0)
+    monkeypatch.setattr("meeting_records_page.QMenu", _RecordingMenu)
+    _RecordingMenu.instances.clear()
+    page._on_export_menu()
+    menus = _RecordingMenu.instances
+    assert len(menus) == 1
+    assert menus[0].scheduled_delete is True
+
+
 # --- app-level end entry (identity through the confirmation dialog) ---------------
 
 
