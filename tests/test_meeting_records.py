@@ -8,6 +8,8 @@ is detected rather than guessed.
 
 import json
 
+import pytest
+
 import meeting_records as records
 from transcript_writer import delete_session
 

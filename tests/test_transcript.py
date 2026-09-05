@@ -325,10 +325,12 @@ def test_write_original_rejects_entries_from_another_session(tmp_path):
     writer.write_original(2, "09:00:05", "stale from A", session=stamp_a)
     all_text = (tmp_path / f"livetrans_{stamp_b}_all.txt").read_text("utf-8")
     assert "stale from A" not in all_text
-    # A None expectation (legacy auto-open callers) is still accepted.
+    # A None expectation (legacy auto-open callers) is still accepted. The
+    # original file is the immediate proof (entries reach all.txt only when
+    # they complete, in utterance order — the drain design).
     writer.write_original(3, "09:00:06", "no expectation")
-    all_text = (tmp_path / f"livetrans_{stamp_b}_all.txt").read_text("utf-8")
-    assert "no expectation" in all_text
+    orig_text = (tmp_path / f"livetrans_{stamp_b}_original.txt").read_text("utf-8")
+    assert "no expectation" in orig_text
     writer.end_session()
 
 
@@ -607,7 +609,10 @@ def test_late_translation_of_a_refused_original_never_enters_new_session(tmp_pat
     translation_result = writer.write_translation(
         2, "late translation of stale audio", session=stamp_a
     )
-    assert translation_result == TranscriptWriter.WRITE_SESSION_MISMATCH
+    # The original was refused, so the translation has no recorded entry:
+    # the writer's documented orphan rule *discards* it outright (there is
+    # deliberately no orphan-write path) — skipped, never written anywhere.
+    assert translation_result == TranscriptWriter.WRITE_SKIPPED
     writer.end_session()
 
     for kind in ("all", "translation", "original"):

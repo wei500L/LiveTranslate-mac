@@ -194,16 +194,26 @@ def test_summary_roundtrip_shows_ready_state(page):
 def test_stale_summary_is_flagged_in_list_and_detail(page):
     stamp = page._list.item(0).record["session"]
     entries = page._entries
+    # The fixture session has no session_status/footer (an old-format,
+    # crash-left record) — its "interrupted" badge outranks everything, so
+    # the stale badge is only reachable on a cleanly-ended record. Complete
+    # this one first, the way a real seal would have.
+    meta_path = page._dir / f"livetrans_{stamp}_meta.json"
+    meta = json.loads(meta_path.read_text(encoding="utf-8"))
+    meta["session_status"] = "completed"
+    meta_path.write_text(json.dumps(meta), encoding="utf-8")
     records.save_summary(page._dir, stamp, "# 旧纪要", {
         "source_hash": "not-the-real-hash",
     })
     page.refresh()
-    row = page._list.item(0).text()
-    # The stale badge is locale text (zh or en); the record field is the
-    # locale-independent assertion.
-    assert ("重新生成" in row) or ("regenerate" in row.lower())
     record = page._list.item(0).record
+    assert record["ended_cleanly"] is True
+    assert record["interrupted"] is False
     assert record["summary_stale"] is True
+    row = page._list.item(0).text()
+    # The stale badge is locale text (zh or en); the record field above is
+    # the locale-independent assertion.
+    assert ("重新生成" in row) or ("regenerate" in row.lower())
 
 
 # --- provider selection -------------------------------------------------------------
@@ -448,9 +458,13 @@ def test_live_role_prefer_the_ending_state_over_writer_active(page):
     # Without the app-level push it is what the writer says.
     page._session_state = "active"
     assert page._live_session_role(stamp) == "active"
-    # Another session's ENDING never paints this row.
+    # Another session's ENDING never paints this row: the app-level stamp
+    # does not match, and the row is whatever the *writer* says about it.
     page._session_state = "ending"
     page._ending_session_id = "some_other_stamp"
+    assert page._live_session_role(stamp) == "active"
+    # With the writer holding nothing open either, the row has no live role.
+    page.set_transcript_writer(_FakeWriter(active=None, ending=None))
     assert page._live_session_role(stamp) == "none"
     page._session_state = "idle"
     page._ending_session_id = None
@@ -784,8 +798,11 @@ def test_rename_refused_when_the_session_was_deleted_under_the_dialog(page, monk
     )
     page._rename_session(page._list.item(0))
     assert shown, "the session-gone refusal must be shown"
-    # No sidecar was resurrected for the deleted session.
-    assert not list(_session_file_candidates(page._dir, stamp))
+    # No sidecar was resurrected for the deleted session. The candidates
+    # helper enumerates names (existing or not) — assert on existence.
+    assert not any(
+        path.exists() for path in _session_file_candidates(page._dir, stamp)
+    )
 
 
 def test_delete_of_a_parent_stamp_spares_its_same_second_suffixed_sibling(page, monkeypatch):
@@ -1178,14 +1195,18 @@ def test_lightweight_push_preserves_stale_and_edited_badges(page, monkeypatch):
     and asserting they survive the push is the real contract."""
     page._list.setCurrentRow(0)
     stamp = page._list.item(0).record["session"]
-    # A committed (stale) summary and an edited flag on the record, plus
-    # the live row the pushes will target.
+    # A writer reporting the session live (the pushes resolve their target
+    # identity through it) and a committed summary on disk.
+    page.set_transcript_writer(_FakeWriter(active=stamp))
     records.save_summary(page._dir, stamp, "# old", {"source_hash": "bogus"})
     page.refresh()
     live = page._record_for_session(stamp)
     assert live["has_summary"] is True
-    # Stamp the cache the way a live session with a stale summary looks:
-    # the summary exists, its hash no longer matches, the meeting is live.
+    # A refresh forces summary_stale=False while the session is live (a
+    # summary of a growing meeting is interim, not stale — the product
+    # rule), so stamp the cache the way a live row with a stale summary
+    # looks: summary exists, hash no longer matches, meeting live. The
+    # lightweight path must carry these through untouched.
     live["is_active"] = True
     live["summary_stale"] = True
     live["summary_edited"] = False

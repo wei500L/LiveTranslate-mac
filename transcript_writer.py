@@ -473,6 +473,11 @@ class TranscriptWriter:
             self._paths[self.META_KIND] = str(
                 self._base_dir / f"livetrans_{self._session_ts}_{self.META_KIND}.json"
             )
+            # Set BEFORE the create_only write: _summary_locked reads this
+            # field, and the very first sidecar commit must already carry
+            # session_status=active — the records layer's primary signal for
+            # "still recording" (a null here read as the legacy format).
+            self._session_status = "active"
             if not self._write_meta_locked(create_only=True):
                 failures.append(f"{self._paths[self.META_KIND]}: create failed")
 
@@ -508,10 +513,8 @@ class TranscriptWriter:
         self._markdown_header_open = True
         self._opened = True
         self._session_open = True
-        # The sidecar written by create_only carries session_status=active
-        # (see _summary_locked) — the records layer treats a live session by
-        # this field first.
-        self._session_status = "active"
+        # (session_status was set before the create_only meta write above;
+        # the failure branch already reset it to None.)
         self._write_degraded = False
         log.info(f"Transcripts -> {self._base_dir} (session {self._session_ts})")
 
@@ -1215,6 +1218,12 @@ def read_session_meta(base_dir: Path) -> list[dict]:
 
     sessions: dict[str, dict] = {}
     for path in base_dir.glob("livetrans_*_meta.json"):
+        # The AI-summary sidecar matches this glob too (the records layer
+        # drops it by stamp afterwards); skipping it *before* the read is
+        # the same exclusion moved earlier — one full JSON read less per
+        # summarized session per listing.
+        if path.name.endswith(_SUMMARY_FILE_SUFFIXES):
+            continue
         stamp = path.name[len("livetrans_"):-len("_meta.json")]
         try:
             sessions[stamp] = json.loads(path.read_text(encoding="utf-8"))

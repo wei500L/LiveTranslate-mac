@@ -20,7 +20,7 @@ start.bat                           # Windows
 ./start.sh                          # macOS
 ```
 
-Tests: `python -m pytest -q` (82 offline tests, no network or model downloads). This must pass before any commit — CI runs the same command on macOS arm64 and every release-producing job gates on it.
+Tests: `python -m pytest -q` (463 offline tests, no network or model downloads; 4 skipped where torch/Qt optional pieces are absent). This must pass before any commit — CI runs the same command on macOS arm64 and every release-producing job gates on it.
 
 Linter: `ruff` is **not** bundled with the venv. When it is available, run `python -m ruff check --select F,E,W --ignore E501,E402 *.py`. E402 is intentionally ignored because `main.py` requires torch before PyQt6. When ruff is unavailable, fall back to `python -m compileall -q .` plus the test suite, and say so rather than reporting a lint pass that did not happen.
 
