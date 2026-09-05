@@ -1089,6 +1089,9 @@ class _AdoptionApp:
         self._asr_config = None
         self._running = True
         self._paused = False
+        # The ENDING-flush hand-off (_flush_for_session_end) gates on ASR
+        # readiness; tests that need the not-ready branch flip it.
+        self._asr_ready = True
         self._target_language = "ru"
         self._asr_count = 0
         self._msg_id = 0
@@ -1099,6 +1102,8 @@ class _AdoptionApp:
         self._vad = None
         self._interim_pending = ""
         self._interim_active = False
+        self._last_interim_samples = 0
+        self._last_interim_check_time = 0.0
         self._interim_committed_tail = ""
         # Notified state changes: [(state, session_id), ...].
         self.notifications = []
@@ -1136,6 +1141,10 @@ class _AdoptionApp:
     _is_substantial_echo = None
     _buffer_interim_fragment = None
     _do_interim_asr = None
+    _reset_interim_state = None
+    _process_interim_final = None
+    _flush_for_session_end = None
+    _enqueue_final_segment = None
 
 
 def _make_adoption_app(tmp_path):
@@ -1151,7 +1160,9 @@ def _make_adoption_app(tmp_path):
             "_record_session_info", "_publish_transcript_paths",
             "begin_recording_session", "_strip_committed_overlap",
             "_is_substantial_echo", "_buffer_interim_fragment",
-            "_do_interim_asr",
+            "_do_interim_asr", "_reset_interim_state",
+            "_process_interim_final", "_flush_for_session_end",
+            "_enqueue_final_segment",
         ):
             setattr(_AdoptionApp, name, getattr(real, name))
         # A staticmethod retrieved from the class is a plain function; store
@@ -1243,7 +1254,10 @@ def test_ending_waits_for_work_enqueued_before_adoption(tmp_path):
 
 class _FakeInterimVAD:
     """Just enough VAD for _do_interim_asr: a peekable buffer and a
-    recording trimmer."""
+    recording trimmer. flush()/force_flush()/_reset() serve the ENDING
+    hand-off tests — both flush variants return and clear the buffer
+    (None when empty), matching the real VAD's contract for the paths
+    _flush_for_session_end takes."""
 
     def __init__(self, seconds: float):
         self._samples = [0.0] * int(seconds * 16000)
@@ -1257,6 +1271,18 @@ class _FakeInterimVAD:
     def trim_front(self, samples):
         self.trimmed += samples
         self._samples = self._samples[samples:]
+
+    def _flush_all(self):
+        if not self._samples:
+            return None
+        segment, self._samples = self._samples, []
+        return segment
+
+    flush = _flush_all
+    force_flush = _flush_all
+
+    def _reset(self):
+        self._samples = []
 
 
 def test_interim_sentences_after_adoption_are_not_lost(tmp_path):
@@ -1638,3 +1664,173 @@ def test_interim_prefix_commit_with_later_refusal_consumes_only_the_prefix(
     assert app._interim_committed_tail == "Да, Первое предложение."
     assert app._interim_active is True
     assert app._vad.trimmed > 0
+
+
+# --- the ENDING flush hands the interim state to the ASR loop ---------------
+
+
+def _drain_vad_flush_like_the_asr_loop(app):
+    """The ASR loop's vad_flush handling, verbatim in shape: dispatch on
+    ``_interim_active`` (the flag must have survived the ENDING hand-off
+    for the interim-final branch to run at all), the interim-state reset
+    in the ``finally``, the queue count released afterwards. Keeping this
+    replica here is the point — the ENDING hand-off relies on exactly
+    this ownership, so the tests pin it against the real methods."""
+    item = app._asr_queue.get_nowait()
+    assert item[0] == "vad_flush"
+    try:
+        if app._interim_active:
+            app._process_interim_final(item[1], item[2], item[3], item[4])
+        else:
+            app._process_segment(item[1], item[2], item[3], item[4])
+    finally:
+        app._reset_interim_state()
+    if item[2] is not None:
+        app._session_work.release(item[3], item[2])
+    return item
+
+
+def test_ending_flush_hands_interim_state_to_the_asr_loop(tmp_path):
+    """[ENDING hand-off regression] The ENDING flush used to reset the
+    interim state on the producer side, right after enqueueing the final
+    segment — which sent the item down the plain ``_process_segment``
+    branch (the loop dispatches on ``_interim_active``) and destroyed the
+    buffered fragments before ``_process_interim_final`` could flush
+    them: their audio was already trimmed away, so the text was lost
+    forever. On a successful enqueue the producer must leave the state
+    intact and let the loop's existing vad_flush ``finally`` own the one
+    reset."""
+    app, writer, main = _make_adoption_app(tmp_path)
+    app._vad = _FakeInterimVAD(4.0)
+    stamp = app.begin_recording_session()
+    assert stamp is not None
+    gen = app._session_generation
+    # The real ENDING order: CLOSING flips before the flush.
+    app._session_work.start_closing(gen)
+    app._interim_pending = "Да,"
+    app._interim_committed_tail = "предыдущая фраза"
+    app._interim_active = True
+    app._run_asr = lambda audio, kind, **kw: (
+        {"text": "Хвост фразы", "language": "ru"}, 60,
+    )
+
+    app._flush_for_session_end(gen)
+
+    # The segment reached the queue and the producer did NOT reset: the
+    # dispatch flag, the buffered fragments and the echo tail all survive
+    # for the consumer, and the ENDING wait sees the item's count (it
+    # gates the seal — the reset may only happen after this drains).
+    assert app._asr_queue.qsize() == 1
+    assert app._session_work.pending_count(gen) == 1
+    assert app._interim_active is True
+    assert app._interim_pending == "Да,"
+    assert app._interim_committed_tail == "предыдущая фраза"
+
+    item = _drain_vad_flush_like_the_asr_loop(app)
+    assert item[3] == gen and item[4] == stamp
+
+    # The buffered fragment reached the final record, spliced into the
+    # final recognition...
+    all_text = (tmp_path / f"livetrans_{stamp}_all.txt").read_text("utf-8")
+    assert "Да, Хвост фразы" in all_text
+    # ...and after the handler's finally the state is clean — the one
+    # reset ran on the consumer side; nothing lingers for the next
+    # session, and the drained count lets the seal proceed.
+    assert app._interim_active is False
+    assert app._interim_pending == ""
+    assert app._interim_committed_tail == ""
+    assert app._session_work.wait_idle(gen, timeout=0.0) is True
+    writer.end_session()
+
+
+def test_ending_flush_echo_tail_dedups_the_final_recognition(tmp_path):
+    """[ENDING hand-off regression] The final flush's audio re-recognizes
+    whatever the buffer still held when the meeting ended — which overlaps
+    the interim-committed prefix. The committed tail must survive the
+    hand-off so ``_process_interim_final`` can strip the repeat; the old
+    producer-side reset wiped it and the committed sentence was written
+    into the closing record twice."""
+    app, writer, main = _make_adoption_app(tmp_path)
+    app._vad = _FakeInterimVAD(4.0)
+    stamp = app.begin_recording_session()
+    assert stamp is not None
+    gen = app._session_generation
+    # A sentence the interim path already committed (its audio was
+    # trimmed; the tail is its only remaining trace).
+    assert app._process_segment_text(
+        "Первое предложение.", "ru", 100,
+        generation=gen, expected_session=stamp,
+    ) is True
+    app._interim_committed_tail = "Первое предложение."
+    app._interim_active = True
+    app._session_work.start_closing(gen)
+    # The final recognition replays the committed sentence plus the words
+    # still being spoken when the meeting ended.
+    app._run_asr = lambda audio, kind, **kw: (
+        {"text": "Первое предложение. Хвост", "language": "ru"}, 60,
+    )
+
+    app._flush_for_session_end(gen)
+    assert app._interim_committed_tail == "Первое предложение."
+    _drain_vad_flush_like_the_asr_loop(app)
+
+    all_text = (tmp_path / f"livetrans_{stamp}_all.txt").read_text("utf-8")
+    # The committed sentence appears exactly once (its own entry, not a
+    # replayed duplicate), and the genuinely new tail was kept.
+    assert all_text.count("Первое предложение.") == 1
+    assert "Хвост" in all_text
+    writer.end_session()
+
+
+def test_ending_flush_resets_immediately_when_nothing_reaches_the_queue(
+    tmp_path,
+):
+    """[ENDING hand-off regression] Every path that leaves the final audio
+    unqueued must reset the interim state on the ENDING thread itself —
+    no consumer will ever run the loop's reset, and a dirty state
+    (buffered fragments, echo tail, dispatch flag) left behind would leak
+    into the next session: ASR not ready, nothing remaining, a superseded
+    generation, a stop already begun."""
+    app, writer, main = _make_adoption_app(tmp_path)
+    gen = app._session_generation
+
+    def dirty():
+        app._interim_pending = "Да,"
+        app._interim_committed_tail = "хвост"
+        app._interim_active = True
+
+    def assert_clean():
+        assert app._interim_active is False
+        assert app._interim_pending == ""
+        assert app._interim_committed_tail == ""
+        assert app._asr_queue.empty()
+
+    # ASR not ready: the VAD buffer is dropped, the state reset here.
+    app._vad = _FakeInterimVAD(4.0)
+    app._asr_ready = False
+    dirty()
+    app._flush_for_session_end(gen)
+    assert_clean()
+    assert app._vad._samples == []  # the buffer went with it
+
+    # Nothing remaining: force_flush() had nothing to hand over.
+    app._asr_ready = True
+    app._vad = _FakeInterimVAD(0.0)
+    dirty()
+    app._flush_for_session_end(gen)
+    assert_clean()
+
+    # A superseded generation (a quit raced the end): register_final
+    # refuses, the segment is dropped, the state is the caller's.
+    app._vad = _FakeInterimVAD(4.0)
+    dirty()
+    app._flush_for_session_end(gen + 99)
+    assert_clean()
+
+    # A stop already begun: the enqueue refuses before registering, and a
+    # fresh buffer must not reach the queue either.
+    app._vad = _FakeInterimVAD(4.0)
+    dirty()
+    app._stop_event.set()
+    app._flush_for_session_end(gen)
+    assert_clean()

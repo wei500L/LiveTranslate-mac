@@ -487,7 +487,22 @@ linearized lifecycle inside one lock/Condition —
    deduplicated interim items release through `_release_queued_work`, also
    keyed to the item's own generation. The ENDING flush enqueues through
    `_enqueue_final_segment`/`register_final` — the only new work a CLOSING
-   generation accepts.
+   generation accepts. `_enqueue_final_segment` returns whether the item
+   reached the queue: on success `_flush_for_session_end` hands the
+   interim state over with the segment and does **not** reset it — the
+   ASR loop's vad_flush `finally` owns that reset (the same ownership
+   `pause()` relies on), because the loop's dispatch between
+   `_process_interim_final` and `_process_segment` reads
+   `_interim_active`, and `_process_interim_final` needs
+   `_interim_pending` (the trimmed-away fragments' only remaining copy)
+   and `_interim_committed_tail` (echo dedup). A producer-side reset
+   early-cleared both and routed the final segment down the plain
+   `_process_segment` branch, losing the fragments and duplicating the
+   committed prefix. Only the unqueued paths (ASR not ready, nothing
+   remaining, superseded generation, stop begun, queue rejecting the item
+   after dropping one) reset on the ENDING thread — no consumer will ever
+   run the loop's reset there, and a dirty state would leak into the next
+   session.
 2. **translation work** — `register_msg` when recognition produces a
    message (before the job is submitted), keyed to the *segment's*
    generation; released by the `finally` in `_translate_async` (which

@@ -1215,6 +1215,22 @@ class LiveTranslateApp:
         work a CLOSING generation accepts — before it is enqueued. If the
         generation was superseded before the flush ran (a quit raced the
         end), the segment is dropped: the stop() path owns that audio.
+
+        The interim state is handed over with the segment and reset by the
+        ASR loop's vad_flush ``finally`` — the same ownership pause()
+        relies on. Resetting it here used to break both halves of the
+        final processing: the loop's dispatch between
+        ``_process_interim_final`` and ``_process_segment`` reads
+        ``_interim_active``, and ``_process_interim_final`` itself needs
+        ``_interim_pending`` (the buffered fragments whose audio was
+        already trimmed away — this final write is their only remaining
+        copy) and ``_interim_committed_tail`` (echo dedup against the
+        committed prefix). Only the paths that leave the audio unqueued
+        reset here — ASR not ready, nothing remaining, a superseded
+        generation, a stop already begun, or the queue rejecting the item
+        even after dropping one — because then no consumer will ever run
+        the handler's reset, and a dirty interim state left behind would
+        leak into the next session.
         """
         if not self._asr_ready:
             with self._vad_lock:
@@ -1225,11 +1241,15 @@ class LiveTranslateApp:
             remaining = (
                 self._vad.force_flush() if self._interim_active else self._vad.flush()
             )
-        if remaining is not None:
-            self._enqueue_final_segment(generation, remaining)
-        self._reset_interim_state()
+        if remaining is None:
+            self._reset_interim_state()
+            return
+        if not self._enqueue_final_segment(generation, remaining):
+            # Nothing reached the queue: the interim state is this
+            # thread's to clear now (see the docstring).
+            self._reset_interim_state()
 
-    def _enqueue_final_segment(self, generation: int, segment) -> None:
+    def _enqueue_final_segment(self, generation: int, segment) -> bool:
         """Enqueue the ENDING flush's segment with a final-registration.
 
         Split from _enqueue_asr so the two producers can never be confused:
@@ -1241,9 +1261,16 @@ class LiveTranslateApp:
         is still open here). Overflow handling mirrors _enqueue_asr: a
         dropped victim releases its count, a failed put releases the item's
         own count.
+
+        Returns True only when the item actually reached the ASR queue, so
+        the ASR loop's vad_flush handler — and with it the interim-state
+        reset the handler owns — is guaranteed to run. False on every
+        refusal (a stop already begun, the generation superseded, or the
+        queue still full after dropping one victim); the caller then owns
+        the interim state and must reset it itself.
         """
         if self._stop_event.is_set():
-            return
+            return False
         # Snapshot under the boundary fence like the ordinary producer, so
         # the item's identity pair is consistent (ENDing state blocks a
         # concurrent begin, but the fence keeps the invariant uniform).
@@ -1252,14 +1279,14 @@ class LiveTranslateApp:
             work_id = self._next_session_work_id()
             if not self._session_work.register_final(generation, work_id):
                 log.debug("Dropping ENDING flush for superseded generation")
-                return
+                return False
             item = (
                 "vad_flush", segment, work_id, generation,
                 expected_session,
             )
             try:
                 self._asr_queue.put_nowait(item)
-                return
+                return True
             except queue.Full:
                 pass
         try:
@@ -1276,6 +1303,8 @@ class LiveTranslateApp:
         except queue.Full:
             log.warning("ASR queue still full, dropping the ENDING flush")
             self._release_queued_work(item)
+            return False
+        return True
 
     def _next_session_work_id(self):
         """A unique work id for one queued ASR item. Independent of msg_id:
