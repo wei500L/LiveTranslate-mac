@@ -1148,6 +1148,8 @@ class _AdoptionApp:
     _flush_for_session_end = None
     _enqueue_final_segment = None
     _run_session_end = None
+    pause = None
+    resume = None
 
 
 def _make_adoption_app(tmp_path):
@@ -1166,6 +1168,7 @@ def _make_adoption_app(tmp_path):
             "_do_interim_asr", "_reset_interim_state",
             "_process_interim_final", "_flush_for_session_end",
             "_enqueue_final_segment", "_run_session_end",
+            "pause", "resume",
         ):
             setattr(_AdoptionApp, name, getattr(real, name))
         # A staticmethod retrieved from the class is a plain function; store
@@ -1588,7 +1591,7 @@ def test_refused_interim_commit_keeps_the_buffered_pending(tmp_path):
     lost forever. A later pass commits it exactly once."""
     app, writer, main = _make_adoption_app(tmp_path)
     app._vad = _FakeInterimVAD(4.0)
-    app._interim_pending = "Да,"
+    app._interim_pending = "Да, "
     app._run_asr = lambda audio, kind, **kw: (
         {"text": "Новое предложение. Хвост", "language": "ru"}, 100,
     )
@@ -1599,7 +1602,7 @@ def test_refused_interim_commit_keeps_the_buffered_pending(tmp_path):
     # A stale generation: the spliced sentence is refused before any write.
     assert app._do_interim_asr(generation=42, expected_session=None) is False
     # The pending was never consumed, nothing was trimmed or written.
-    assert app._interim_pending == "Да,"
+    assert app._interim_pending == "Да, "
     assert app._vad.trimmed == 0
     assert list(tmp_path.glob("livetrans_*_all.txt")) == []
 
@@ -1633,7 +1636,7 @@ def test_interim_prefix_commit_with_later_refusal_consumes_only_the_prefix(
     absorbed by the committed prefix stays consumed."""
     app, writer, main = _make_adoption_app(tmp_path)
     app._vad = _FakeInterimVAD(6.0)
-    app._interim_pending = "Да,"
+    app._interim_pending = "Да, "
     app._run_asr = lambda audio, kind, **kw: (
         {"text": "Первое предложение. Второе предложение. Хвост",
          "language": "ru"}, 100,
@@ -1673,16 +1676,21 @@ def test_interim_prefix_commit_with_later_refusal_consumes_only_the_prefix(
 
 
 def _drain_vad_flush_like_the_asr_loop(app):
-    """The ASR loop's vad_flush handling, verbatim in shape: dispatch on
-    ``_interim_active`` (the flag must have survived the ENDING hand-off
-    for the interim-final branch to run at all), the interim-state reset
-    in the ``finally``, the queue count released afterwards. Keeping this
-    replica here is the point — the ENDING hand-off relies on exactly
-    this ownership, so the tests pin it against the real methods."""
+    """The ASR loop's vad_flush handling, verbatim in shape: the marker
+    branch (no audio — the item exists so this ``finally`` runs), the
+    dispatch on ``_interim_active`` (the flag must have survived the
+    ENDING hand-off and the pause marker's ordering for the interim-final
+    branch to run at all), the interim-state reset in the ``finally``, the
+    queue count released afterwards. Keeping this replica here is the
+    point — the ENDING hand-off and the pause marker rely on exactly this
+    ownership, so the tests pin it against the real methods."""
     item = app._asr_queue.get_nowait()
     assert item[0] == "vad_flush"
     try:
-        if app._interim_active:
+        if item[1] is None:
+            # pause()'s cleanup marker: nothing to recognize.
+            pass
+        elif app._interim_active:
             app._process_interim_final(item[1], item[2], item[3], item[4])
         else:
             app._process_segment(item[1], item[2], item[3], item[4])
@@ -1710,7 +1718,7 @@ def test_ending_flush_hands_interim_state_to_the_asr_loop(tmp_path):
     gen = app._session_generation
     # The real ENDING order: CLOSING flips before the flush.
     app._session_work.start_closing(gen)
-    app._interim_pending = "Да,"
+    app._interim_pending = "Да, "
     app._interim_committed_tail = "предыдущая фраза"
     app._interim_active = True
     app._run_asr = lambda audio, kind, **kw: (
@@ -1726,7 +1734,7 @@ def test_ending_flush_hands_interim_state_to_the_asr_loop(tmp_path):
     assert app._asr_queue.qsize() == 1
     assert app._session_work.pending_count(gen) == 1
     assert app._interim_active is True
-    assert app._interim_pending == "Да,"
+    assert app._interim_pending == "Да, "
     assert app._interim_committed_tail == "предыдущая фраза"
 
     item = _drain_vad_flush_like_the_asr_loop(app)
@@ -1808,7 +1816,7 @@ def test_ending_flush_returns_none_keeps_state_for_an_older_queued_vad_flush(
     with app._session_boundary_lock:
         app._enqueue_asr("vad_flush", "audio-from-before-the-end")
     assert app._session_work.pending_count(gen) == 1
-    app._interim_pending = "Да,"
+    app._interim_pending = "Да, "
     app._interim_committed_tail = "предыдущая фраза"
     app._interim_active = True
     app._run_asr = lambda audio, kind, **kw: (
@@ -1822,7 +1830,7 @@ def test_ending_flush_returns_none_keeps_state_for_an_older_queued_vad_flush(
     # ...and the None path must NOT reset: the queued consumer still owns
     # the state (this is the pin — the old code reset right here).
     assert app._interim_active is True
-    assert app._interim_pending == "Да,"
+    assert app._interim_pending == "Да, "
     assert app._interim_committed_tail == "предыдущая фраза"
 
     # The ASR loop consumes the older item with the state intact: the
@@ -1853,7 +1861,7 @@ def test_ending_flush_refusals_leave_the_reset_to_the_drain_phase(tmp_path):
     gen = app._session_generation
 
     def dirty():
-        app._interim_pending = "Да,"
+        app._interim_pending = "Да, "
         app._interim_committed_tail = "хвост"
         app._interim_active = True
 
@@ -1912,7 +1920,7 @@ def test_run_session_end_resets_when_no_queue_work_and_nothing_remains(
     assert stamp is not None
     gen = app._session_generation
     app._vad = _FakeInterimVAD(0.0)
-    app._interim_pending = "Да,"
+    app._interim_pending = "Да, "
     app._interim_committed_tail = "хвост"
     app._interim_active = True
 
@@ -1958,7 +1966,7 @@ def test_run_session_end_resets_after_queue_consumers_and_before_the_seal(
     app._vad.force_flush = _force_flush_recording
     with app._session_boundary_lock:
         app._enqueue_asr("vad_flush", "audio-from-before-the-end")
-    app._interim_pending = "Да,"
+    app._interim_pending = "Да, "
     app._interim_active = True
     app._run_asr = lambda audio, kind, **kw: (
         {"text": "Хвост фразы", "language": "ru"}, 60,
@@ -1988,7 +1996,7 @@ def test_run_session_end_resets_after_queue_consumers_and_before_the_seal(
     # must still be the consumer's — nothing has reset it.
     assert flush_ran.wait(timeout=5.0)
     assert app._interim_active is True
-    assert app._interim_pending == "Да,"
+    assert app._interim_pending == "Да, "
 
     # The ASR loop consumes the older item; the release unblocks the drain
     # phase, which resets and proceeds to the seal.
@@ -2023,7 +2031,7 @@ def test_session_end_queue_timeout_still_resets_and_never_leaks(
     assert stamp is not None
     gen = app._session_generation
     app._vad = _FakeInterimVAD(0.0)
-    app._interim_pending = "Да,"
+    app._interim_pending = "Да, "
     app._interim_active = True
 
     with app._session_boundary_lock:
@@ -2043,3 +2051,197 @@ def test_session_end_queue_timeout_still_resets_and_never_leaks(
     item = app._asr_queue.get_nowait()
     app._release_queued_work(item)
     assert app._session_work.pending_count(gen) == 0
+
+
+# --- pause hands the interim state to the queue's FIFO order ---------------
+
+
+def test_pause_with_an_older_queued_vad_flush_keeps_the_interim_state(tmp_path):
+    """[pause ownership regression] ``remaining is None`` proves only that
+    *this* pause's flush produced no segment — not that no earlier
+    vad_flush (a natural split, a silence-feed flush, an earlier hand-off)
+    is still queued unconsumed. That item's consumer owns the interim
+    state. The old code reset in the else-branch, so the still-queued
+    consumer dispatched on a cleared ``_interim_active``, took the plain
+    ``_process_segment`` branch and lost the buffered fragments (their
+    audio was already trimmed away) together with the echo dedup. pause()
+    must leave the state to the consumer and enqueue its no-audio cleanup
+    marker behind it, so the one reset runs on the consumer side in queue
+    order."""
+    app, writer, main = _make_adoption_app(tmp_path)
+    app._vad = _FakeInterimVAD(0.0)   # the pause flush finds nothing
+    stamp = app.begin_recording_session()
+    assert stamp is not None
+    gen = app._session_generation
+
+    with app._session_boundary_lock:
+        app._enqueue_asr("vad_flush", "audio-from-before-the-pause")
+    app._interim_pending = "Да, "
+    app._interim_committed_tail = "предыдущая фраза"
+    app._interim_active = True
+    # The older item's recognition replays the committed prefix (the echo
+    # the tail must strip) plus the words still being spoken.
+    app._run_asr = lambda audio, kind, **kw: (
+        {"text": "предыдущая фраза Хвост", "language": "ru"}, 60,
+    )
+
+    app.pause()
+
+    # The pause flushed nothing and must NOT reset: the older item's
+    # consumer still owns every field of the state.
+    assert app._interim_active is True
+    assert app._interim_pending == "Да, "
+    assert app._interim_committed_tail == "предыдущая фраза"
+    # The cleanup marker landed *behind* the older item.
+    assert app._asr_queue.qsize() == 2
+
+    # The ASR loop consumes the older item first, with the state intact:
+    # the echo is stripped against the surviving tail and the buffered
+    # fragment is spliced in. (With the old reset, this took the plain
+    # path and wrote "предыдущая фраза Хвост" raw, no fragment.)
+    item = _drain_vad_flush_like_the_asr_loop(app)
+    assert item[1] == "audio-from-before-the-pause"
+    assert item[3] == gen and item[4] == stamp
+    all_text = (tmp_path / f"livetrans_{stamp}_all.txt").read_text("utf-8")
+    assert "Да, Хвост" in all_text
+    assert "предыдущая фраза" not in all_text
+
+    # Then the marker: no audio, its finally performs the one reset.
+    marker = _drain_vad_flush_like_the_asr_loop(app)
+    assert marker[1] is None
+    assert app._interim_active is False
+    assert app._interim_pending == ""
+    assert app._interim_committed_tail == ""
+    writer.end_session()
+
+
+def test_pause_with_no_consumer_enqueues_the_marker_and_still_resets(tmp_path):
+    """[pause ownership regression] With nothing queued and nothing to
+    flush there is no consumer at all — the marker is the consumer: it
+    carries no audio, so nothing is recognized, but its vad_flush finally
+    performs the reset. The state cannot survive the pause (the next
+    utterance would splice onto the old one), and the subtitle-only
+    admission ("pass", no session) carries the marker like any item."""
+    app, writer, main = _make_adoption_app(tmp_path)
+    app._vad = _FakeInterimVAD(0.0)
+    gen = app._session_generation
+    app._interim_pending = "Да, "
+    app._interim_committed_tail = "хвост"
+    app._interim_active = True
+
+    app.pause()
+
+    # The marker is the only queue item, and it is counted (the ENDING
+    # wait would cover it if an end raced the pause).
+    assert app._asr_queue.qsize() == 1
+    assert app._session_work.pending_count(gen) == 1
+
+    marker = _drain_vad_flush_like_the_asr_loop(app)
+    assert marker[1] is None
+    assert app._session_work.pending_count(gen) == 0
+    assert app._interim_active is False
+    assert app._interim_pending == ""
+    assert app._interim_committed_tail == ""
+
+
+def test_pause_resume_starts_the_next_utterance_from_a_clean_slate(tmp_path):
+    """[pause ownership regression] The pause semantics — "speech still in
+    flight before the pause completes; after the resume a fresh utterance
+    starts" — must hold by *ordering*, not by resetting early: the marker
+    is enqueued at the tail, the ASR loop is a single-consumer FIFO, so
+    the reset runs after every pre-pause item and before anything
+    enqueued after the resume. The post-resume segment therefore sees a
+    clean state: no pre-pause fragment spliced onto it, no echo stripping
+    against the old utterance."""
+    app, writer, main = _make_adoption_app(tmp_path)
+    stamp = app.begin_recording_session()
+    assert stamp is not None
+    app._vad = _FakeInterimVAD(0.0)
+
+    with app._session_boundary_lock:
+        app._enqueue_asr("vad_flush", "audio-before-pause")
+    app._interim_pending = "Да, "
+    app._interim_committed_tail = "предыдущая фраза"
+    app._interim_active = True
+
+    app.pause()
+    app.resume()
+
+    # Post-resume speech lands behind the marker (the capture thread
+    # produces through the same fence).
+    with app._session_boundary_lock:
+        app._enqueue_asr("vad_flush", "audio-after-resume")
+
+    def fake_asr(audio, kind, **kw):
+        if kind == "interim_final":
+            return {"text": "Хвост фразы", "language": "ru"}, 60
+        return {"text": "Новая фраза", "language": "ru"}, 60
+
+    app._run_asr = fake_asr
+
+    # FIFO: the pre-pause remainder (state intact) → the marker (one
+    # reset) → the post-resume audio (clean state, plain path).
+    item1 = _drain_vad_flush_like_the_asr_loop(app)
+    assert item1[1] == "audio-before-pause"
+    marker = _drain_vad_flush_like_the_asr_loop(app)
+    assert marker[1] is None
+    item3 = _drain_vad_flush_like_the_asr_loop(app)
+    assert item3[1] == "audio-after-resume"
+
+    all_text = (tmp_path / f"livetrans_{stamp}_all.txt").read_text("utf-8")
+    # The pre-pause remainder completed: fragment spliced, echo stripped.
+    assert "Да, Хвост фразы" in all_text
+    # The new utterance is exactly its own text — nothing spliced from or
+    # deduped against the pre-pause utterance.
+    assert "Новая фраза" in all_text
+    assert "Да, Новая фраза" not in all_text
+    writer.end_session()
+
+
+def test_pause_failure_paths_do_not_leak_or_corrupt(tmp_path):
+    """[pause ownership regression] The failure paths must close both
+    ways: with an older consumer still queued (ASR not ready — the audio
+    is dropped but the state is not the pause's to clear), and with no
+    consumer ever coming (a stop already begun — both enqueues refuse, so
+    the pause clears the state itself rather than leaking it across the
+    pause→resume boundary)."""
+    app, writer, main = _make_adoption_app(tmp_path)
+    gen = app._session_generation
+
+    def dirty():
+        app._interim_pending = "Да, "
+        app._interim_committed_tail = "хвост"
+        app._interim_active = True
+
+    # ASR not ready, buffer audio present, an older vad_flush queued: the
+    # audio is dropped as before, but the state stays the older
+    # consumer's and the marker lands behind it.
+    app._vad = _FakeInterimVAD(4.0)
+    app._asr_ready = False
+    with app._session_boundary_lock:
+        app._enqueue_asr("vad_flush", "audio-old")
+    dirty()
+    app._run_asr = lambda audio, kind, **kw: (None, 0)
+
+    app.pause()
+
+    assert app._vad._samples == []            # the buffer went with it
+    assert app._interim_active is True        # the state did not
+    assert app._asr_queue.qsize() == 2        # older item + marker
+    _item = _drain_vad_flush_like_the_asr_loop(app)
+    marker = _drain_vad_flush_like_the_asr_loop(app)
+    assert marker[1] is None
+    assert app._interim_active is False       # the consumer-side reset ran
+
+    # A stop already begun: both enqueues refuse before registering, no
+    # consumer will ever run — the pause resets inline (stop() carries
+    # its own reset too; this is the bounded last resort).
+    app._asr_ready = True
+    app._vad = _FakeInterimVAD(4.0)
+    app._stop_event.set()
+    dirty()
+    app.pause()
+    assert app._interim_active is False
+    assert app._interim_pending == ""
+    assert app._asr_queue.empty()
+    app._stop_event.clear()

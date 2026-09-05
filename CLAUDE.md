@@ -516,7 +516,21 @@ linearized lifecycle inside one lock/Condition —
    runs — bounded, logged, and stragglers fail the generation guards; the
    abort path (`_run_session_end` raised) resets after `supersede()`. So
    the state is never cleared under a live consumer, never leaked into
-   the next session, and the seal/IDLE only happen after it.
+   the next session, and the seal/IDLE only happen after it. `pause()`
+   follows the same ownership with a **queue-ordered cleanup marker**
+   instead of a wait (it runs on the Qt thread): its whole
+   flush→enqueue→reset decision runs under the boundary fence, and when
+   no audio of its own reached the queue (`_enqueue_asr` now returns
+   whether it did) it enqueues a `("vad_flush", None, …)` marker whose
+   handler skips recognition (`segment is None`) but whose `finally`
+   performs the one reset. The ASR loop is a single-consumer FIFO, so the
+   marker runs strictly after every pre-pause item (queued *or* in
+   flight, including an interim pass still writing state) and before
+   anything enqueued after the resume — "the pre-pause remainder finishes,
+   the next utterance starts clean" holds by ordering, not by resetting
+   early under a consumer. Only when the marker itself is refused (stop
+   begun, a closing generation, the queue rejecting even after dropping a
+   victim) does pause reset inline — the bounded last resort.
 2. **translation work** — `register_msg` when recognition produces a
    message (before the job is submitted), keyed to the *segment's*
    generation; released by the `finally` in `_translate_async` (which

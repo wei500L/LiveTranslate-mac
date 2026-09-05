@@ -2994,18 +2994,56 @@ class LiveTranslateApp:
         # the middle of a sentence produced one line spliced across the gap —
         # however long the gap was. flush()/force_flush() clear the buffer
         # either way, so the next utterance starts clean.
-        with self._vad_lock:
-            remaining = (
-                self._vad.force_flush() if self._interim_active else self._vad.flush()
-            )
-        if remaining is not None and self._asr_ready:
-            # Queued for the ASR thread rather than transcribed here: this runs
-            # on the Qt thread. Its vad_flush handler resets the interim state.
-            # The boundary lock is the producer fence _enqueue_asr expects.
-            with self._session_boundary_lock:
-                self._enqueue_asr("vad_flush", remaining)
-        else:
-            self._reset_interim_state()
+        #
+        # The whole flush→enqueue→reset decision runs under the session
+        # boundary lock (the producer fence), so it is linearized against the
+        # capture thread's "gate check → VAD → enqueue" section: whether an
+        # earlier vad_flush is already queued has one answer. Only short
+        # local work happens here (a VAD flush, non-blocking puts, counter
+        # sets) — the Qt thread never waits on the ASR queue or the tracker.
+        with self._session_boundary_lock:
+            with self._vad_lock:
+                remaining = (
+                    self._vad.force_flush() if self._interim_active else self._vad.flush()
+                )
+            enqueued = False
+            if remaining is not None and self._asr_ready:
+                # Queued for the ASR thread rather than transcribed here:
+                # this runs on the Qt thread. Its vad_flush handler resets
+                # the interim state.
+                enqueued = self._enqueue_asr("vad_flush", remaining)
+            if not enqueued:
+                # No audio of *this* pause reached the queue — nothing
+                # remaining, ASR not ready, or the queue refused the item.
+                # That still proves nothing about vad_flush items enqueued
+                # *earlier* (a natural split, a silence-feed flush, an
+                # earlier hand-off) that the ASR loop has not consumed:
+                # their consumers read ``_interim_pending`` (the buffered
+                # fragments' only remaining copy), the echo tail and the
+                # dispatch flag, and resetting here would clear
+                # ``_interim_active`` under them, routing them down the
+                # plain ``_process_segment`` branch and losing the
+                # fragments. Enqueue a no-audio cleanup marker instead:
+                # the ASR loop is a single-consumer FIFO, so the marker is
+                # processed only after every item enqueued before it
+                # finished (handler *and* finally), and its vad_flush
+                # finally performs the one reset — strictly before
+                # anything enqueued after the pause, so post-resume
+                # speech starts from a clean slate.
+                enqueued = self._enqueue_asr("vad_flush", None)
+            if not enqueued:
+                # The marker was refused too (a stop already begun, a
+                # closing generation, or the queue rejecting even after
+                # dropping one victim): no consumer will ever run, so the
+                # state is this thread's to clear now. stop() and the
+                # ENDING queue-drain phase carry their own reset; this is
+                # the bounded last resort against leaking a dirty state
+                # across the pause.
+                log.warning(
+                    "Pause: interim-state cleanup marker could not be "
+                    "enqueued; resetting inline"
+                )
+                self._reset_interim_state()
         if self._overlay:
             self._overlay.update_monitor(0.0, 0.0)
         log.info("Pipeline paused")
@@ -3861,7 +3899,7 @@ class LiveTranslateApp:
 
                 self._enqueue_asr("vad_flush", speech_segment)
 
-    def _enqueue_asr(self, seg_type: str, segment):
+    def _enqueue_asr(self, seg_type: str, segment) -> bool:
         """Queue a segment for the ASR thread, dropping the oldest on overflow.
 
         Never raises: this runs on the capture thread, which has no outer
@@ -3881,16 +3919,25 @@ class LiveTranslateApp:
         ASR result can be identity-checked at write time: a session that
         ended (and possibly re-opened as a new one) between enqueue and
         recognition can never receive the old audio's entries.
+
+        Returns True only when the item actually reached the queue, so a
+        consumer is guaranteed to run its handler (and the vad_flush
+        handler's interim-state reset). False on every refusal: a stop
+        already begun, a closing/superseded generation, or the queue still
+        full after dropping one victim. pause() uses this to decide
+        between the consumer-side reset (its cleanup marker) and its own
+        last-resort reset; the capture-loop callers ignore it — a dropped
+        capture segment is only ever audio.
         """
         if self._stop_event.is_set():
-            return
+            return False
         generation, expected_session = self._session_snapshot()
         decision = self._session_work.admit(generation)
         if decision == "drop":
             # Unreachable under the producer fence (the gate precedes any
             # CLOSING enqueue); kept as a defensive guard for stray callers.
             log.debug("Dropping %s segment for a closing/closed session", seg_type)
-            return
+            return False
         # Both the session-tracked item ("register") and the subtitle-only
         # one ("pass" — no session exists yet) carry a work count: a legacy
         # auto-open session adopted moments later reuses this same
@@ -3903,12 +3950,12 @@ class LiveTranslateApp:
         work_id = self._next_session_work_id()
         if not self._session_work.register(generation, work_id, seg_type):
             if decision == "register":
-                return
+                return False
             work_id = None
         item = (seg_type, segment, work_id, generation, expected_session)
         try:
             self._asr_queue.put_nowait(item)
-            return
+            return True
         except queue.Full:
             pass
         try:
@@ -3924,9 +3971,11 @@ class LiveTranslateApp:
             self._release_queued_work(dropped)
         try:
             self._asr_queue.put_nowait(item)
+            return True
         except queue.Full:
             log.warning("ASR queue still full after drop, skipping segment")
             self._release_queued_work(item)
+            return False
 
     def _release_queued_work(self, item) -> None:
         """Release the work count of a queue item that will never be
@@ -3984,7 +4033,16 @@ class LiveTranslateApp:
             try:
                 if seg_type == "vad_flush":
                     try:
-                        if self._interim_active:
+                        if segment is None:
+                            # pause()'s cleanup marker: no audio to
+                            # recognize. The item exists so that this
+                            # ``finally`` runs in queue order — after every
+                            # older item (the loop is a single-consumer
+                            # FIFO) finished reading the interim state,
+                            # and before anything enqueued after the pause
+                            # — and performs the one reset.
+                            pass
+                        elif self._interim_active:
                             self._process_interim_final(
                                 segment, work_id, work_generation, expected_session
                             )
