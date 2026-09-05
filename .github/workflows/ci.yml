@@ -1,0 +1,52 @@
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches:
+      - main
+
+jobs:
+  test-macos-arm64:
+    name: macOS arm64 tests
+    runs-on: macos-14
+    timeout-minutes: 45
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+      - name: Install portaudio
+        # PyAudio ships no macOS wheels; the sdist build needs the portaudio
+        # headers. Idempotent when the runner image already provides them.
+        run: brew install portaudio
+      - name: Install test dependencies
+        # The release.yml recipe covers collection-time imports only; the
+        # packages below additionally unskip the full suite so a PR sees the
+        # same 466 passed / 4 skipped as a complete local environment:
+        # main.py imports torch before PyQt6 at module level, and the tests
+        # importorskip silero-vad, openai, httpx, pyaudio and pyobjc.
+        # fastapi is deliberately absent — its asr_server test skips in a
+        # full local run too (that is 1 of the 4 expected skips; the other 3
+        # skip because a project .venv does not exist in CI).
+        run: |
+          python -m pip install --disable-pip-version-check \
+            "numpy>=1.24,<2.3" \
+            pytest \
+            "yasbd-lib>=0.15,<1.0" \
+            "PyYAML>=6.0" \
+            "PyQt6>=6.5.0,<7" \
+            "torch==2.8.0" \
+            "torchaudio==2.8.0" \
+            "silero-vad>=5.0,<7" \
+            "soundfile>=0.12" \
+            "openai>=1.0.0" \
+            "httpx>=0.28.0,<1.0" \
+            "psutil>=5.9.0" \
+            "PyAudio>=0.2.14" \
+            "pyobjc-core>=9.2" \
+            "pyobjc-framework-Cocoa>=9.2"
+      - name: Run tests
+        run: python -m pytest -q
