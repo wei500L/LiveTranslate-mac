@@ -177,7 +177,15 @@ class MeetingRecordsPage(QWidget):
         directly. Going through here means the page refreshes its active-row
         marking immediately when the writer arrives, instead of waiting for
         the next tab visit.
+
+        Idempotent: re-injecting the *same* writer (every records-tab visit
+        re-forwards the panel's writer through ``_refresh_transcripts``)
+        neither reassigns the field nor schedules a deferred refresh — the
+        caller's own synchronous refresh is the single entry point then, so
+        tab entry produces exactly one full refresh.
         """
+        if writer is self._writer:
+            return
         self._writer = writer
         self._defer_refresh()
 
@@ -188,30 +196,100 @@ class MeetingRecordsPage(QWidget):
     def on_session_state_changed(self, state: str, session_id=None):
         """App-level session state push (SessionState constants).
 
-        ACTIVE/PAUSED mark the still-growing row and gate AI minutes;
-        ENDING marks the closing row by its stamp (only that row — the
-        badge and action permissions are per-record); IDLE after an end
-        refreshes the list and selects the just-finished meeting so the
-        user can summarize it, with a note that listening stopped (model
-        still loaded).
+        IDLE always runs one full refresh: a seal just wrote the final
+        sidecar, counts and summary state, and the just-ended meeting is
+        selected so the user can summarize it, with a note that listening
+        stopped (model still loaded). Every other push — the pipeline's
+        ACTIVE↔PAUSED toggles and the ENDING flip — is applied **in memory**
+        when the target session is already a cached live row
+        (``_apply_lightweight_state_update``): rows and the detail pane are
+        re-rendered from the cached snapshot with zero records-layer reads,
+        so a pause/resume/end no longer re-scans every historical meeting.
+        Anything the cache cannot represent (a new meeting's first ACTIVE,
+        an unresolvable identity, an inconsistent transition) falls back to
+        one full refresh rather than guessing the record's state.
         """
         self._session_state = state
         if state == "ending":
             self._ending_session_id = session_id
         elif state == "idle":
             self._ending_session_id = None
-        if state == "idle" and session_id:
-            # A meeting just completed: refresh onto it, and tell the user
-            # the app stopped listening (the model stays loaded) so the
-            # paused pipeline is not mistaken for a bug.
+        if state == "idle":
+            # A meeting just completed (or the app stopped): refresh onto it.
             self.refresh(select_session=session_id)
-            if hasattr(self, "_status_label"):
+            if session_id and hasattr(self, "_status_label"):
                 self._status_label.setText(t("session_end_paused_hint"))
-        else:
+        elif not self._apply_lightweight_state_update(state, session_id):
             self.refresh()
         # Action availability depends on the selected record's role; the
         # refresh above may have changed the selection.
         self._update_action_availability()
+
+    def _apply_lightweight_state_update(self, state: str, session_id) -> bool:
+        """Apply a lifecycle push to the cached records without touching disk.
+
+        Eligible pushes — the target session must already be a cached *live*
+        row (``is_active``, not ``is_ending``):
+
+        * ``active``/``paused`` — the pipeline's pause/resume toggles. The
+          record stays the live session (a paused meeting is still open, so
+          ``is_active`` is unchanged); only the app-level state and with it
+          the row badge and the detail state text change. Production pushes
+          of these two states carry no session id, so the identity is
+          resolved from the writer's ``active_session()`` — an in-memory,
+          lock-held query, never a guess from the cached rows.
+        * ``ending`` — the record flips to ``is_ending`` (``is_active``
+          False). ``interrupted`` must NOT become true: a close in flight is
+          not a crash-left record.
+
+        Returns True when the push was applied in memory. False means the
+        caller should run one full refresh: the state is not
+        lightweight-eligible, the identity is missing and unresolvable, the
+        session is not in the cache (a new meeting's first ACTIVE), or the
+        cached flags contradict the transition — the cache is then
+        unreliable and re-reading beats guessing. Disk-derived fields
+        (``summary_stale``, ``summary_edited``, ``ended_cleanly``,
+        ``has_summary``) are never written here.
+
+        The re-render reuses the existing rebuild and detail-sync methods:
+        ``_refill_list`` rebuilds rows from the *same* ``_sessions``
+        snapshot (no ``list_sessions``, no summary/meta/record reads, no
+        ``source_hash``) and preserves the selection by identity, so a
+        running SummaryWorker is never cancelled; the detail pane of the
+        target row (when selected) is re-synced state-only — its minutes
+        are not re-read.
+        """
+        if state not in ("active", "paused", "ending"):
+            return False
+        if session_id is None:
+            if state == "ending" or self._writer is None:
+                return False
+            try:
+                session_id = self._writer.active_session()
+            except Exception:
+                log.debug("Could not resolve writer session", exc_info=True)
+                return False
+        record = self._record_for_session(session_id)
+        if record is None:
+            return False
+        if state == "ending":
+            if not record.get("is_active") or record.get("is_ending"):
+                return False
+            record["is_active"] = False
+            record["is_ending"] = True
+        else:
+            # Pause/resume: the record must be the live session already; a
+            # push for a closed/ending row contradicts the cache.
+            if not record.get("is_active") or record.get("is_ending"):
+                return False
+        # A live or closing row is never "interrupted" (the crash-left
+        # classification belongs to closed records only).
+        record["interrupted"] = False
+        self._refill_list(sync_detail=False)
+        current = self._current_record()
+        if current is not None and current.get("session") == session_id:
+            self._refresh_detail_for_record(current, reload_minutes=False)
+        return True
 
     def _defer_refresh(self):
         """Refresh via the page-owned one-shot timer (see __init__)."""
@@ -601,6 +679,15 @@ class MeetingRecordsPage(QWidget):
     # --- session list ------------------------------------------------------
 
     def refresh(self, select_session: str | None = None):
+        """Run one full refresh from disk.
+
+        A direct call supersedes any still-pending deferred refresh (the
+        0ms timer's data would be identical to what this call just read —
+        re-reading the directory would be pure double work): the timer is
+        stopped, and this synchronous pass is the single refresh that
+        lands.
+        """
+        self._deferred_refresh_timer.stop()
         # Migration (id stamping, legacy index→id) may change the settings
         # dict; persist it so the ids survive a crash before the next
         # arbitrary panel auto-save.
@@ -741,7 +828,8 @@ class MeetingRecordsPage(QWidget):
         """
         self._refill_list(sync_detail=False)
 
-    def _refresh_detail_for_record(self, record: dict):
+    def _refresh_detail_for_record(self, record: dict,
+                                   reload_minutes: bool = True):
         """Re-sync the detail pane's *data* to a fresh record, in place.
 
         The complement to the suppressed re-select in ``_refill_list``:
@@ -758,6 +846,12 @@ class MeetingRecordsPage(QWidget):
           success path reloads the minutes itself;
         * the current tab — a refresh must not yank the user to another
           view.
+
+        ``reload_minutes=False`` (a lightweight lifecycle push) skips the
+        minutes re-read as well: the record's summary state did not
+        change, so re-reading the pair from disk would cost I/O for data
+        the pane already shows. The title, meta line and info tab carry the
+        live-state badge text, so they are still re-synced.
         """
         self._title_label.setText(records.session_title(record, self._dir))
         self._meta_label.setText(self._meta_line(record))
@@ -767,7 +861,7 @@ class MeetingRecordsPage(QWidget):
             and self._worker.isRunning()
             and self._worker_session == record.get("session")
         )
-        if not generating:
+        if reload_minutes and not generating:
             self._load_minutes(record)
         self._update_action_availability()
 

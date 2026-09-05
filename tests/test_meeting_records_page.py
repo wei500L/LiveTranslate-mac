@@ -288,7 +288,7 @@ class _FakeWriter:
         return True
 
 
-def test_ending_marks_only_its_own_row_and_gates_actions(page):
+def test_ending_marks_only_its_own_row_and_gates_actions(page, monkeypatch):
     """A global ENDING paints exactly one row (the closing session's); the
     end button, AI minutes and delete all key on the record's own
     identity, never on the global state alone."""
@@ -296,9 +296,18 @@ def test_ending_marks_only_its_own_row_and_gates_actions(page):
     closing = page._list.item(0).record["session"]
     other = page._list.item(1).record["session"]
 
-    page.set_transcript_writer(_FakeWriter(active=None, ending=closing))
+    # The closing meeting was a cached live row: the ENDING push takes the
+    # lightweight in-memory path (no disk scan) and flips its flags there.
+    listing = []
+    monkeypatch.setattr(
+        records, "list_sessions",
+        lambda *a, **k: listing.append(a) or [],
+    )
+    page.set_transcript_writer(_FakeWriter(active=closing))
+    page._record_for_session(closing)["is_active"] = True
     page._ending_session_id = closing
     page.on_session_state_changed("ending", closing)
+    assert listing == []
 
     # Row identity: only the closing row is ending.
     by_stamp = {r["session"]: r for r in page._sessions}
@@ -666,16 +675,20 @@ def test_export_refused_while_session_is_ending(page, monkeypatch):
     an export mid-close could read as complete while missing the last
     utterance — refuse until the close lands."""
     stamp, shown = _loaded_summary_page(page, monkeypatch)
-    page.set_transcript_writer(_FakeWriter(active=None, ending=stamp))
-    page._ending_session_id = stamp
-    page._session_state = "ending"
+    # The closing meeting's cached row is live: the push flips it in memory.
+    page.set_transcript_writer(_FakeWriter(active=stamp))
+    page._record_for_session(stamp)["is_active"] = True
+    page.on_session_state_changed("ending", stamp)
+    shown.clear()
 
     page._export("pdf_summary")
     assert shown, "the ending refusal must be shown"
     # An active record still exports (flagged as a snapshot elsewhere).
     page.set_transcript_writer(_FakeWriter(active=stamp, ending=None))
-    page._session_state = "active"
     page._ending_session_id = None
+    page._session_state = "active"
+    page._record_for_session(stamp)["is_ending"] = False
+    page._record_for_session(stamp)["is_active"] = True
     shown.clear()
     # QFileDialog.getSaveFileName is monkeypatched to cancel: the point is
     # that the *guard* let the call through to the file dialog.
@@ -837,12 +850,14 @@ def test_export_button_disabled_in_ui_while_record_is_ending(page):
     enabled."""
     page._list.setCurrentRow(0)
     stamp = page._list.item(0).record["session"]
-    page.set_transcript_writer(_FakeWriter(active=None, ending=stamp))
-    page._ending_session_id = stamp
+    # The live row that the ENDING push flips in memory.
+    page.set_transcript_writer(_FakeWriter(active=stamp))
+    page._record_for_session(stamp)["is_active"] = True
     page.on_session_state_changed("ending", stamp)
     assert page._export_btn.isEnabled() is False
 
     page.set_transcript_writer(_FakeWriter(active=None, ending=None))
+    page._record_for_session(stamp)["is_ending"] = False
     page._ending_session_id = None
     page.on_session_state_changed("idle")
     assert page._export_btn.isEnabled() is True
@@ -935,6 +950,238 @@ def test_refresh_selecting_a_target_loads_only_the_target(monkeypatch, page):
     # Exactly one load, and it is the target — the older meeting's detail
     # was never loaded on the way.
     assert detail_loads == [target]
+
+
+# --- refresh economics: writer injection and lightweight state pushes --------------
+
+
+def test_same_writer_reinjection_does_not_defer_refresh(page, monkeypatch):
+    """[per-1] Re-injecting the *same* writer (what every records-tab visit
+    forwards through _refresh_transcripts) must not schedule a deferred
+    refresh on top of the caller's synchronous one — tab entry would
+    otherwise refresh twice from identical data."""
+    scheduled = []
+    monkeypatch.setattr(page, "_defer_refresh", lambda: scheduled.append(1))
+    deferred_started = []
+    real_start = page._deferred_refresh_timer.start
+    monkeypatch.setattr(
+        page._deferred_refresh_timer, "start",
+        lambda *a: deferred_started.append(1) or real_start(),
+    )
+    page.set_transcript_writer(page._writer)  # same object
+    page.set_transcript_writer(page._writer)
+    assert scheduled == []
+    assert deferred_started == []
+
+
+def test_writer_change_refreshes_once(page, monkeypatch):
+    """[per-2] A genuinely different writer updates the field and defers
+    exactly one refresh; the synchronous refresh() that follows supersedes
+    the pending deferred one (the timer is stopped), so one effective full
+    refresh lands — not two."""
+    calls = []
+    real_refresh = page.refresh
+
+    def counting_refresh(*a, **k):
+        calls.append(a)
+        return real_refresh(*a, **k)
+
+    monkeypatch.setattr(page, "refresh", counting_refresh)
+    page._deferred_refresh_timer.start()  # pending deferred refresh
+    assert page._deferred_refresh_timer.isActive()
+    writer = _FakeWriter(active=page._list.item(0).record["session"])
+    page.set_transcript_writer(writer)  # change: defers
+    assert page._writer is writer
+    page.refresh()  # the caller's synchronous entry point
+    # The direct refresh superseded the pending timer: one effective call.
+    assert page._deferred_refresh_timer.isActive() is False
+    assert calls == [()]
+
+
+def test_tab_entry_calls_refresh_once(page, monkeypatch):
+    """[per-3] The tab-entry path (set_transcript_writer with an unchanged
+    writer, then the synchronous refresh — the two statements
+    _refresh_transcripts runs) results in exactly one refresh call: the
+    injection re-schedules nothing and the direct call supersedes any
+    pending deferred timer."""
+    calls = []
+    real_refresh = page.refresh
+
+    def counting_refresh(*a, **k):
+        calls.append(a)
+        return real_refresh(*a, **k)
+
+    monkeypatch.setattr(page, "refresh", counting_refresh)
+    # A pending deferred refresh from an earlier injection.
+    page._deferred_refresh_timer.start()
+    assert page._deferred_refresh_timer.isActive()
+    page.set_transcript_writer(page._writer)  # unchanged: schedules nothing
+    page.refresh()  # supersedes the pending timer
+    assert page._deferred_refresh_timer.isActive() is False
+    assert calls == [()]
+
+
+def _lightweight_recorder(page, monkeypatch):
+    """Patch records.list_sessions, records.load_summary and the page's
+    full-refresh path with recorders, so a test can tell a lightweight
+    in-memory update (no list_sessions, no summary/meta reads, no refresh
+    call) from a full refresh."""
+    full_refreshes = []
+    monkeypatch.setattr(page, "refresh", lambda *a, **k: full_refreshes.append(a))
+    listing = []
+    real_list = records.list_sessions
+    monkeypatch.setattr(
+        records, "list_sessions",
+        lambda *a, **k: listing.append(a) or real_list(*a, **k),
+    )
+    summary_reads = []
+    real_load = records.load_summary
+    monkeypatch.setattr(
+        records, "load_summary",
+        lambda *a, **k: summary_reads.append(a) or real_load(*a, **k),
+    )
+    return full_refreshes, listing, summary_reads
+
+
+def test_pause_resume_pushes_stay_in_memory(page, monkeypatch):
+    """[per-4] PAUSED and back to ACTIVE for the cached live row: no
+    records.list_sessions call, no full refresh, the badge source flags
+    (is_active) are unchanged and disk-derived flags are untouched."""
+    page._list.setCurrentRow(0)
+    stamp = page._list.item(0).record["session"]
+    page.set_transcript_writer(_FakeWriter(active=stamp))
+    page.refresh()
+    before = dict(page._record_for_session(stamp))
+
+    full_refreshes, listing, summary_reads = _lightweight_recorder(page, monkeypatch)
+    page.on_session_state_changed("paused")
+    page.on_session_state_changed("active")
+    assert listing == []
+    assert full_refreshes == []
+    assert summary_reads == []
+
+    after = page._record_for_session(stamp)
+    for key in ("summary_stale", "summary_edited", "has_summary",
+                "ended_cleanly", "interrupted", "is_active", "is_ending"):
+        assert after[key] == before[key], key
+
+
+def test_ending_push_stays_in_memory_and_marks_only_target(page, monkeypatch):
+    """[per-5] ACTIVE→ENDING: no disk scan, no full refresh; only the target
+    record flips to is_ending (is_active False, interrupted stays False);
+    every other row keeps its flags."""
+    page._list.setCurrentRow(0)
+    target = page._list.item(0).record["session"]
+    other = page._list.item(1).record["session"]
+    page.set_transcript_writer(_FakeWriter(active=target))
+    page.refresh()
+
+    full_refreshes, listing, summary_reads = _lightweight_recorder(page, monkeypatch)
+    page.on_session_state_changed("ending", target)
+    assert listing == []
+    assert full_refreshes == []
+    assert summary_reads == []
+
+    by_stamp = {r["session"]: r for r in page._sessions}
+    assert by_stamp[target]["is_ending"] is True
+    assert by_stamp[target]["is_active"] is False
+    assert by_stamp[target]["interrupted"] is False
+    assert by_stamp[other]["is_ending"] is False
+    assert by_stamp[other]["is_active"] is False
+
+
+def test_new_active_session_falls_back_to_full_refresh(page, monkeypatch):
+    """[per-6] A first ACTIVE for a session the cache has never seen (the
+    new meeting is not in the list yet): one full refresh re-reads it from
+    disk rather than guessing an identity."""
+    full_refreshes, _listing, _reads = _lightweight_recorder(page, monkeypatch)
+    page.on_session_state_changed("active", "20261231_235959")
+    assert full_refreshes == [()]
+
+
+def test_idle_after_end_runs_full_refresh_and_selects_target(page, monkeypatch):
+    """[per-7] IDLE carrying the just-ended session: one full refresh with
+    select_session (the seal wrote new counts/status on disk), landing the
+    selection on the ended meeting. An IDLE with no identity (the app-quit
+    path) is also a full refresh: the records layer must re-read whatever
+    the close wrote."""
+    page._list.setCurrentRow(1)  # a different row is selected
+    ended = page._list.item(0).record["session"]
+    full_refreshes = []
+    monkeypatch.setattr(
+        page, "refresh",
+        lambda select_session=None: full_refreshes.append(select_session),
+    )
+    page.on_session_state_changed("idle", ended)
+    assert full_refreshes == [ended]
+    # The status hint is shown for the just-ended meeting.
+    assert page._status_label.text()
+    # IDLE without an identity (app stop): one plain full refresh.
+    page.on_session_state_changed("idle")
+    assert full_refreshes == [ended, None]
+
+
+def test_lightweight_push_does_not_cancel_running_worker(page, monkeypatch):
+    """[per-8] A pause (or resume/ending) push during a running generation
+    must not cancel the worker: _refill_list preserves the selection by
+    identity, and the push path never reaches _load_session's cancel
+    branch."""
+    page._list.setCurrentRow(0)
+    stamp = page._list.item(0).record["session"]
+    page.set_transcript_writer(_FakeWriter(active=stamp))
+    page.refresh()
+
+    class _RunningWorker:
+        session = stamp
+        generation = 1
+        cancelled = False
+
+        def cancel(self):
+            self.cancelled = True
+
+        @staticmethod
+        def isRunning():
+            return True
+
+    worker = _RunningWorker()
+    page._worker = worker
+    page._worker_session = stamp
+    try:
+        page.on_session_state_changed("paused")
+        page.on_session_state_changed("active")
+        page.on_session_state_changed("ending", stamp)
+        assert worker.cancelled is False
+        assert page._worker is worker  # ownership untouched
+    finally:
+        page._worker = None
+        page._worker_session = None
+
+
+def test_lightweight_push_preserves_stale_and_edited_badges(page, monkeypatch):
+    """[per-9] The stale/edited (and ready) flags are disk-derived state:
+    a lightweight pause/ending push must carry them through the list
+    rebuild unchanged — rows and badges re-render, the data does not."""
+    page._list.setCurrentRow(0)
+    stamp = page._list.item(0).record["session"]
+    page.set_transcript_writer(_FakeWriter(active=stamp))
+    page.refresh()
+    # A stale summary (hash mismatch) on the live meeting's record.
+    records.save_summary(page._dir, stamp, "# old", {"source_hash": "bogus"})
+    page.refresh()
+    live = page._record_for_session(stamp)
+    assert live["summary_stale"] is True
+
+    full_refreshes, listing, summary_reads = _lightweight_recorder(page, monkeypatch)
+    page.on_session_state_changed("paused")
+    page.on_session_state_changed("active")
+    page.on_session_state_changed("ending", stamp)
+    assert listing == [] and full_refreshes == []
+    assert summary_reads == []
+
+    after = page._record_for_session(stamp)
+    assert after["summary_stale"] is True
+    assert after["summary_edited"] == live["summary_edited"]
+    assert after["has_summary"] == live["has_summary"]
 
 
 # --- app-level end entry (identity through the confirmation dialog) ---------------

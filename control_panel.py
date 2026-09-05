@@ -1391,11 +1391,15 @@ class ControlPanel(QWidget):
         _save_settings(self._current_settings)
 
     def _refresh_transcripts(self):
-        if hasattr(self, "_records_page"):
-            # Pick up a writer registered after panel construction through
-            # the injection API (also refreshes the page's active-row state).
-            self._records_page.set_transcript_writer(self._transcript_writer)
-            self._records_page.refresh()
+        if not hasattr(self, "_records_page"):
+            return
+        # Pick up a writer registered after panel construction through the
+        # injection API (also refreshes the page's active-row state).
+        # set_transcript_writer is idempotent for an unchanged writer, and
+        # the direct refresh() below supersedes any deferred refresh it
+        # might have scheduled — one tab entry, exactly one full refresh.
+        self._records_page.set_transcript_writer(self._transcript_writer)
+        self._records_page.refresh()
 
     def _notify_records_models_changed(self):
         """Model list changed elsewhere in the panel: update summary provider

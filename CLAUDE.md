@@ -307,7 +307,23 @@ meeting_records_page.py  The records-center page (ControlPanel "Meeting Records"
                          `on_session_state_changed(state, session_id)`
                          (from LiveTranslateApp's bridge); the page never
                          derives it, and AI minutes are refused while
-                         ACTIVE/PAUSED/ENDING. `end_recording_requested` is a
+                         ACTIVE/PAUSED/ENDING. IDLE pushes always run one
+                         full refresh (the seal just wrote final counts and
+                         status) with `select_session`; every other push —
+                         the pipeline's ACTIVE↔PAUSED toggles and the ENDING
+                         flip — is applied *in memory* when the target
+                         session is already a cached live row
+                         (`_apply_lightweight_state_update`: flags updated
+                         by exact session id, rows rebuilt from the same
+                         snapshot, zero records-layer reads), falling back
+                         to one full refresh whenever the identity is
+                         missing/unresolvable, the session is not cached, or
+                         the cached flags contradict the transition —
+                         re-reading beats guessing. Disk-derived record
+                         fields (`summary_stale`, `summary_edited`,
+                         `ended_cleanly`, `has_summary`) are never written
+                         by the lightweight path, and an ENDING row is
+                         never marked `interrupted`. `end_recording_requested` is a
                          request-only signal carrying the target session id —
                          the app's `end_recording_session(expected_session)`
                          is the single implementation, and the expected id is
@@ -372,7 +388,12 @@ meeting_records_page.py  The records-center page (ControlPanel "Meeting Records"
                          directly — the previous selection's detail is never
                          synced on the way to a different target.
                          Dependency injection is public API:
-                         `set_transcript_writer(writer)` /
+                         `set_transcript_writer(writer)` (idempotent: a
+                         re-injection of the same writer schedules nothing —
+                         every records-tab visit re-forwards the panel's
+                         writer, and `refresh()` supersedes any pending
+                         deferred refresh, so one tab entry is exactly one
+                         full refresh) /
                          `set_summary_registry(registry)`. Page-owned
                          single-shot QTimers (`_layout_settle_timer`,
                          `_deferred_refresh_timer`) replace bare
