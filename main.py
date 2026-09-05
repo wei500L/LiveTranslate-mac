@@ -505,7 +505,8 @@ class _SessionWorkTracker:
 
     # --- waiting ----------------------------------------------------------
 
-    def wait_idle(self, generation: int, timeout: float) -> bool:
+    def wait_idle(self, generation: int, timeout: float,
+                  queue_only: bool = False) -> bool:
         """Block until the generation has no pending work, or the timeout
         passes. Runs on the ENDING background thread only, never the Qt
         thread. Returns True when idle, False on timeout.
@@ -515,6 +516,16 @@ class _SessionWorkTracker:
         capture thread raced the end request). The end thread always calls
         start_closing before wait_idle; a caller that does not gets the
         old, racy semantics.
+
+        ``queue_only`` waits for queue-item work only, ignoring translation
+        work — the ENDING thread's interim-state phase: the interim state
+        may be reset only after every queued ASR item of the generation
+        finished (any of them can be a vad_flush that reads
+        ``_interim_active`` / ``_interim_pending`` / the echo tail), but
+        the end must not first wait out the network-bound translations.
+        Callers that run both phases pass
+        ``timeout=deadline - time.monotonic()`` from one shared monotonic
+        deadline, so the two waits can never sum to two full budgets.
         """
         deadline = time.monotonic() + timeout
         with self._cond:
@@ -522,9 +533,13 @@ class _SessionWorkTracker:
                 if self._gen_state.get(generation) == self.SUPERSEDED:
                     return True
                 gen_work = self._pending.get(generation)
-                gen_msgs = self._msgs.get(generation)
-                if not gen_work and not gen_msgs:
-                    return True
+                if queue_only:
+                    if not gen_work:
+                        return True
+                else:
+                    gen_msgs = self._msgs.get(generation)
+                    if not gen_work and not gen_msgs:
+                        return True
                 remaining = deadline - time.monotonic()
                 if remaining <= 0:
                     return False
@@ -1089,6 +1104,12 @@ class LiveTranslateApp:
                 # _run_session_end's supersede never ran; retire the
                 # generation here so the tracker drops its CLOSING entry.
                 self._session_work.supersede(generation)
+                # Its interim-state reset never ran either (the failure can
+                # precede the queue-drain phase): clear it here rather than
+                # leaking a dirty state into the next session. Stragglers
+                # still queued for this generation find it superseded and
+                # are dropped by the identity guards at write time.
+                self._reset_interim_state()
             # IDLE may only be announced once the writer verifiably holds
             # nothing of the session: a state machine claiming "done" over
             # live handles is a lie that strands the meeting's files open.
@@ -1165,13 +1186,51 @@ class LiveTranslateApp:
             # 2) Flush the last VAD buffer into the ASR queue through the
             #    controlled final-registration entry (the only new work
             #    allowed while CLOSING), registered before it is enqueued.
+            #    The flush itself never resets the interim state — not even
+            #    when it has nothing to enqueue; see its docstring for the
+            #    ownership rule and step 3 for the one reset point.
             self._flush_for_session_end(generation)
 
-            # 3) Wait for this session's in-flight work to reach zero — and,
-            #    because the generation is CLOSING, for it to *stay* zero:
-            #    no ordinary registration can land after this returns.
+            # 3) Two waits over ONE budget: the 30s ENDING cap is shared,
+            #    not doubled. Phase A waits for this generation's *queue*
+            #    work only — the ASR items that read or update the interim
+            #    state: a vad_flush queued before the end (a pause
+            #    hand-off, a natural VAD flush, a silence-feed flush that
+            #    raced the end gate) as much as the final segment just
+            #    enqueued. The interim state may only be reset once every
+            #    such consumer returned; the end must not first wait out
+            #    the network-bound translations, which is why phase B is
+            #    separate. Both waits derive their timeout from the same
+            #    monotonic deadline.
+            deadline = time.monotonic() + SessionState.ENDING_TIMEOUT_S
+            queue_idle = self._session_work.wait_idle(
+                generation, deadline - time.monotonic(), queue_only=True,
+            )
+            # The interim state is the end thread's again exactly here:
+            # every queued consumer of this generation returned (the
+            # vad_flush handler's finally already reset on the normal
+            # path, making this a no-op), or the deadline forced the close
+            # and any straggler fails the generation guards below. One
+            # reset point, after the consumers and before the seal — that
+            # ordering keeps the state neither cleared under a live
+            # consumer (the buffered-fragments / echo-tail loss a
+            # producer-side reset caused) nor leaked into the next
+            # session.
+            self._reset_interim_state()
+            if not queue_idle:
+                log.warning(
+                    "Session end: ASR queue work still in flight at the "
+                    "deadline; interim state reset with a consumer "
+                    "possibly running (stragglers fail the generation "
+                    "guards)"
+                )
+
+            # 4) Phase B: wait for the translations this session's
+            #    recognition produced — and, because the generation is
+            #    CLOSING, for the work to *stay* zero: no ordinary
+            #    registration can land after this returns.
             idle = self._session_work.wait_idle(
-                generation, SessionState.ENDING_TIMEOUT_S
+                generation, deadline - time.monotonic(),
             )
             if not idle:
                 log.warning(
@@ -1183,12 +1242,12 @@ class LiveTranslateApp:
             if generation != self._session_generation:
                 return None
 
-            # 4) Close: entries that never got their translation are flushed
+            # 5) Close: entries that never got their translation are flushed
             #    as untranslated, the footer and final sidecar are written,
             #    the files close. After this the session is immutable: late
             #    results are dropped by the writer's session routing.
             summary = self._transcript.end_session()
-            # 5) The generation's session is over — every work unit that
+            # 6) The generation's session is over — every work unit that
             #    returns after this (a timed-out translation straggler) finds
             #    its generation superseded and is discarded, whatever its
             #    terminal path. Releasing an already-cleared generation is a
@@ -1225,29 +1284,41 @@ class LiveTranslateApp:
         ``_interim_pending`` (the buffered fragments whose audio was
         already trimmed away — this final write is their only remaining
         copy) and ``_interim_committed_tail`` (echo dedup against the
-        committed prefix). Only the paths that leave the audio unqueued
-        reset here — ASR not ready, nothing remaining, a superseded
-        generation, a stop already begun, or the queue rejecting the item
-        even after dropping one — because then no consumer will ever run
-        the handler's reset, and a dirty interim state left behind would
-        leak into the next session.
+        committed prefix).
+
+        This method therefore never resets the interim state — not even on
+        the paths that leave *this* flush's audio unqueued (ASR not ready,
+        nothing remaining, a superseded generation, a stop already begun,
+        or the queue rejecting the item). ``remaining is None`` only proves
+        that *this* flush produced no segment; it proves nothing about
+        vad_flush items enqueued *earlier* — a pause hand-off, a natural
+        VAD flush, a silence-feed flush that raced the end gate — that the
+        ASR loop has not consumed yet. Their consumers read and update the
+        same interim state, so an immediate reset here would clear
+        ``_interim_active`` under a still-queued vad_flush and route it
+        down the plain ``_process_segment`` branch, losing the buffered
+        fragments (their audio is gone) and disabling the echo dedup. The
+        one reset belongs to _run_session_end's queue-drain phase, which
+        runs it only after every queued item of the generation finished
+        (or the shared deadline forced the close, where stragglers fail
+        the generation guards).
         """
         if not self._asr_ready:
             with self._vad_lock:
                 self._vad._reset()
-            self._reset_interim_state()
             return
         with self._vad_lock:
             remaining = (
                 self._vad.force_flush() if self._interim_active else self._vad.flush()
             )
         if remaining is None:
-            self._reset_interim_state()
             return
-        if not self._enqueue_final_segment(generation, remaining):
-            # Nothing reached the queue: the interim state is this
-            # thread's to clear now (see the docstring).
-            self._reset_interim_state()
+        # An enqueue failure leaves this segment unconsumed (its buffered
+        # fragments are lost with it — _enqueue_final_segment logs the
+        # refusal), but the reset is still not this method's to run: an
+        # older queued vad_flush may own the interim state. The drain
+        # phase in _run_session_end owns the reset on every path.
+        self._enqueue_final_segment(generation, remaining)
 
     def _enqueue_final_segment(self, generation: int, segment) -> bool:
         """Enqueue the ENDING flush's segment with a final-registration.
@@ -1266,8 +1337,12 @@ class LiveTranslateApp:
         the ASR loop's vad_flush handler — and with it the interim-state
         reset the handler owns — is guaranteed to run. False on every
         refusal (a stop already begun, the generation superseded, or the
-        queue still full after dropping one victim); the caller then owns
-        the interim state and must reset it itself.
+        queue still full after dropping one victim): this segment will
+        never reach a consumer, but the interim state is still not the
+        caller's to reset on the spot — older queued vad_flush items may
+        own it. The reset is owned by _run_session_end's queue-drain
+        phase, which runs after the generation's queued consumers finished
+        (or the shared deadline forced the close).
         """
         if self._stop_event.is_set():
             return False

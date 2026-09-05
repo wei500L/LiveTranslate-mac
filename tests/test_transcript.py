@@ -1082,6 +1082,8 @@ class _AdoptionApp:
         self._session_work_seq = 0
         self._stop_event = _threading.Event()
         self._asr_queue = _queue.Queue()
+        # The ENDING gate _run_session_end raises around its flush.
+        self._session_end_gating = False
         self._overlay = None
         self._subwin = None
         self._panel = None
@@ -1145,6 +1147,7 @@ class _AdoptionApp:
     _process_interim_final = None
     _flush_for_session_end = None
     _enqueue_final_segment = None
+    _run_session_end = None
 
 
 def _make_adoption_app(tmp_path):
@@ -1162,7 +1165,7 @@ def _make_adoption_app(tmp_path):
             "_is_substantial_echo", "_buffer_interim_fragment",
             "_do_interim_asr", "_reset_interim_state",
             "_process_interim_final", "_flush_for_session_end",
-            "_enqueue_final_segment",
+            "_enqueue_final_segment", "_run_session_end",
         ):
             setattr(_AdoptionApp, name, getattr(real, name))
         # A staticmethod retrieved from the class is a plain function; store
@@ -1782,15 +1785,70 @@ def test_ending_flush_echo_tail_dedups_the_final_recognition(tmp_path):
     writer.end_session()
 
 
-def test_ending_flush_resets_immediately_when_nothing_reaches_the_queue(
+def test_ending_flush_returns_none_keeps_state_for_an_older_queued_vad_flush(
     tmp_path,
 ):
-    """[ENDING hand-off regression] Every path that leaves the final audio
-    unqueued must reset the interim state on the ENDING thread itself —
-    no consumer will ever run the loop's reset, and a dirty state
-    (buffered fragments, echo tail, dispatch flag) left behind would leak
-    into the next session: ASR not ready, nothing remaining, a superseded
-    generation, a stop already begun."""
+    """[ENDING ownership regression] ``remaining is None`` proves only that
+    *this* flush produced no segment — not that no earlier vad_flush (a
+    pause hand-off, a natural VAD flush that raced the end gate) is still
+    sitting in the ASR queue. That older item's consumer owns the interim
+    state exactly like the final segment's does. The old code reset on the
+    None path, so the still-queued consumer dispatched on a cleared
+    ``_interim_active``, took the plain ``_process_segment`` branch and
+    lost the buffered fragments (their audio was already trimmed away)
+    together with the echo dedup."""
+    app, writer, main = _make_adoption_app(tmp_path)
+    app._vad = _FakeInterimVAD(0.0)  # the ENDING flush finds nothing
+    stamp = app.begin_recording_session()
+    assert stamp is not None
+    gen = app._session_generation
+
+    # A vad_flush queued *before* the end (pause() hands off exactly like
+    # this), already counted under the session's generation.
+    with app._session_boundary_lock:
+        app._enqueue_asr("vad_flush", "audio-from-before-the-end")
+    assert app._session_work.pending_count(gen) == 1
+    app._interim_pending = "Да,"
+    app._interim_committed_tail = "предыдущая фраза"
+    app._interim_active = True
+    app._run_asr = lambda audio, kind, **kw: (
+        {"text": "Хвост фразы", "language": "ru"}, 60,
+    )
+
+    # The real ENDING order: CLOSING flips before the flush...
+    app._session_work.start_closing(gen)
+    app._flush_for_session_end(gen)
+
+    # ...and the None path must NOT reset: the queued consumer still owns
+    # the state (this is the pin — the old code reset right here).
+    assert app._interim_active is True
+    assert app._interim_pending == "Да,"
+    assert app._interim_committed_tail == "предыдущая фраза"
+
+    # The ASR loop consumes the older item with the state intact: the
+    # buffered fragment splices into the final recognition.
+    item = _drain_vad_flush_like_the_asr_loop(app)
+    assert item[3] == gen and item[4] == stamp
+    all_text = (tmp_path / f"livetrans_{stamp}_all.txt").read_text("utf-8")
+    assert "Да, Хвост фразы" in all_text
+
+    # The drain phase: with the count released the queue work is idle, and
+    # the ENDING thread's one reset runs — a no-op after the consumer's
+    # own finally, clean either way, never leaked into a next session.
+    assert app._session_work.wait_idle(gen, timeout=0.0, queue_only=True) is True
+    app._reset_interim_state()
+    assert app._interim_active is False
+    writer.end_session()
+
+
+def test_ending_flush_refusals_leave_the_reset_to_the_drain_phase(tmp_path):
+    """[ENDING ownership regression] Every path that leaves the flush's
+    *own* audio unqueued (ASR not ready, a superseded generation, a stop
+    already begun, the queue rejecting the item) used to reset the
+    interim state on the spot. But an older queued vad_flush owns that
+    state, so the flush must leave it alone on these paths too: the reset
+    is the ENDING flow's (the queue-drain phase; the stop and abort paths
+    carry their own), never the flush's."""
     app, writer, main = _make_adoption_app(tmp_path)
     gen = app._session_generation
 
@@ -1799,38 +1857,189 @@ def test_ending_flush_resets_immediately_when_nothing_reaches_the_queue(
         app._interim_committed_tail = "хвост"
         app._interim_active = True
 
-    def assert_clean():
-        assert app._interim_active is False
-        assert app._interim_pending == ""
-        assert app._interim_committed_tail == ""
-        assert app._asr_queue.empty()
+    # An older vad_flush is queued: whatever the flush does with its own
+    # audio, that item's consumer still owns the interim state.
+    with app._session_boundary_lock:
+        app._enqueue_asr("vad_flush", "audio-old")
 
-    # ASR not ready: the VAD buffer is dropped, the state reset here.
+    # ASR not ready: the VAD buffer is dropped, but the interim state
+    # stays the queued consumer's.
     app._vad = _FakeInterimVAD(4.0)
     app._asr_ready = False
     dirty()
     app._flush_for_session_end(gen)
-    assert_clean()
-    assert app._vad._samples == []  # the buffer went with it
-
-    # Nothing remaining: force_flush() had nothing to hand over.
-    app._asr_ready = True
-    app._vad = _FakeInterimVAD(0.0)
-    dirty()
-    app._flush_for_session_end(gen)
-    assert_clean()
+    assert app._vad._samples == []          # the buffer went with it
+    assert app._interim_active is True      # the state did not
 
     # A superseded generation (a quit raced the end): register_final
-    # refuses, the segment is dropped, the state is the caller's.
+    # refuses, the segment is dropped — the state still stands.
+    app._asr_ready = True
     app._vad = _FakeInterimVAD(4.0)
     dirty()
     app._flush_for_session_end(gen + 99)
-    assert_clean()
+    assert app._interim_active is True
 
-    # A stop already begun: the enqueue refuses before registering, and a
-    # fresh buffer must not reach the queue either.
+    # A stop already begun: the enqueue refuses before even registering.
     app._vad = _FakeInterimVAD(4.0)
     dirty()
     app._stop_event.set()
     app._flush_for_session_end(gen)
-    assert_clean()
+    assert app._interim_active is True
+    app._stop_event.clear()
+
+    # The drain phase owns the one reset: while the older item is queued
+    # the queue-only wait reports busy; once its consumer released, the
+    # ENDING flow's reset runs.
+    assert app._session_work.wait_idle(gen, timeout=0.0, queue_only=True) is False
+    item = app._asr_queue.get_nowait()
+    app._release_queued_work(item)
+    assert app._session_work.wait_idle(gen, timeout=0.0, queue_only=True) is True
+    app._reset_interim_state()
+    assert app._interim_active is False
+    assert app._interim_pending == ""
+
+
+def test_run_session_end_resets_when_no_queue_work_and_nothing_remains(
+    tmp_path,
+):
+    """[ENDING ownership regression] With no older queue work and no
+    remaining VAD buffer there is no consumer to hand the state to — the
+    drain phase owns the reset and must actually run it: a dirty state
+    (buffered fragments, echo tail, dispatch flag) must not leak into the
+    next session, and the seal still completes."""
+    app, writer, main = _make_adoption_app(tmp_path)
+    stamp = app.begin_recording_session()
+    assert stamp is not None
+    gen = app._session_generation
+    app._vad = _FakeInterimVAD(0.0)
+    app._interim_pending = "Да,"
+    app._interim_committed_tail = "хвост"
+    app._interim_active = True
+
+    # Nothing is queued and the flush finds nothing: the end runs to
+    # completion without blocking (the queue-only phase is instantly
+    # idle) and resets on the way to the seal.
+    summary = app._run_session_end(gen)
+
+    assert summary is not None
+    assert summary["session_status"] == "completed"
+    assert app._interim_active is False
+    assert app._interim_pending == ""
+    assert app._interim_committed_tail == ""
+    assert app._session_work.pending_count(gen) == 0
+
+
+def test_run_session_end_resets_after_queue_consumers_and_before_the_seal(
+    tmp_path,
+):
+    """[ENDING ownership regression] The one interim-state reset lives in
+    _run_session_end's queue-drain phase: after every queued consumer of
+    the generation returned (the tracker's queue counts — never
+    Queue.empty(), which an already-taken item empties too early), and
+    before end_session() and the IDLE broadcast that _work sends once
+    _run_session_end returns. The queue-only phase exists so the end does
+    not first burn the shared 30s budget on the network translations."""
+    app, writer, main = _make_adoption_app(tmp_path)
+    stamp = app.begin_recording_session()
+    assert stamp is not None
+    gen = app._session_generation
+
+    # The older vad_flush is queued and counted; the ENDING flush will
+    # find nothing (empty VAD buffer → the None path under repair).
+    app._vad = _FakeInterimVAD(0.0)
+    flush_ran = _threading.Event()
+    real_force_flush = app._vad.force_flush
+
+    def _force_flush_recording():
+        result = real_force_flush()
+        flush_ran.set()
+        return result
+
+    app._vad.force_flush = _force_flush_recording
+    with app._session_boundary_lock:
+        app._enqueue_asr("vad_flush", "audio-from-before-the-end")
+    app._interim_pending = "Да,"
+    app._interim_active = True
+    app._run_asr = lambda audio, kind, **kw: (
+        {"text": "Хвост фразы", "language": "ru"}, 60,
+    )
+    # The seal must observe an already-reset state: the reset runs before
+    # end_session(), not after it.
+    sealed_state = {}
+    real_end_session = writer.end_session
+
+    def _end_session_recording_state():
+        sealed_state["interim_active"] = app._interim_active
+        sealed_state["interim_pending"] = app._interim_pending
+        return real_end_session()
+
+    writer.end_session = _end_session_recording_state
+
+    result = {}
+
+    def _end():
+        result["summary"] = app._run_session_end(gen)
+
+    end_thread = _threading.Thread(target=_end, name="session-end-test")
+    end_thread.start()
+
+    # The ENDING flush has run and returned None; the end thread is now
+    # blocked in the queue-drain wait on the older item's count. The state
+    # must still be the consumer's — nothing has reset it.
+    assert flush_ran.wait(timeout=5.0)
+    assert app._interim_active is True
+    assert app._interim_pending == "Да,"
+
+    # The ASR loop consumes the older item; the release unblocks the drain
+    # phase, which resets and proceeds to the seal.
+    item = _drain_vad_flush_like_the_asr_loop(app)
+    assert item[3] == gen and item[4] == stamp
+    end_thread.join(timeout=5.0)
+    assert not end_thread.is_alive()
+
+    # The fragment landed (the consumer ran with the state intact)...
+    all_text = (tmp_path / f"livetrans_{stamp}_all.txt").read_text("utf-8")
+    assert "Да, Хвост фразы" in all_text
+    # ...the seal completed and saw an already-clean interim state...
+    assert sealed_state == {"interim_active": False, "interim_pending": ""}
+    assert result["summary"]["session_status"] == "completed"
+    # ...and nothing lingers for the next session.
+    assert app._interim_active is False
+    assert app._interim_pending == ""
+    assert app._interim_committed_tail == ""
+
+
+def test_session_end_queue_timeout_still_resets_and_never_leaks(
+    tmp_path, monkeypatch,
+):
+    """[ENDING ownership regression] When the queue drain misses the
+    shared deadline (a stuck ASR worker, a dead consumer thread), the end
+    still closes: the interim state is reset anyway — bounded, logged, and
+    safe because the straggler fails the generation guards once the
+    generation is superseded — so a dirty state cannot leak into the next
+    session and ENDING can never park forever waiting to reset."""
+    app, writer, main = _make_adoption_app(tmp_path)
+    stamp = app.begin_recording_session()
+    assert stamp is not None
+    gen = app._session_generation
+    app._vad = _FakeInterimVAD(0.0)
+    app._interim_pending = "Да,"
+    app._interim_active = True
+
+    with app._session_boundary_lock:
+        app._enqueue_asr("vad_flush", "audio-stuck")
+    assert app._session_work.pending_count(gen) == 1
+
+    # Shrink the shared budget so the drain misses it within the test.
+    monkeypatch.setattr(main.SessionState, "ENDING_TIMEOUT_S", 0.05)
+    summary = app._run_session_end(gen)
+
+    # The end completed (never parked in ENDING) and the state is clean.
+    assert summary is not None
+    assert app._interim_active is False
+    assert app._interim_pending == ""
+    # The stuck item was neither consumed nor waited on forever; its late
+    # release after the supersede is the idempotent no-op it must be.
+    item = app._asr_queue.get_nowait()
+    app._release_queued_work(item)
+    assert app._session_work.pending_count(gen) == 0

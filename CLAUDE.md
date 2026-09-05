@@ -498,11 +498,25 @@ linearized lifecycle inside one lock/Condition —
    and `_interim_committed_tail` (echo dedup). A producer-side reset
    early-cleared both and routed the final segment down the plain
    `_process_segment` branch, losing the fragments and duplicating the
-   committed prefix. Only the unqueued paths (ASR not ready, nothing
-   remaining, superseded generation, stop begun, queue rejecting the item
-   after dropping one) reset on the ENDING thread — no consumer will ever
-   run the loop's reset there, and a dirty state would leak into the next
-   session.
+   committed prefix. The flush **never** resets — not even on its
+   unqueued paths (ASR not ready, nothing remaining, superseded
+   generation, stop begun, queue rejecting the item after dropping one):
+   `remaining is None` proves only that *this* flush produced no segment,
+   not that no *earlier* vad_flush (a pause hand-off, a natural VAD flush
+   that raced the end gate) is still queued unconsumed — its consumer
+   owns the same interim state, and a reset under it lost the fragments
+   the same way. The one reset belongs to `_run_session_end`'s queue-drain
+   phase: after the flush, a **two-phase wait over one shared monotonic
+   30s deadline** (the ENDING cap is not doubled) first drains the
+   generation's *queue* work only (`wait_idle(..., queue_only=True)` —
+   waiting for network translations first would burn the budget on the
+   wrong work), then resets the interim state (a no-op on the normal
+   path, where the consumer's `finally` already ran), then waits for the
+   translations with whatever budget remains. On timeout the reset still
+   runs — bounded, logged, and stragglers fail the generation guards; the
+   abort path (`_run_session_end` raised) resets after `supersede()`. So
+   the state is never cleared under a live consumer, never leaked into
+   the next session, and the seal/IDLE only happen after it.
 2. **translation work** — `register_msg` when recognition produces a
    message (before the job is submitted), keyed to the *segment's*
    generation; released by the `finally` in `_translate_async` (which
