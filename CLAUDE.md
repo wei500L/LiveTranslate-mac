@@ -508,7 +508,20 @@ holds it, so a queue item's identity pair can never straddle a boundary.
 
 Stale-segment guard, three layers: `_process_segment`/
 `_process_segment_text` drop any queue item whose generation is no longer
-current (an end+begin raced the queue) before writing; every queue item
+current (an end+begin raced the queue) — checked at entry (before ASR) and
+**again inside the session boundary fence right before the write**: the
+entry check cannot be the last word, because recognition runs for seconds
+after it and the writer's `session=None` (the legacy auto-open wildcard)
+accepts whatever session is open. The whole identity resolution — re-check
+→ `write_original` (and the auto-open it may perform) → `register_msg` →
+adoption — is one linearized section under the boundary fence, so an
+explicit begin either fully precedes it (the fence re-check refuses the
+pre-begin audio: it must not land in the new meeting) or fully follows it
+(the write auto-opened, the adoption claimed the session under the same
+generation, and the later begin finds ACTIVE and refuses). Only short local
+work runs under that fence (a queued signal emit, buffered file appends,
+tracker set-adds) — never ASR, translation or network; the lock order stays
+boundary→writer / boundary→tracker. Every queue item
 carries the writer session stamp it was enqueued under, which
 `write_original(session=...)` re-verifies inside the writer's lock as the
 final authority; and the writer returns an explicit WRITE_* state
@@ -523,19 +536,35 @@ a refused entry's late translation could land in the next meeting's files).
 A requeue failure in `_drain_interim_duplicates` releases the displaced
 item's work count. Legacy auto-open adoption is *one* authoritative helper,
 `_adopt_auto_opened_session` (called by both `_process_segment` and
-`_process_segment_text` after a recorded write): it reuses the **current**
+`_process_segment_text` after a recorded write, inside their fence): it
+reuses the **current**
 generation — adoption never bumps it, because items enqueued before the
 auto-open carry that generation and are the same meeting's opening speech (a
 bump made the stale-segment guard discard them, silently losing speech).
 `begin()` adopts an auto-created entry in place, so the pre-adoption queue
-counts survive into the ENDING wait. `begin_recording_session` flips to
+counts survive into the ENDING wait. Every branch of the helper decides
+under the boundary lock *with a generation comparison* — there is no
+unlocked early return on "a session is live": a live session under the
+entry's own generation is the fast path (the count is already keyed
+correctly), a live session under a **different** generation means an
+explicit begin claimed the writer session this entry recorded into
+(`begin_session()` returns an open session unchanged), so the count
+migrates — release under the old generation, register under the live one,
+exactly once — or the live generation's ENDING would never wait for that
+translation. `begin_recording_session` flips to
 ACTIVE *inside* the boundary lock, so adoption and an explicit begin can
 never both claim the session — exactly one ACTIVE notification and one live
 tracker generation. `_process_segment_text` returns False only when an
 identity guard refused the sentence; `_do_interim_asr` then treats the
 refused sentence as *not consumed* — excluded from the committed prefix, so
 neither the audio trim nor the echo-tail update accounts for it and a later
-pass can still commit it.
+pass can still commit it. Buffered fragments (`_interim_pending`) spliced
+into a refused sentence are snapshotted before the splice and restored on
+the refusal: their audio was already trimmed by the pass that buffered
+them, so the pending text is the only copy — clearing it before the commit
+(the old code) lost it forever. The pending is cleared only after a
+confirmed commit, and only confirmed-committed text participates in the
+trim, the echo tail and `_interim_active`.
 
 End-thread fault tolerance: `_run_session_end` is wrapped by its caller —
 a failure anywhere (flush, wait, `end_session`) is logged, the writer is

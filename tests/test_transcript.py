@@ -1123,6 +1123,7 @@ class _AdoptionApp:
     _next_session_work_id = None
     _requeue_stop_sentinel = None
     _release_queued_work = None
+    _process_segment = None
     _process_segment_text = None
     _adopt_auto_opened_session = None
     _notify_session_state = None
@@ -1144,7 +1145,8 @@ def _make_adoption_app(tmp_path):
         for name in (
             "_enqueue_asr", "_session_snapshot", "_next_session_work_id",
             "_requeue_stop_sentinel", "_release_queued_work",
-            "_process_segment_text", "_adopt_auto_opened_session",
+            "_process_segment", "_process_segment_text",
+            "_adopt_auto_opened_session",
             "_notify_session_state", "_finalize_untranslated",
             "_record_session_info", "_publish_transcript_paths",
             "begin_recording_session", "_strip_committed_overlap",
@@ -1419,3 +1421,220 @@ def test_adoption_and_explicit_begin_yield_one_authority(tmp_path):
     ]
     assert live2 == [gen2]
     writer2.end_session()
+
+
+# --- B2: the recognition-window boundary races [round 2] ---------------------
+
+
+def test_begin_during_recognition_is_refused_at_the_fence(tmp_path):
+    """[B2 regression, TOCTOU] The stale guard at _process_segment's entry
+    passed (generation N was current), then an explicit begin landed *while
+    the audio was still being recognized*. The next step used to be
+    write_original(session=None), and the writer's wildcard accepted the
+    pre-begin audio into the brand-new meeting. The boundary fence re-check
+    must refuse it instead."""
+    app, writer, main = _make_adoption_app(tmp_path)
+
+    with app._session_boundary_lock:
+        app._enqueue_asr("vad_flush", "audio-old")
+    item = app._asr_queue.get_nowait()
+    assert item[3] == app._session_generation  # N == current at enqueue
+    assert item[4] is None                     # no session existed yet
+
+    def begin_mid_asr(audio, kind, **kwargs):
+        # The entry guard has already passed; the begin lands inside the
+        # recognition window and opens a session at generation N+1.
+        stamp = app.begin_recording_session()
+        assert stamp is not None
+        return {"text": "старая фраза", "language": "ru"}, 80
+
+    app._run_asr = begin_mid_asr
+    app._process_segment("audio-old", item[2], item[3], item[4])
+
+    stamp_new = writer.active_session()
+    assert stamp_new is not None
+    assert app._session_generation == item[3] + 1
+    # The new meeting's files never saw the pre-begin audio...
+    all_text = (tmp_path / f"livetrans_{stamp_new}_all.txt").read_text("utf-8")
+    assert "старая фраза" not in all_text
+    # ...nothing of it was registered under the live generation...
+    assert app._session_work.pending_count(app._session_generation) == 0
+    # ...and the only ACTIVE notification is the begin's own.
+    assert app.notifications == [("active", stamp_new)]
+    writer.end_session()
+
+
+def test_end_then_begin_during_recognition_refuses_the_stale_item(tmp_path):
+    """[B2 regression, end→begin] The queue item was enqueued under an
+    explicit session (generation N, stamp A); while its audio was being
+    recognized the meeting ended (generation superseded and bumped, session
+    sealed) and a new one began. The fence re-check refuses the straggler:
+    the old meeting's late audio never lands in either meeting."""
+    app, writer, main = _make_adoption_app(tmp_path)
+    stamp_a = app.begin_recording_session()
+    assert stamp_a is not None
+    gen_a = app._session_generation
+
+    with app._session_boundary_lock:
+        app._enqueue_asr("vad_flush", "audio-a")
+    item = app._asr_queue.get_nowait()
+    assert item[3] == gen_a and item[4] == stamp_a
+
+    def end_then_begin_mid_asr(audio, kind, **kwargs):
+        # The end thread's tail, in its real order: the generation is
+        # superseded and bumped, the writer seals session A, the state
+        # returns to IDLE — then the user starts the next meeting.
+        app._session_work.supersede(gen_a)
+        with app._session_boundary_lock:
+            app._session_generation += 1
+        app._notify_session_state(main.SessionState.IDLE)
+        writer.end_session()
+        stamp_b = app.begin_recording_session()
+        assert stamp_b is not None and stamp_b != stamp_a
+        return {"text": "хвост прошлой встречи", "language": "ru"}, 80
+
+    app._run_asr = end_then_begin_mid_asr
+    app._process_segment("audio-a", item[2], item[3], item[4])
+
+    stamp_b = writer.active_session()
+    all_b = (tmp_path / f"livetrans_{stamp_b}_all.txt").read_text("utf-8")
+    assert "хвост прошлой встречи" not in all_b
+    all_a = (tmp_path / f"livetrans_{stamp_a}_all.txt").read_text("utf-8")
+    assert "хвост прошлой встречи" not in all_a
+    writer.end_session()
+
+
+def test_begin_between_write_and_adoption_migrates_the_count(tmp_path):
+    """[B2 regression] The entry recorded into a writer session the state
+    machine did not track yet; an explicit begin then claimed that same
+    session (begin_session returns an open session unchanged), bumped the
+    generation and retired the old one's counts. The adoption helper must
+    not answer the entry's stale generation just because a session is live:
+    the count migrates to the live generation exactly once, so ENDING waits
+    for the in-flight translation instead of sealing the meeting without
+    it."""
+    app, writer, main = _make_adoption_app(tmp_path)
+
+    # The queue item's registration auto-creates generation 0 (the
+    # pre-adoption opening work an ENDING wait must cover).
+    with app._session_boundary_lock:
+        app._enqueue_asr("vad_flush", "audio")
+    item = app._asr_queue.get_nowait()
+    assert app._session_work.pending_count(0) == 1
+
+    # The entry's fenced write + registration, by hand: the writer
+    # auto-opens a session and the msg count lands under generation 0.
+    assert writer.write_original(7, "09:00:00", "запись", language="ru") == (
+        TranscriptWriter.WRITE_RECORDED
+    )
+    assert writer._entry_sessions[7] is not None
+    assert app._session_work.register_msg(0, 7) is True
+
+    # The explicit begin claims that session, bumps to generation 1 and
+    # retires generation 0's auto-created counts.
+    stamp = app.begin_recording_session()
+    assert stamp is not None
+    assert stamp == writer._entry_sessions[7]  # same writer session
+    assert app._session_generation == 1
+    assert app._session_work.pending_count(0) == 0
+
+    # The helper, entered while the state is already ACTIVE and the entry's
+    # generation is stale: it must answer the live generation...
+    assert app._adopt_auto_opened_session(7, 0) == 1
+    # ...with the count migrated there exactly once.
+    assert app._session_work.pending_count(1) == 1
+    # The live generation's ENDING therefore waits for the translation:
+    app._session_work.start_closing(1)
+    assert app._session_work.wait_idle(1, timeout=0.0) is False
+    app._session_work.release_msg(1, 7)
+    assert app._session_work.wait_idle(1, timeout=0.0) is True
+    writer.end_session()
+
+
+def test_refused_interim_commit_keeps_the_buffered_pending(tmp_path):
+    """[B2 regression, pending] The buffered fragments' audio was already
+    trimmed away by the pass that buffered them, so when the sentence they
+    were spliced into is refused by an identity guard, the pending must
+    survive — the old code cleared it before the commit and the text was
+    lost forever. A later pass commits it exactly once."""
+    app, writer, main = _make_adoption_app(tmp_path)
+    app._vad = _FakeInterimVAD(4.0)
+    app._interim_pending = "Да,"
+    app._run_asr = lambda audio, kind, **kw: (
+        {"text": "Новое предложение. Хвост", "language": "ru"}, 100,
+    )
+    app._split_sentences = lambda text, lang: [
+        "Новое предложение.", "Хвост"
+    ]
+
+    # A stale generation: the spliced sentence is refused before any write.
+    assert app._do_interim_asr(generation=42, expected_session=None) is False
+    # The pending was never consumed, nothing was trimmed or written.
+    assert app._interim_pending == "Да,"
+    assert app._vad.trimmed == 0
+    assert list(tmp_path.glob("livetrans_*_all.txt")) == []
+
+    # A later pass at a current generation commits the pending with its own
+    # sentence — exactly once, no duplication.
+    app._run_asr = lambda audio, kind, **kw: (
+        {"text": "Другое предложение. Хвост", "language": "ru"}, 100,
+    )
+    app._split_sentences = lambda text, lang: [
+        "Другое предложение.", "Хвост"
+    ]
+    assert app._do_interim_asr(
+        generation=app._session_generation, expected_session=None
+    ) is True
+    stamp = writer.active_session()
+    assert stamp is not None
+    all_text = (tmp_path / f"livetrans_{stamp}_all.txt").read_text("utf-8")
+    assert "Да, Другое предложение." in all_text
+    assert all_text.count("Да,") == 1
+    assert app._interim_pending == ""
+    assert app._vad.trimmed > 0
+
+
+def test_interim_prefix_commit_with_later_refusal_consumes_only_the_prefix(
+    tmp_path,
+):
+    """[B2 regression, pending] When earlier sentences of one interim pass
+    commit and a later one is refused, only the committed prefix is
+    consumed: the trim, the echo tail and _interim_active account for it
+    alone, the refused sentence never reaches the record, and a pending
+    absorbed by the committed prefix stays consumed."""
+    app, writer, main = _make_adoption_app(tmp_path)
+    app._vad = _FakeInterimVAD(6.0)
+    app._interim_pending = "Да,"
+    app._run_asr = lambda audio, kind, **kw: (
+        {"text": "Первое предложение. Второе предложение. Хвост",
+         "language": "ru"}, 100,
+    )
+    app._split_sentences = lambda text, lang: [
+        "Первое предложение.", "Второе предложение.", "Хвост"
+    ]
+    # The writer refuses the second sentence's write (a session boundary
+    # landed under the pass); the first commits normally.
+    real_write = writer.write_original
+    writes = {"n": 0}
+
+    def refuse_second_write(msg_id, *args, **kwargs):
+        writes["n"] += 1
+        if writes["n"] >= 2:
+            return TranscriptWriter.WRITE_SESSION_MISMATCH
+        return real_write(msg_id, *args, **kwargs)
+
+    writer.write_original = refuse_second_write
+
+    assert app._do_interim_asr(generation=0, expected_session=None) is True
+    stamp = writer.active_session()
+    all_text = (tmp_path / f"livetrans_{stamp}_all.txt").read_text("utf-8")
+    # The committed prefix (pending absorbed) landed; the refused sentence
+    # did not.
+    assert "Да, Первое предложение." in all_text
+    assert "Второе предложение." not in all_text
+    # The pending was consumed by the committed prefix — not resurrected.
+    assert app._interim_pending == ""
+    # Only the committed prefix participates in the accounting.
+    assert app._interim_committed_tail == "Да, Первое предложение."
+    assert app._interim_active is True
+    assert app._vad.trimmed > 0
