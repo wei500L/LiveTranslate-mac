@@ -1402,13 +1402,16 @@ class LiveTranslateApp:
         return self._session_generation, self._transcript.active_session()
 
     def _on_session_state_ui(self, state: str, session_id: str | None,
-                             summary: dict | None):
+                             summary: dict | None = None):
         """Qt-thread reaction to a session-state change (wired via main()).
 
         Meeting over → IDLE: the pipeline stays paused (the ENDING thread
         already set _paused), and the overlay's run/pause button must say
         so — an IDLE session next to a "Running" overlay would invite a
-        resume that recognises audio nobody is recording.
+        resume that recognises audio nobody is recording. ``summary`` has a
+        default so a two-argument caller cannot break the whole UI reaction
+        chain (a missing argument here raised inside the bridge slot and
+        left the overlay's session button stuck on its previous label).
         """
         if self._overlay:
             self._overlay.set_session_state(state)
@@ -4299,7 +4302,11 @@ def main():
     session_bridge = _SessionBridge()
 
     def _on_session_state_signal(state: str, session_id, summary):
-        live_trans._on_session_state_ui(state, session_id)
+        # The full triple must reach the UI reaction: dropping `summary`
+        # here raised TypeError inside the slot on *every* state push, so
+        # the overlay's session button never flipped (found in a real
+        # window run; the exception only surfaced on stderr).
+        live_trans._on_session_state_ui(state, session_id, summary)
         if state == SessionState.IDLE:
             # Meeting over, pipeline stays paused: the tray and the overlay's
             # run/pause button reflect that, so a later "resume" is a

@@ -89,6 +89,9 @@ class _MLXTaskThread(QThread):
 
     def __init__(self, manager, action, parent=None):
         super().__init__(parent)
+        # The object name surfaces in Qt's fatal "Destroyed while thread is
+        # still running" message, so a startup abort names its thread.
+        self.setObjectName("MLXTaskThread")
         self.manager = manager
         self.action = action
         self.cancel_event = threading.Event()
@@ -153,6 +156,9 @@ class _MLXHealthThread(QThread):
 
     def __init__(self, manager, parent=None):
         super().__init__(parent)
+        # Named for Qt's fatal "Destroyed while thread is still running"
+        # message (see _MLXTaskThread).
+        self.setObjectName("MLXHealthThread")
         self.manager = manager
 
     def run(self):
@@ -1418,6 +1424,7 @@ class ControlPanel(QWidget):
         self._cache_list.clear()
         self._cache_total.setText(t("scanning"))
         task = _CacheScanThread(self)
+        task.setObjectName("CacheScanThread")
         self._cache_task = task
         task.result.connect(self._cache_result.emit)
         task.finished.connect(self._on_cache_scan_finished)
@@ -1427,7 +1434,9 @@ class ControlPanel(QWidget):
         task = self._cache_task
         self._cache_task = None
         if task is not None:
-            task.deleteLater()
+            # Same one-beat deferral as the MLX threads (the scan's
+            # result.emit also fires from inside run()).
+            QTimer.singleShot(100, task.deleteLater)
 
     def _on_cache_result(self, results):
         self._cache_list.clear()
@@ -1799,7 +1808,9 @@ class ControlPanel(QWidget):
         task = self._mlx_task
         self._mlx_task = None
         if task is not None:
-            task.deleteLater()
+            # Same one-beat deferral as _on_mlx_health_finished: deleting on
+            # finished delivery races the worker's running-flag cleanup.
+            QTimer.singleShot(100, task.deleteLater)
         # prepare/start just changed the very state the cache describes.
         self._mlx_status_cache = None
         self._update_mlx_controls()
@@ -1825,7 +1836,13 @@ class ControlPanel(QWidget):
         task = self._mlx_health_task
         self._mlx_health_task = None
         if task is not None:
-            task.deleteLater()
+            # Delete one beat later: QThread emits finished() from the
+            # worker thread BEFORE it clears its internal running flag, so
+            # a deleteLater delivered on finished can race a preempted
+            # worker and abort with "Destroyed while thread is still
+            # running" (reproduced on MLXHealthThread at startup). The
+            # timer keeps the reference alive until the flag is clear.
+            QTimer.singleShot(100, task.deleteLater)
         self._maybe_close_after_mlx_tasks()
 
     def stop_background_tasks(self, timeout_ms: int = 3000):

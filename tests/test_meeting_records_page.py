@@ -1335,3 +1335,45 @@ def test_end_recording_session_re_verifies_the_named_meeting(monkeypatch):
     assert app.end_recording_session(expected_session="20260905_100000") is True
     assert len(started) == 1
     assert app._session_state == main.SessionState.ENDING
+
+
+def test_session_state_ui_reaction_accepts_the_bridge_payloads():
+    """[round-16 regression] The bridge slot in main() forwards the state
+    push to LiveTranslateApp._on_session_state_ui. A two-argument call
+    (the shape the slot used before the fix) raised TypeError inside the
+    Qt slot on EVERY push — the overlay's session button never flipped
+    and the exception only surfaced on stderr. The reaction must accept
+    both the full triple and the reduced shape, and drive the overlay's
+    set_session_state with the state it received."""
+    main = pytest.importorskip(
+        "main", reason="main.py needs torch + PyQt6, which the offline job skips"
+    )
+
+    app = object.__new__(main.LiveTranslateApp)
+    app._overlay = None
+    app._panel = None
+    app._running = False
+    app._paused = False
+
+    # Full triple (what the bridge emits): must not raise.
+    app._on_session_state_ui("active", "20260905_100000", {})
+
+    # Reduced shape (what the bridge slot used to forward: state + id only).
+    app._on_session_state_ui("idle", "20260905_100000")
+
+    # The overlay receives the state — the exact chain whose break left
+    # the session button stuck on its previous label.
+    states = []
+
+    class _Overlay:
+        def set_session_state(self, state):
+            states.append(state)
+
+        def set_running(self, running):
+            pass
+
+    app._overlay = _Overlay()
+    app._on_session_state_ui("ending", "20260905_100000", None)
+    assert states == ["ending"]
+    app._on_session_state_ui("idle", "20260905_100000", {"session": "x"})
+    assert states == ["ending", "idle"]
