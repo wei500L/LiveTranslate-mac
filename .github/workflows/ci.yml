@@ -6,6 +6,15 @@ on:
     branches:
       - main
 
+permissions:
+  contents: read
+
+# A superseded run (rapid pushes to the same ref) is cancelled instead of
+# stacking; the newest commit's run is the one that matters.
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
 jobs:
   test-macos-arm64:
     name: macOS arm64 tests
@@ -15,7 +24,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - name: Install portaudio
