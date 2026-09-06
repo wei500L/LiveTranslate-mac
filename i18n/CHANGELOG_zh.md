@@ -1,5 +1,8 @@
 # 更新日志
 
+## 2026-09-06 (第二十一轮)
+- CI 工作流卫生：actions/setup-python 由 v5 升至 v7——v5 基于 GitHub 已弃用的 Node 20 运行时，此前每次运行日志都附带一条弃用警告注解；ci.yml 显式声明最小权限 `permissions: contents: read` 并新增并发组，同一 PR/分支的过期运行自动取消而非排队堆叠；release.yml 的轻量测试配方注释交叉引用 ci.yml 的全量配方，两处差异自此有意为之、显式管理。main 分支启用必需状态检查（macOS arm64 tests）并禁止直推——PR 级 CI 从「会红」升级为「会拦」
+
 ## 2026-09-06 (第二十轮)
 - 新增 PR 级 CI：此前唯一的测试工作流只在打 tag 或手动触发时运行，普通 push 与 PR 无任何机器检查——上一条特性分支带着 26 个测试失败与一个导入级致命错误长期无人发现。现在 `ci.yml` 在每个 PR 与 push 到 main 时于 macos-14 / Python 3.12 运行与本地完全相同的 `python -m pytest -q`；依赖在 release.yml 已验证配方（numpy/pytest/yasbd-lib/PyYAML）之上按测试导入面补齐：PyQt6、torch/torchaudio 2.8.0、silero-vad、soundfile、openai、httpx、psutil、PyAudio、pyobjc（PyAudio 在 macOS 无 wheel，先 brew 装 portaudio 再源码构建），fastapi 刻意不装以保持与本地一致的跳过集合。CI 套件达到 466 通过 / 4 跳过（缺 fastapi 的 asr_server 用例 1 个 + 需项目 .venv 的打包测试 3 个），与本地全量环境一致；首轮真实运行全程约 1 分钟（依赖安装 38 秒、测试 10 秒），`[WIP][UNTESTED]` 分支要等打 tag 才会被机器检验的日子就此结束
 

@@ -22,7 +22,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v6
       - name: Set up Python
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v7
         with:
           python-version: '3.12'
       - name: Install test dependencies
@@ -31,6 +31,10 @@ jobs:
         # directly, and PyYAML because the i18n and config tests parse the YAML
         # files; translator/mlx_service import openai+httpx lazily so their
         # pure-logic tests need no network stack.
+        # This lighter set is the release smoke gate; ci.yml installs the
+        # full-suite recipe (torch/Qt/silero/...) on every PR and push to
+        # main. The two differ on purpose — revisit both when the test
+        # import surface changes.
         run: python -m pip install --disable-pip-version-check "numpy>=1.24,<2.3" pytest "yasbd-lib>=0.15,<1.0" "PyYAML>=6.0"
       - name: Run offline platform tests
         run: python -m pytest -q
