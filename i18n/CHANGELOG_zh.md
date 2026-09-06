@@ -1,5 +1,8 @@
 # 更新日志
 
+## 2026-09-06 (第二十二轮)
+- lint 门禁首次真实执行并清零：ruff 装入项目 venv（此前该命令从未可跑，历次「通过」实为 compileall 回退），基线 10 个 F/E/W 问题全部处理——control_panel 的 4 个死导入与 benchmark/meeting_records 的 2 个无占位符 f-string 直接清除；meeting_records_widgets 未用海象变量改普通判断；platform_clickthrough 的 c_void_p 导入是死代码（第 38 行 `c_void_p=` 是 PyObjC 关键字参数名而非引用）已删；translator 的 `"OpenAI"` 注解补 TYPE_CHECKING 守卫（运行时仍惰性导入，无 openai 亦可收集）；audio_capture 末尾的 macOS 再导出是 ruff 误报——main.py 的平台分发依赖它，删除会让 macOS 启动拿错采集类，以 noqa 显式保留并说明理由。ruff 现为全绿
+
 ## 2026-09-06 (第二十一轮)
 - CI 工作流卫生：actions/setup-python 由 v5 升至 v7——v5 基于 GitHub 已弃用的 Node 20 运行时，此前每次运行日志都附带一条弃用警告注解；ci.yml 显式声明最小权限 `permissions: contents: read` 并新增并发组，同一 PR/分支的过期运行自动取消而非排队堆叠；release.yml 的轻量测试配方注释交叉引用 ci.yml 的全量配方，两处差异自此有意为之、显式管理。main 分支启用必需状态检查（macOS arm64 tests）并禁止直推——PR 级 CI 从「会红」升级为「会拦」
 

@@ -186,7 +186,7 @@ def run_benchmark(models, source_lang, target_lang, timeout_s, prompt, result_ca
             # The caller re-enables its button on "__DONE__", so anything that
             # escapes here would disable it for the rest of the session.
             log.error("Benchmark run failed", exc_info=True)
-            result_callback(f"\nBenchmark aborted: see the log for details")
+            result_callback("\nBenchmark aborted: see the log for details")
         finally:
             result_callback("__DONE__")
 

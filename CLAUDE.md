@@ -22,7 +22,7 @@ start.bat                           # Windows
 
 Tests: `python -m pytest -q` (466 offline tests, no network or model downloads; 4 skipped — fastapi's asr_server case and the three bundle tests that need a project `.venv`). This must pass before any commit — CI runs the same command on macOS arm64 for every pull request and push to main, and every release-producing job gates on it.
 
-Linter: `ruff` is **not** bundled with the venv. When it is available, run `python -m ruff check --select F,E,W --ignore E501,E402 *.py`. E402 is intentionally ignored because `main.py` requires torch before PyQt6. When ruff is unavailable, fall back to `python -m compileall -q .` plus the test suite, and say so rather than reporting a lint pass that did not happen.
+Linter: run `python -m ruff check --select F,E,W --ignore E501,E402 *.py` — ruff is installed in the project venv. E402 is intentionally ignored because `main.py` requires torch before PyQt6. On a machine where ruff is missing, fall back to `python -m compileall -q .` plus the test suite, and say so rather than reporting a lint pass that did not happen.
 
 Install scripts keep every download off the system drive: pip/uv caches, uv-managed Python, and temp files all live under the project/app folder, and caches are deleted after a successful install.
 

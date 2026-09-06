@@ -1,5 +1,8 @@
 # Changelog
 
+## 2026-09-06 (round 22)
+- The lint gate ran for real for the first time and is now clean: ruff is installed in the project venv (the documented command had never been runnable — every earlier "pass" was the compileall fallback), and all 10 baseline F/E/W findings are resolved — four dead imports in control_panel and two placeholder-less f-strings removed outright; an unused walrus binding became a plain check; platform_clickthrough's c_void_p import was dead code (the later `c_void_p=` is a PyObjC keyword-argument name, not a reference) and is gone; translator's `"OpenAI"` annotation gained a TYPE_CHECKING guard (the runtime import stays lazy, so the module still collects without the openai wheel); and audio_capture's trailing macOS re-export — a ruff false positive that main.py's platform dispatch depends on — is kept with an explicit noqa and reason, since deleting it would hand macOS the wrong capture class. ruff now exits clean
+
 ## 2026-09-06 (round 21)
 - CI workflow hygiene: actions/setup-python bumped v5 → v7 — v5 rides the Node 20 runtime GitHub has deprecated, and every run log carried a deprecation annotation; ci.yml now declares least privilege (`permissions: contents: read`) and a concurrency group, so a superseded run on the same PR/branch is cancelled instead of stacking; release.yml's light test recipe gained a cross-reference comment to ci.yml's full-suite recipe, the difference now explicit and managed. main is protected with the required "macOS arm64 tests" check and direct pushes disabled — PR-level CI goes from "turns red" to "blocks the merge"
 

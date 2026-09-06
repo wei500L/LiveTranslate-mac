@@ -114,7 +114,7 @@ def minutes_html(markdown_text: str) -> str:
                 out.append("</ul>")
                 in_list = False
             continue
-        if re_match := _BULLET.match(line):
+        if _BULLET.match(line):
             if not in_list:
                 out.append("<ul style='margin:4px 0 4px 0;padding-left:18px;'>")
                 in_list = True
