@@ -3,8 +3,15 @@ from __future__ import annotations
 import json
 import logging
 import time
+from typing import TYPE_CHECKING
 
 from connection_config import normalize_api_base
+
+if TYPE_CHECKING:
+    # Annotation-only import: the runtime path stays the lazy import inside
+    # make_openai_client, which is what keeps this module collectable
+    # without the openai wheel.
+    from openai import OpenAI
 
 log = logging.getLogger("LiveTranslate.TL")
 

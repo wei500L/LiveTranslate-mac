@@ -104,7 +104,7 @@ def list_sessions(base_dir: Path, active_session: str | None = None,
     # richer files were lost) do not match the writer's _all.txt glob; pick
     # them up so nothing recorded is invisible in the list.
     known = {r.get("session") for r in sessions}
-    for path in base_dir.glob(f"livetrans_*_original.txt"):
+    for path in base_dir.glob("livetrans_*_original.txt"):
         stamp = path.name[len("livetrans_"):-len("_original.txt")]
         if stamp in known or stamp.endswith("_" + SUMMARY_KIND):
             continue

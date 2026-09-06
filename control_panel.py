@@ -1,11 +1,9 @@
 import json
 import logging
 import os
-import shutil
 import subprocess
 import sys
 import threading
-from datetime import datetime
 from pathlib import Path
 
 from PyQt6.QtCore import QThread, Qt, QTimer, pyqtSignal
@@ -14,7 +12,6 @@ from PyQt6.QtWidgets import (
     QColorDialog,
     QComboBox,
     QDoubleSpinBox,
-    QFileDialog,
     QFontComboBox,
     QGridLayout,
     QGroupBox,
@@ -67,7 +64,6 @@ from subtitle_settings import SubtitleSettingsWidget
 from platform_fonts import default_mono_font_family, default_ui_font_family
 from torch_backend import available_devices, mps_available, normalize_device
 from mlx_service import (
-    MLXServiceError,
     MLXServiceManager,
     ensure_hy_mt_model,
     is_hy_mt_model,
