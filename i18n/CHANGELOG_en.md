@@ -1,5 +1,8 @@
 # Changelog
 
+## 2026-09-07 (round 24)
+- The suite's Windows share ran on a machine for the first time and is fully green: tests had only ever run on macOS arm64 (both release and CI), while the project ships on both platforms. A windows-latest smoke job on the light recipe (no torch/Qt/pyobjc stacks, so their cases skip) passed its first real run with **228 passed / 60 skipped / 0 failed** (5.6 seconds) — the Windows-only surfaces (install entrypoints, the WASAPI capture contract, config parsing) are machine-guarded from here on and listed among main's required checks
+
 ## 2026-09-07 (round 23)
 - Closed the machine-coverage blind spot on the asr_server serving stack: the remote-ASR server's "the app carries its configuration" case had been skipped in every environment (neither local nor CI installed fastapi), yet it guards a documented real startup crash — uvicorn starting the app with no app.state.args and dying inside the startup hook. The CI recipe now installs fastapi, uvicorn and faster-whisper, so the case runs for real; the complementary "clear error when the stack is absent" case swaps to skipped and stays covered by the light release.yml environment — both paths are machine-checked from here on, and the swap is count-neutral (CI remains 466 passed / 4 skipped, the full local venv 469/1)
 

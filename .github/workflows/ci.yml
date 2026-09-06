@@ -67,13 +67,13 @@ jobs:
         run: python -m pytest -q
 
   windows-smoke:
-    # Non-blocking probe: the suite's Windows share has never been machine-run
-    # (release.yml tests macOS arm64 only, and this repo ships on Windows).
-    # continue-on-error keeps it advisory until the findings are triaged —
-    # the run log with the real pass/skip counts is the point.
-    name: Windows smoke (non-blocking)
+    # The suite's Windows share on the light recipe (no torch/Qt/pyobjc
+    # stacks, so their cases skip) stayed green since its first machine run:
+    # 228 passed / 60 skipped. Guards the Windows-only surfaces (install
+    # entrypoints, the WASAPI capture contract, config parsing) that the
+    # macOS job cannot see.
+    name: Windows smoke
     runs-on: windows-latest
-    continue-on-error: true
     timeout-minutes: 30
     steps:
       - name: Checkout
