@@ -1,5 +1,8 @@
 # 更新日志
 
+## 2026-09-07 (第二十三轮)
+- 补上 asr_server 服务端栈的机器覆盖盲区：远程 ASR 服务端（REMOTE_ASR.md）的「应用携带其配置」用例此前在所有环境都被跳过（本地与 CI 均未装 fastapi），而它防的是文档记载过的真实启动崩溃——uvicorn 起服务时 app.state.args 为空即在启动钩子里死掉。CI 依赖加入 fastapi、uvicorn 与 faster-whisper 后该用例真实运行；互补的「栈缺失时报清晰错误」用例换位跳过，并继续在 release.yml 的轻量环境得到覆盖——两条路径自此都有机器检验，且互换对计数中性（CI 仍为 466 通过 / 4 跳过，本地全量 venv 仍为 469/1）
+
 ## 2026-09-06 (第二十二轮)
 - lint 门禁首次真实执行并清零：ruff 装入项目 venv（此前该命令从未可跑，历次「通过」实为 compileall 回退），基线 10 个 F/E/W 问题全部处理——control_panel 的 4 个死导入与 benchmark/meeting_records 的 2 个无占位符 f-string 直接清除；meeting_records_widgets 未用海象变量改普通判断；platform_clickthrough 的 c_void_p 导入是死代码（第 38 行 `c_void_p=` 是 PyObjC 关键字参数名而非引用）已删；translator 的 `"OpenAI"` 注解补 TYPE_CHECKING 守卫（运行时仍惰性导入，无 openai 亦可收集）；audio_capture 末尾的 macOS 再导出是 ruff 误报——main.py 的平台分发依赖它，删除会让 macOS 启动拿错采集类，以 noqa 显式保留并说明理由。ruff 现为全绿
 

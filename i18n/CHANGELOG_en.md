@@ -1,5 +1,8 @@
 # Changelog
 
+## 2026-09-07 (round 23)
+- Closed the machine-coverage blind spot on the asr_server serving stack: the remote-ASR server's "the app carries its configuration" case had been skipped in every environment (neither local nor CI installed fastapi), yet it guards a documented real startup crash — uvicorn starting the app with no app.state.args and dying inside the startup hook. The CI recipe now installs fastapi, uvicorn and faster-whisper, so the case runs for real; the complementary "clear error when the stack is absent" case swaps to skipped and stays covered by the light release.yml environment — both paths are machine-checked from here on, and the swap is count-neutral (CI remains 466 passed / 4 skipped, the full local venv 469/1)
+
 ## 2026-09-06 (round 22)
 - The lint gate ran for real for the first time and is now clean: ruff is installed in the project venv (the documented command had never been runnable — every earlier "pass" was the compileall fallback), and all 10 baseline F/E/W findings are resolved — four dead imports in control_panel and two placeholder-less f-strings removed outright; an unused walrus binding became a plain check; platform_clickthrough's c_void_p import was dead code (the later `c_void_p=` is a PyObjC keyword-argument name, not a reference) and is gone; translator's `"OpenAI"` annotation gained a TYPE_CHECKING guard (the runtime import stays lazy, so the module still collects without the openai wheel); and audio_capture's trailing macOS re-export — a ruff false positive that main.py's platform dispatch depends on — is kept with an explicit noqa and reason, since deleting it would hand macOS the wrong capture class. ruff now exits clean
 
