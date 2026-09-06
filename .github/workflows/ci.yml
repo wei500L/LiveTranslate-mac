@@ -65,3 +65,26 @@ jobs:
             "faster-whisper>=1.0,<2"
       - name: Run tests
         run: python -m pytest -q
+
+  windows-smoke:
+    # Non-blocking probe: the suite's Windows share has never been machine-run
+    # (release.yml tests macOS arm64 only, and this repo ships on Windows).
+    # continue-on-error keeps it advisory until the findings are triaged —
+    # the run log with the real pass/skip counts is the point.
+    name: Windows smoke (non-blocking)
+    runs-on: windows-latest
+    continue-on-error: true
+    timeout-minutes: 30
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+      - name: Set up Python
+        uses: actions/setup-python@v7
+        with:
+          python-version: '3.12'
+      - name: Install test dependencies
+        # The light collection-time recipe, same as release.yml's test job —
+        # torch/Qt/pyobjc stacks stay absent, so their cases skip.
+        run: python -m pip install --disable-pip-version-check "numpy>=1.24,<2.3" pytest "yasbd-lib>=0.15,<1.0" "PyYAML>=6.0"
+      - name: Run tests
+        run: python -m pytest -q
