@@ -32,6 +32,7 @@ class RecordingOverlay:
         self.messages = []      # (msg_id, timestamp, original, provider)
         self.live = []          # (msg_id, original, translation, final)
         self.stats = []
+        self.connections = []
         self._lock = threading.Lock()
 
     def add_message(self, msg_id, timestamp, original, source_lang, asr_ms,
@@ -46,6 +47,10 @@ class RecordingOverlay:
     def update_stats(self, *args):
         with self._lock:
             self.stats.append(args)
+
+    def update_connection(self, status):
+        with self._lock:
+            self.connections.append(status)
 
 
 class FakeSubwin:
@@ -275,3 +280,62 @@ def test_subwin_receives_final_pair(app, tmp_path):
     assert app._subwin.updated == [("Окно", {"zh": "窗口"})]
     app._transcript.set_recording(False)
     app._transcript.end_session()
+
+
+class SinkApp:
+    """The attributes _SonioxSink touches (a smaller stand-in than StandIn)."""
+
+    def __init__(self, overlay):
+        self._overlay = overlay
+        self._msg_id = 0
+        self._soniox_live_msg_id = None
+
+
+def test_sink_finalizes_dangling_live_card_on_terminal_status():
+    """Engine teardown (falling back to a local engine) must not leave the
+    live card stuck in its provisional dim state."""
+    overlay = RecordingOverlay()
+    app = SinkApp(overlay)
+    sink = main._SonioxSink(app)
+
+    # The sink allocates the live card itself on the first provisional.
+    from soniox_accumulator import SonioxLiveState
+
+    sink.on_live(SonioxLiveState(original="Говорили", translation="正在讲"))
+    assert overlay.live == []  # first provisional only creates the card
+    assert len(overlay.messages) == 1
+    assert app._soniox_live_msg_id == app._msg_id
+
+    # Engine torn down -> FINISHED: the card is settled with final=True and
+    # the residual id is gone.
+    sink.on_status(main.SonioxStatus.FINISHED)
+    assert app._soniox_live_msg_id is None
+    assert overlay.live and overlay.live[-1] == (
+        app._msg_id, "Говорили", "正在讲", True,
+    )
+    assert overlay.connections[-1] is None  # the indicator is cleared
+
+
+def test_sink_failed_status_settles_card_but_keeps_chip():
+    """Runtime failure settles the card AND keeps the failed indicator
+    visible (the user must see the engine is down)."""
+    overlay = RecordingOverlay()
+    app = SinkApp(overlay)
+    sink = main._SonioxSink(app)
+
+    from soniox_accumulator import SonioxLiveState
+
+    sink.on_live(SonioxLiveState(original="Обрыв", translation=""))
+    sink.on_status(main.SonioxStatus.FAILED)
+    assert app._soniox_live_msg_id is None
+    assert overlay.live[-1][3] is True  # settled
+    # FAILED keeps the chip visible ("failed"); FINISHED clears it (None).
+    assert overlay.connections[-1] == "failed"
+
+
+def test_sink_terminal_status_without_live_card_is_noop():
+    overlay = RecordingOverlay()
+    app = SinkApp(overlay)
+    sink = main._SonioxSink(app)
+    sink.on_status(main.SonioxStatus.FINISHED)
+    assert overlay.live == []

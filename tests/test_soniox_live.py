@@ -3,15 +3,17 @@
 Runs ONLY when both gates are open:
   SONIOX_API_KEY is set AND RUN_SONIOX_LIVE_TEST=1
 
-Streams a few seconds of synthesized audio (no bundled media, minimal cost)
-through a real SonioxServiceManager and asserts the full loop: connect,
-receive tokens, commit at least one segment, bounded shutdown. Skipped
-otherwise — the default suite never touches the network.
+Synthesizes a short Russian utterance with the macOS `say` TTS voice (no
+bundled media, minimal cloud cost — a pure tone produces no tokens, real
+speech is required) and streams it through a real SonioxServiceManager:
+connect, provisional tokens, a committed segment, bounded shutdown.
+Skipped otherwise — the default suite never touches the network.
 """
 
 from __future__ import annotations
 
 import os
+import subprocess
 import sys
 import threading
 import time
@@ -32,7 +34,45 @@ pytestmark = pytest.mark.skipif(
 )
 
 
-def test_live_stream_commits_segment():
+def _synthesize_russian_speech(tmp_path) -> np.ndarray | None:
+    """A few seconds of real Russian speech via the macOS `say` voice, or
+    None when no Russian voice is available (the test skips)."""
+    if sys.platform != "darwin":
+        return None
+    try:
+        voices = subprocess.run(
+            ["say", "-v", "?"], capture_output=True, text=True, timeout=10
+        ).stdout
+        if "ru_" not in voices:
+            return None
+        aiff = tmp_path / "soniox_live_test.aiff"
+        subprocess.run(
+            [
+                "say", "-v", "Milena", "-o", str(aiff),
+                "Привет! Это проверка облачного распознавания русской речи "
+                "в реальном времени.",
+            ],
+            check=True, capture_output=True, timeout=30,
+        )
+        import soundfile as sf
+
+        audio, sr = sf.read(str(aiff), dtype="float32", always_2d=True)
+        audio = audio.mean(axis=1)
+        if sr != 16000:
+            # Linear resample, same approach as audio_capture_base.
+            n = int(len(audio) * 16000 / sr)
+            x = np.linspace(0, len(audio) - 1, n)
+            audio = np.interp(x, np.arange(len(audio)), audio).astype(np.float32)
+        return audio
+    except Exception:
+        return None
+
+
+def test_live_stream_commits_segment(tmp_path):
+    audio = _synthesize_russian_speech(tmp_path)
+    if audio is None:
+        pytest.skip("no Russian TTS voice available for the live test")
+
     from soniox_client import (
         SonioxRuntimeConfig,
         SonioxServiceManager,
@@ -46,10 +86,12 @@ def test_live_stream_commits_segment():
             self.segments = []
             self.statuses = []
             self.errors = []
+            self.lives = []
             self._lock = threading.Lock()
 
         def on_live(self, state):
-            pass
+            with self._lock:
+                self.lives.append(state)
 
         def on_segments(self, segments):
             with self._lock:
@@ -79,16 +121,10 @@ def test_live_stream_commits_segment():
         time.sleep(0.2)
     assert manager.status() == SonioxStatus.LIVE, f"statuses={sink.statuses}"
 
-    # ~3s of a 220Hz tone with amplitude envelope (clearly voiced), fed in
-    # 512-sample blocks like the capture loop does.
-    t = np.arange(16000 * 3) / 16000.0
-    tone = 0.5 * np.sin(2 * np.pi * 220 * t) * (
-        0.5 + 0.5 * np.sin(2 * np.pi * 0.5 * t)
-    )
-    tone = tone.astype(np.float32)
-    for start in range(0, len(tone), 512):
-        manager.feed(tone[start:start + 512])
-        time.sleep(0.032)  # roughly realtime
+    # Stream the utterance in 512-sample blocks (paced, not realtime-critical).
+    for start in range(0, len(audio), 512):
+        manager.feed(audio[start:start + 512])
+        time.sleep(0.005)
 
     # finish (end-of-audio) and drain: the server finalizes the tail.
     ok = manager.finish_and_drain(timeout=10.0)
@@ -97,4 +133,8 @@ def test_live_stream_commits_segment():
     assert sink.segments, "no segment committed from the live stream"
     segment = sink.segments[0]
     assert isinstance(segment, SonioxSegment)
-    assert segment.original  # some Russian transcription text
+    # Russian transcription with the Chinese one-way translation attached.
+    assert segment.original, "empty transcription"
+    assert segment.translation, "empty translation"
+    # Provisionals streamed before the commit (the live card's data source).
+    assert sink.lives, "no provisional updates received"

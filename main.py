@@ -670,9 +670,11 @@ class _SonioxSink:
 
     def __init__(self, app: "LiveTranslateApp"):
         self._app = app
+        self._last_live: SonioxLiveState | None = None
 
     def on_live(self, state: SonioxLiveState) -> None:
         app = self._app
+        self._last_live = state
         # One live card per segment: the first provisional of a segment
         # allocates the card; every later provisional updates it in place
         # (never a new card per token).
@@ -699,9 +701,29 @@ class _SonioxSink:
 
     def on_status(self, status: SonioxStatus) -> None:
         app = self._app
+        if status in (SonioxStatus.FINISHED, SonioxStatus.FAILED):
+            # Terminal: the connection is over either way. A dangling
+            # provisional live card must be settled now — engine teardown
+            # (switching back to a local engine) and runtime failure both
+            # land here, and without this the card hangs in its dim
+            # "recognizing" state forever and the stale msg_id would let a
+            # later session update the dead card.
+            self._finalize_live_card()
         if app._overlay:
             app._overlay.update_connection(
                 None if status in (SonioxStatus.FINISHED,) else status.value
+            )
+
+    def _finalize_live_card(self) -> None:
+        app = self._app
+        msg_id = app._soniox_live_msg_id
+        if msg_id is None:
+            return
+        app._soniox_live_msg_id = None
+        state = self._last_live
+        if state is not None and (state.original or state.translation) and app._overlay:
+            app._overlay.update_live(
+                msg_id, state.original, state.translation, final=True
             )
 
     def on_error(self, message: str) -> None:
@@ -2544,6 +2566,15 @@ class LiveTranslateApp:
                         self._session_generation,
                         self._transcript.active_session(),
                     )
+            else:
+                # Leaving cloud mode (engine fallback to local): the sink's
+                # FINISHED handling settles the live card and the chip; this
+                # clears the residual id deterministically in case that
+                # event raced or was lost, so the next cloud session cannot
+                # update a dead card.
+                self._soniox_live_msg_id = None
+                if self._overlay:
+                    self._overlay.update_connection(None)
             if self._running:
                 self._record_session_info()
 
