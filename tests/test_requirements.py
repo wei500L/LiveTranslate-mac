@@ -28,12 +28,18 @@ def test_funasr_uses_published_dependency_metadata():
 
 
 def test_soniox_sdk_is_pinned_in_both_requirement_files():
-    """The Soniox cloud engine depends on the official SDK in both platforms'
-    requirement files — the symmetry test alone would also accept it in
-    neither."""
-    for path in ("requirements.txt", "requirements-mac.txt"):
-        lines = _requirement_lines(path) if "mac" in path else _requirement_lines()
-        assert "soniox>=2.9,<3" in lines, f"{path} must pin soniox>=2.9,<3"
+    """The Soniox cloud engine depends on the official SDK (plus python-socks:
+    websockets raises ImportError through a SOCKS system proxy without it —
+    measured on a proxied macOS machine where the SDK was unusable until it
+    was installed) in both platforms' requirement files — the symmetry test
+    alone would also accept them in neither."""
+    for name in ("requirements.txt", "requirements-mac.txt"):
+        lines = _requirement_lines(name)
+        assert "soniox>=2.9,<3" in lines, f"{name} must pin soniox>=2.9,<3"
+        assert "python-socks>=2.4,<3" in lines, (
+            f"{name} must pin python-socks: the Soniox WebSocket connection "
+            "fails with ImportError on any SOCKS-proxied machine without it"
+        )
 
 
 def test_numpy_numba_versions_support_python_312_resolution():
