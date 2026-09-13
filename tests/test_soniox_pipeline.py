@@ -31,6 +31,7 @@ class RecordingOverlay:
     def __init__(self):
         self.messages = []      # (msg_id, timestamp, original, provider)
         self.live = []          # (msg_id, original, translation, final)
+        self.settles = []       # (msg_id, timestamp, original, translation)
         self.stats = []
         self.connections = []
         self._lock = threading.Lock()
@@ -51,6 +52,11 @@ class RecordingOverlay:
     def update_connection(self, status):
         with self._lock:
             self.connections.append(status)
+
+    def settle_live_message(self, msg_id, timestamp, original, translation,
+                            source_lang="ru"):
+        with self._lock:
+            self.settles.append((msg_id, timestamp, original, translation))
 
 
 class FakeSubwin:
@@ -183,9 +189,10 @@ def test_commit_without_anchor_is_display_only(app, tmp_path):
     )
     # No session was ever opened: no transcript files at all.
     assert list(tmp_path.glob("livetrans_*")) == []
-    # And the overlay got the final live render.
-    assert app._overlay.live
-    assert app._overlay.live[-1][1] == "Без сессии"
+    # And the overlay got the settle (final render, card reused/created).
+    assert app._overlay.settles
+    assert app._overlay.settles[-1][2] == "Без сессии"
+    assert app._overlay.settles[-1][3] == "无会话"
 
 
 def test_commit_with_stale_generation_is_display_only(app, tmp_path):

@@ -154,3 +154,94 @@ def test_local_mode_shows_no_connection_status(app):
     from i18n import t
 
     assert t("soniox_status_live") not in html
+
+
+def test_provider_survives_the_signal_path(app):
+    """Regression: the stale 5-arg @pyqtSlot on _on_add_message truncated the
+    6th (provider) argument, so cloud cards showed a fake 'ASR 0ms' chip even
+    though direct construction suppressed it. The decorator must match the
+    signal's arity."""
+    overlay = subtitle_overlay.SubtitleOverlay({})
+    overlay.add_message(7, "12:00:00", "Тест", "ru", 320.0, provider="soniox")
+    for _ in range(5):
+        app.processEvents()
+    msg = overlay._messages.get(7)
+    assert msg is not None
+    html = msg._header_label.text()
+    assert "ASR" not in html and "320" not in html
+
+
+def test_settle_reuses_the_provisional_card(app):
+    """The commit must settle the SAME card the provisionals created — the
+    old add_message-on-commit path leaked a second card per segment (the
+    stale provisional one stayed in the layout)."""
+    overlay = subtitle_overlay.SubtitleOverlay({})
+    overlay.add_message(10, "12:00:00", "При", "ru", 0.0, provider="soniox")
+    for _ in range(5):
+        app.processEvents()
+    overlay.settle_live_message(
+        10, "12:00:00", "Привет. Как у тебя?", "你好。你好吗？"
+    )
+    overlay._flush_streaming()
+    for _ in range(5):
+        app.processEvents()
+    # Exactly one card for this id in the dict AND the visible layout.
+    assert len(overlay._messages) == 1
+    card_widgets = [
+        overlay._msg_layout.itemAt(i).widget()
+        for i in range(overlay._msg_layout.count())
+        if overlay._msg_layout.itemAt(i).widget() is not None
+        and hasattr(overlay._msg_layout.itemAt(i).widget(), "msg_id")
+    ]
+    same_id = [w for w in card_widgets if w.msg_id == 10]
+    assert len(same_id) == 1
+    # And it is settled: final text, final colors, no cursor.
+    html = same_id[0]._header_label.text()
+    assert "Как у тебя?" in html
+    assert "▍" not in html
+    trans = same_id[0]._trans_label.text()
+    assert "你好吗？" in trans
+    assert "翻译中" not in trans and "translating" not in trans
+
+
+def test_settle_without_provisional_card_creates_final_card(app):
+    """A fast <end> with no provisionals still gets its (already-final)
+    card."""
+    overlay = subtitle_overlay.SubtitleOverlay({})
+    overlay.settle_live_message(11, "12:01:00", "Быстрая фраза", "快句")
+    for _ in range(5):
+        app.processEvents()
+    msg = overlay._messages.get(11)
+    assert msg is not None
+    assert "Быстрая фраза" in msg._header_label.text()
+    assert "快句" in msg._trans_label.text()
+    assert "ASR" not in msg._header_label.text()
+
+
+def test_provisional_cursor_marks_recognition_in_progress(app):
+    style = dict(subtitle_overlay.DEFAULT_STYLE)
+    msg = make_message(app, provider="soniox")
+    subtitle_overlay.ChatMessage._current_style = style
+    msg.update_live("Говорю", "在讲", final=False)
+    assert "▍" in msg._header_label.text()
+    msg.update_live("Говорю", "在讲", final=True)
+    assert "▍" not in msg._header_label.text()
+
+
+def test_duplicate_add_with_same_id_does_not_leak_widget(app):
+    """The overlay's own duplicate defense: re-adding the same msg_id (which
+    the old commit path did every segment) replaces the card instead of
+    stacking a second widget."""
+    overlay = subtitle_overlay.SubtitleOverlay({})
+    overlay.add_message(20, "12:00:00", "Первый", "ru", 0.0, provider="soniox")
+    overlay.add_message(20, "12:00:01", "Второй", "ru", 0.0, provider="soniox")
+    for _ in range(5):
+        app.processEvents()
+    assert len(overlay._messages) == 1
+    card_widgets = [
+        overlay._msg_layout.itemAt(i).widget()
+        for i in range(overlay._msg_layout.count())
+        if overlay._msg_layout.itemAt(i).widget() is not None
+        and getattr(overlay._msg_layout.itemAt(i).widget(), "msg_id", None) == 20
+    ]
+    assert len(card_widgets) == 1

@@ -2131,14 +2131,9 @@ class LiveTranslateApp:
         if not self._overlay:
             return
         self._msg_id += 1
-        msg_id = self._msg_id
-        self._overlay.add_message(
-            msg_id, datetime.now().strftime("%H:%M:%S"),
-            message, "ru", 0.0, provider="soniox",
+        self._overlay.settle_live_message(
+            self._msg_id, datetime.now().strftime("%H:%M:%S"), message, ""
         )
-        # Final live render with no translation: shows the cloud-mode
-        # "no translation" hint rather than a stuck "translating".
-        self._overlay.update_live(msg_id, message, "", final=True)
 
     def _commit_soniox_segment(self, segment: SonioxSegment) -> None:
         """Endpoint commit with the translation already provided.
@@ -2181,8 +2176,8 @@ class LiveTranslateApp:
                 # the legacy auto-open wildcard, and cloud commits must not
                 # open ghost sessions.
                 if self._overlay:
-                    self._overlay.update_live(
-                        msg_id, original_text, segment.translation, final=True
+                    self._overlay.settle_live_message(
+                        msg_id, timestamp, original_text, segment.translation
                     )
                 return
             msg_generation, expected_session = anchor
@@ -2195,15 +2190,10 @@ class LiveTranslateApp:
                     msg_generation, self._session_generation,
                 )
                 if self._overlay:
-                    self._overlay.update_live(
-                        msg_id, original_text, segment.translation, final=True
+                    self._overlay.settle_live_message(
+                        msg_id, timestamp, original_text, segment.translation
                     )
                 return
-            if self._overlay:
-                self._overlay.add_message(
-                    msg_id, timestamp, original_text, "ru", 0.0,
-                    provider="soniox",
-                )
             result = self._transcript.write_original(
                 msg_id, timestamp, original_text,
                 language="ru", session=expected_session,
@@ -2235,10 +2225,18 @@ class LiveTranslateApp:
                     )
                 self._translate_count += 1
                 self._session_work.release_msg(msg_generation, msg_id)
+                # The single card settle: reuses the provisional card (a
+                # second add_message here used to duplicate every segment —
+                # the old card leaked in the layout and the new one hung on
+                # "translating" forever).
+                if self._overlay:
+                    self._overlay.settle_live_message(
+                        msg_id, timestamp, original_text, segment.translation
+                    )
             elif self._overlay:
                 # WRITE_SKIPPED / WRITE_FAILED: subtitle-only display.
-                self._overlay.update_live(
-                    msg_id, original_text, segment.translation, final=True
+                self._overlay.settle_live_message(
+                    msg_id, timestamp, original_text, segment.translation
                 )
         if self._overlay:
             self._overlay.update_stats(

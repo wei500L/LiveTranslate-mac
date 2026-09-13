@@ -354,10 +354,15 @@ class ChatMessage(QWidget):
         orig_color = (
             s["original_color"] if final else s["provisional_original_color"]
         )
+        # The dim colors alone read as "faded old text"; an explicit cursor
+        # makes "this line is still being recognized" unmistakable and
+        # vanishes the moment the segment settles.
+        cursor = "" if final else '<span style="color:#666;"> ▍</span>'
         self._header_label.setText(
             f'<span style="color:{s["timestamp_color"]};">[{self._timestamp}]</span> '
             f'<span style="color:#e7b96f;">[{self._source_lang}]</span> '
             f'<span style="color:{orig_color};">{_escape(original)}</span>'
+            f"{cursor}"
         )
         if hasattr(self, "_streaming_timer"):
             self._streaming_timer.stop()
@@ -1104,6 +1109,7 @@ class SubtitleOverlay(QWidget):
     """Chat-style overlay window for displaying live transcription."""
 
     add_message_signal = pyqtSignal(int, str, str, str, float, str)
+    settle_live_signal = pyqtSignal(int, str, str, str, str)
     update_translation_signal = pyqtSignal(int, str, float)
     update_connection_signal = pyqtSignal(str)
     update_streaming_signal = pyqtSignal(int, str)
@@ -1164,6 +1170,7 @@ class SubtitleOverlay(QWidget):
         self._setup_ui()
 
         self.add_message_signal.connect(self._on_add_message)
+        self.settle_live_signal.connect(self._on_settle_live)
         self.update_translation_signal.connect(self._on_update_translation)
         self.update_connection_signal.connect(self._on_update_connection)
         self.update_streaming_signal.connect(self._on_update_streaming)
@@ -1424,15 +1431,26 @@ class SubtitleOverlay(QWidget):
     def _on_update_asr_device(self, device: str):
         self._monitor.update_asr_device(device)
 
-    @pyqtSlot(int, str, str, str, float)
+    @pyqtSlot(int, str, str, str, float, str)
     def _on_add_message(self, msg_id, timestamp, original, source_lang, asr_ms,
                          provider=""):
+        self._discard_card(msg_id)
         msg = ChatMessage(
             msg_id, timestamp, original, source_lang, asr_ms, provider=provider
         )
-        self._messages[msg_id] = msg
-        self._msg_layout.addWidget(msg)
+        self._append_card(msg)
 
+    def _discard_card(self, msg_id: int) -> None:
+        """Remove an existing card for this id (duplicate defense): a re-add
+        with the same id used to leak the old widget into the layout."""
+        old = self._messages.pop(msg_id, None)
+        if old is not None:
+            self._msg_layout.removeWidget(old)
+            old.deleteLater()
+
+    def _append_card(self, msg: "ChatMessage") -> None:
+        self._messages[msg.msg_id] = msg
+        self._msg_layout.addWidget(msg)
         if len(self._messages) > self._max_messages:
             oldest_id = min(self._messages.keys())
             old_msg = self._messages.pop(oldest_id)
@@ -1441,8 +1459,23 @@ class SubtitleOverlay(QWidget):
             # Remember that the view is no longer the whole session, so an
             # export can say so instead of quietly handing over a partial log.
             self._messages_dropped += 1
-
         QTimer.singleShot(50, self._scroll_to_bottom)
+
+    @pyqtSlot(int, str, str, str, str)
+    def _on_settle_live(self, msg_id, timestamp, original, translation,
+                        source_lang):
+        """Cloud commit: settle the live card into its final render — the
+        card created during provisionals is REUSED (never a second card);
+        a segment that never showed provisionals gets its card created here
+        already-final."""
+        msg = self._messages.get(msg_id)
+        if msg is None:
+            msg = ChatMessage(
+                msg_id, timestamp, original, source_lang, 0.0,
+                provider="soniox",
+            )
+            self._append_card(msg)
+        msg.update_live(original, translation, final=True)
 
     @pyqtSlot(int, str, float)
     def _on_update_translation(self, msg_id, translated, translate_ms):
@@ -1579,6 +1612,15 @@ class SubtitleOverlay(QWidget):
         token). Drained by the 50ms _streaming_timer flush."""
         with self._update_lock:
             self._live_updates[msg_id] = (original, translation, final)
+
+    def settle_live_message(self, msg_id, timestamp, original, translation,
+                            source_lang="ru"):
+        """Cloud commit: settle the live card to its final render on the Qt
+        thread — reuses the provisional card when it exists (no duplicate
+        card per segment), creates an already-final card otherwise."""
+        self.settle_live_signal.emit(
+            msg_id, timestamp, original, translation, source_lang
+        )
 
     def update_connection(self, status):
         """Cloud connection status for the monitor bar; None hides it."""
