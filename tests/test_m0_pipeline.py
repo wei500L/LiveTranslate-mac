@@ -128,12 +128,15 @@ def test_vad_reset_keeps_buffer_and_confidence_lengths_equal():
     import vad_processor
 
     vad = vad_processor.VADProcessor.__new__(vad_processor.VADProcessor)
+    vad.threshold = 0.5
     vad._speech_buffer = [object(), object()]
     vad._confidence_history = [0.9, 0.8]
     vad._speech_samples = 1024
+    vad._buffer_epoch = 0
     vad._is_speaking = True
     vad._silence_counter = 3
     vad._was_trimmed = True
+    vad._segment_threshold = 0.11
 
     vad._reset()
 
@@ -143,4 +146,7 @@ def test_vad_reset_keeps_buffer_and_confidence_lengths_equal():
     assert vad._speech_samples == 0
     assert vad._is_speaking is False
     assert vad._silence_counter == 0
+    # With no utterance in flight the next flush must judge against the live
+    # threshold, not the one the previous utterance was accumulated under.
+    assert vad._segment_threshold == 0.5
     assert vad._was_trimmed is False

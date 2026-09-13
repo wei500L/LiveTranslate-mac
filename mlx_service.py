@@ -5,6 +5,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import re
 import shutil
 import signal
 import socket
@@ -27,13 +28,25 @@ MLX_MODEL_DIR = APP_DIR / "models" / "hy-mt1.5-7b-mlx-4bit"
 MLX_LOG_DIR = APP_DIR / "logs"
 MLX_PID_FILE = MLX_LOG_DIR / "hy-mt1.5-7b-mlx.pid"
 MLX_HOST = "127.0.0.1"
+_MLX_PORT_ENV = os.getenv("LIVETRANSLATE_MLX_PORT")
 try:
-    MLX_PORT = int(os.getenv("LIVETRANSLATE_MLX_PORT", "8080"))
+    MLX_PORT = int(_MLX_PORT_ENV) if _MLX_PORT_ENV else 8080
 except ValueError:
     MLX_PORT = 8080
 if not 1 <= MLX_PORT <= 65535:
     MLX_PORT = 8080
 MLX_BASE_URL = normalize_api_base(f"http://{MLX_HOST}:{MLX_PORT}")
+# An explicitly exported LIVETRANSLATE_MLX_PORT pins the port: settings are
+# force-migrated to it. Without it the persisted managed_service.port is
+# authoritative, because the manager can move the port at runtime (see
+# MLX_PORT_SCAN_ATTEMPTS) and that choice must survive restarts.
+MLX_PORT_FROM_ENV = bool(_MLX_PORT_ENV)
+# How many ports to try upward when the configured one is occupied by a
+# service this app does not own. mlx_lm.server serves whatever model it
+# loaded and ignores the request's model field, so binding onto -- or
+# connecting to -- someone else's endpoint would silently run the wrong
+# model. Moving to a free port lets both services coexist.
+MLX_PORT_SCAN_ATTEMPTS = 20
 
 HY_MT_MODEL_ID = "default_model"
 HY_MT_MODEL_NAME = "HY-MT1.5-7B (MLX 4-bit)"
@@ -91,16 +104,24 @@ def hy_mt_model_config() -> dict[str, Any]:
         # sample: measured 4/4 identical outputs for a repeated sentence versus
         # 2/4 at temperature 0.7, with equal quality and lower latency (0.39s vs
         # 0.49s average). A subtitle for the same sentence should not change
-        # between one utterance and the next. repetition_penalty stays as the
-        # runaway guard — greedy decoding is if anything more loop-prone.
+        # between one utterance and the next.
         "overrides": {
             "temperature": 0.0,
             "top_p": 1.0,
             "max_tokens": 128,
         },
-        "extra_body": {
-            "repetition_penalty": 1.05,
-        },
+        # Deliberately empty. The runaway guard this field used to carry
+        # (repetition_penalty 1.05) disqualifies every request from
+        # mlx_lm.server's batch path — _is_batchable() rejects
+        # repetition_penalty != 0 — so concurrent translations serialized on
+        # the server's single generation thread and the app's translation
+        # worker pool queued behind each other. Measured on this build (4
+        # concurrent requests): last completion 2.2s serialized versus 1.6s
+        # batched, all four streaming from ~0.8s. The loop guard now lives
+        # app-side: Translator._check_repetition raises RepetitionError (a
+        # visible warning per sentence) and max_tokens=128 bounds the worst
+        # case.
+        "extra_body": {},
         "managed_service": {
             "type": "mlx_lm",
             "model_path": str(MLX_MODEL_DIR),
@@ -136,6 +157,56 @@ def _is_superseded_hy_mt_prompt(prompt: Any) -> bool:
 def is_hy_mt_model(model: dict[str, Any] | None) -> bool:
     service = (model or {}).get("managed_service") or {}
     return service.get("type") == "mlx_lm"
+
+
+def _valid_port(value: Any) -> bool:
+    return (
+        isinstance(value, int)
+        and not isinstance(value, bool)
+        and 1 <= value <= 65535
+    )
+
+
+def mlx_base_url_for(port: int) -> str:
+    return normalize_api_base(f"http://{MLX_HOST}:{port}")
+
+
+def managed_port_for(settings: dict[str, Any] | None) -> int:
+    """The port the HY-MT entry expects its local service on.
+
+    Falls back to the module default when there is no entry or no valid
+    persisted port, so callers always get a port they can hand to the
+    manager.
+    """
+    if isinstance(settings, dict):
+        for model in settings.get("models") or []:
+            if is_hy_mt_model(model):
+                port = (model.get("managed_service") or {}).get("port")
+                if _valid_port(port):
+                    return port
+                break
+    return MLX_PORT
+
+
+def sync_managed_endpoint(entry: dict[str, Any], port: int) -> bool:
+    """Point a HY-MT model entry at the port its local service runs on.
+
+    Pure dict surgery, so the panel can call it from whichever hook learned
+    the real port (task success, health probe) and handle saving and signal
+    emission itself. Returns whether anything changed.
+    """
+    if not _valid_port(port) or not is_hy_mt_model(entry):
+        return False
+    service = entry.setdefault("managed_service", {})
+    if (
+        service.get("port") == port
+        and entry.get("api_base") == mlx_base_url_for(port)
+    ):
+        return False
+    service["host"] = MLX_HOST
+    service["port"] = port
+    entry["api_base"] = mlx_base_url_for(port)
+    return True
 
 
 def ensure_hy_mt_model(settings: dict[str, Any] | None, activate_if_ready: bool = False) -> bool:
@@ -183,16 +254,29 @@ def ensure_hy_mt_model(settings: dict[str, Any] | None, activate_if_ready: bool 
         if target.get("extra_body") != preset["extra_body"]:
             target["extra_body"] = dict(preset["extra_body"])
             changed = True
-        # The managed endpoint follows the active local service port. This
-        # also migrates older settings when LIVETRANSLATE_MLX_PORT changes.
-        if target.get("api_base") != preset["api_base"]:
-            target["api_base"] = preset["api_base"]
-            changed = True
+        # The managed endpoint follows the local service port. With an
+        # explicit LIVETRANSLATE_MLX_PORT the preset wins (that is how
+        # changing the env var migrates older settings); otherwise the
+        # entry's own persisted port wins, because the manager may have
+        # moved it at runtime to dodge an occupied port and that choice
+        # must survive restarts.
         service = target.setdefault("managed_service", {})
-        for key in ("host", "port"):
-            if service.get(key) != preset["managed_service"][key]:
-                service[key] = preset["managed_service"][key]
-                changed = True
+        if MLX_PORT_FROM_ENV:
+            port = preset["managed_service"]["port"]
+        else:
+            port = service.get("port")
+            if not _valid_port(port):
+                port = preset["managed_service"]["port"]
+        base = mlx_base_url_for(port)
+        if target.get("api_base") != base:
+            target["api_base"] = base
+            changed = True
+        if service.get("port") != port:
+            service["port"] = port
+            changed = True
+        if service.get("host") != MLX_HOST:
+            service["host"] = MLX_HOST
+            changed = True
     if activate_if_ready and MLXServiceManager().is_model_ready():
         index = models.index(target)
         if settings.get("active_model") != index:
@@ -212,6 +296,12 @@ class MLXServiceManager:
         self.log_dir = self.root / "logs"
         self.pid_file = self.log_dir / MLX_PID_FILE.name
         self.process: subprocess.Popen | None = None
+        # The port the service is expected on / was last started with. The
+        # panel re-points it at the persisted managed_service.port, and
+        # ensure_running may move it to dodge an occupied port (the panel
+        # then persists the new value, so the next start goes straight to
+        # it).
+        self.port = MLX_PORT
         # Set by the UI layer so user-visible strings get localized without this
         # module importing i18n. Keys pass through untranslated by default.
         self.translate = None
@@ -238,7 +328,7 @@ class MLXServiceManager:
 
     @property
     def base_url(self) -> str:
-        return MLX_BASE_URL
+        return mlx_base_url_for(self.port)
 
     def is_model_ready(self) -> bool:
         required = ("config.json", "tokenizer.json", "chat_template.jinja")
@@ -525,8 +615,9 @@ class MLXServiceManager:
     def _url(self, path: str) -> str:
         return f"{self.base_url}{path}"
 
-    def _probe(self) -> dict[str, Any] | None:
-        request = Request(self._url("/models"), headers={"Accept": "application/json"})
+    def _probe(self, port: int | None = None) -> dict[str, Any] | None:
+        base = mlx_base_url_for(self.port if port is None else port)
+        request = Request(f"{base}/models", headers={"Accept": "application/json"})
         try:
             with urlopen(request, timeout=1.5) as response:
                 if response.status != 200:
@@ -540,12 +631,51 @@ class MLXServiceManager:
 
     def is_running(self) -> bool:
         pid = self._read_pid()
-        return bool(pid and self._pid_is_owned(pid) and self._probe() is not None)
+        if not (pid and self._pid_is_owned(pid)):
+            return False
+        # The owned process's command line is the only reliable statement of
+        # where our server actually listens: /v1/models cannot identify the
+        # model (mlx_lm scans the HF cache instead of reporting the loaded
+        # model), and the persisted port can drift -- re-selecting the preset
+        # in the model dialog resets the entry while the service keeps
+        # running on a port chosen earlier to dodge a conflict. Adopting the
+        # real port keeps the monitor, the settings and the translator
+        # pointing at the server that exists.
+        port = self._owned_process_port(pid) or self.port
+        if self._probe(port) is None:
+            return False
+        self.port = port
+        return True
 
-    def _port_is_open(self) -> bool:
+    def _owned_process_port(self, pid: int) -> int | None:
+        """The --port argument of an owned server process, if readable."""
+        try:
+            output = subprocess.check_output(
+                ["ps", "-p", str(pid), "-o", "command="],
+                text=True,
+                stderr=subprocess.DEVNULL,
+            )
+        except (OSError, subprocess.SubprocessError):
+            return None
+        match = re.search(r"--port[= ](\d{1,5})", output)
+        if match and _valid_port(int(match.group(1))):
+            return int(match.group(1))
+        return None
+
+    def _port_is_open(self, port: int | None = None) -> bool:
+        probe_port = self.port if port is None else port
         with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as sock:
             sock.settimeout(0.2)
-            return sock.connect_ex((MLX_HOST, MLX_PORT)) == 0
+            return sock.connect_ex((MLX_HOST, probe_port)) == 0
+
+    def _next_free_port(self) -> int | None:
+        """The first free port above the configured one, or None."""
+        for candidate in range(
+            self.port + 1, self.port + 1 + MLX_PORT_SCAN_ATTEMPTS
+        ):
+            if not self._port_is_open(candidate):
+                return candidate
+        return None
 
     def _read_pid(self) -> int | None:
         try:
@@ -600,7 +730,27 @@ class MLXServiceManager:
                 self._text("mlx_env_not_installed", path=str(self.env_dir))
             )
         if self._port_is_open():
-            raise MLXServiceError(self._text("mlx_port_occupied", port=MLX_PORT))
+            # Occupied by a service we do not own: killing it was never an
+            # option, and connecting to it would silently run the wrong
+            # model (mlx_lm serves whatever it loaded). Move to the next
+            # free port; the caller persists the choice so the next start
+            # does not have to move again.
+            free = self._next_free_port()
+            if free is None:
+                raise MLXServiceError(
+                    self._text(
+                        "mlx_port_occupied",
+                        port=self.port,
+                        attempts=MLX_PORT_SCAN_ATTEMPTS,
+                    )
+                )
+            log.info(
+                "Port %s is occupied by a service this app does not own; "
+                "starting the managed service on port %s instead",
+                self.port,
+                free,
+            )
+            self.port = free
 
         self.log_dir.mkdir(parents=True, exist_ok=True)
         # mlx-lm's /v1/models handler scans the Hugging Face cache even for a
@@ -615,7 +765,7 @@ class MLXServiceManager:
             "--host",
             MLX_HOST,
             "--port",
-            str(MLX_PORT),
+            str(self.port),
             "--log-level",
             "INFO",
             # Fallbacks for a request that omits them; the app always sends its

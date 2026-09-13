@@ -67,6 +67,8 @@ from mlx_service import (
     MLXServiceManager,
     ensure_hy_mt_model,
     is_hy_mt_model,
+    managed_port_for,
+    sync_managed_endpoint,
 )
 
 log = logging.getLogger("LiveTranslate.Panel")
@@ -359,6 +361,10 @@ class ControlPanel(QWidget):
             mlx_changed = ensure_hy_mt_model(self._current_settings, activate_if_ready=False)
             if mlx_changed:
                 _save_settings(self._current_settings)
+            # The manager probes and starts on this port; it may move at
+            # runtime to dodge an occupied one, and _sync_mlx_endpoint_if_
+            # moved persists wherever it ended up.
+            self._mlx_manager.port = managed_port_for(self._current_settings)
 
         self._current_settings.setdefault(
             "funasr_model",
@@ -690,8 +696,28 @@ class ControlPanel(QWidget):
         silero_group = QGroupBox(t("group_silero_threshold"))
         silero_layout = QGridLayout(silero_group)
         self._vad_threshold_slider = QSlider(Qt.Orientation.Horizontal)
-        self._vad_threshold_slider.setRange(0, 100)
+        # Floor at 5%, not 0: at threshold 0.0 `confidence >= threshold` is
+        # always true, so every chunk counts as speech, silence never
+        # accumulates and nothing is ever split on a pause -- the VAD is off
+        # while still looking enabled. A user hunting for a setting that works
+        # on a quiet speaker will find that slider position and be worse off.
+        self._vad_threshold_slider.setRange(5, 100)
+        # Migrate, don't just clamp. setValue() below is wired to the handler
+        # only *after* this point, so a persisted 0.0 would leave the slider
+        # showing 5, the label showing "0%", _current_settings still holding
+        # 0.0 and the engine still running with the VAD effectively off --
+        # four answers to one question. Anyone who has 0.0 on disk got there
+        # hunting for a setting that works on a quiet speaker, which is
+        # exactly the person this floor exists for.
         vad_pct = int(s.get("vad_threshold", 0.5) * 100)
+        if vad_pct < 5:
+            log.info(
+                "Migrating vad_threshold %.2f -> 0.05: below 0.05 every chunk "
+                "counts as speech and no pause ever splits a segment",
+                vad_pct / 100.0,
+            )
+            vad_pct = 5
+            s["vad_threshold"] = 0.05
         self._vad_threshold_slider.setValue(vad_pct)
         self._vad_threshold_slider.valueChanged.connect(self._on_threshold_changed)
         self._vad_threshold_slider.sliderReleased.connect(self._auto_save)
@@ -1742,6 +1768,11 @@ class ControlPanel(QWidget):
                 active = self._current_settings.get("active_model", 0)
                 if isinstance(active, int) and 0 <= active < len(models):
                     model = models[active]
+            # The service may have started on a port other than the entry's
+            # (the configured one was occupied). The entry must follow, or
+            # the translator keeps targeting the old endpoint while the
+            # health monitor happily probes the new one.
+            sync_managed_endpoint(model, self._mlx_manager.port)
             _save_settings(self._current_settings)
             self._refresh_model_list()
             self._emit_models_list_changed()
@@ -1798,6 +1829,18 @@ class ControlPanel(QWidget):
             )
         self._update_mlx_controls()
 
+    def showEvent(self, event):
+        # Re-opening the panel revokes a close that closeEvent deferred while
+        # an MLX task was still running. Without this, the pending flag
+        # outlives the user's change of mind and the panel the user just
+        # opened either stays greyed out (setEnabled(False) is only undone
+        # here) or is closed out from under them moments later -- the two
+        # ways "I clicked Settings and it vanished" was reported.
+        if getattr(self, "_close_after_mlx_task", False):
+            self._close_after_mlx_task = False
+            self.setEnabled(True)
+        super().showEvent(event)
+
     def closeEvent(self, event):
         # The records page's summary worker must stop before the widget tree
         # it reports to goes away.
@@ -1831,6 +1874,33 @@ class ControlPanel(QWidget):
         self._mlx_status_cache = state
         if changed:
             self._update_mlx_controls()
+        self._sync_mlx_endpoint_if_moved()
+
+    def _sync_mlx_endpoint_if_moved(self):
+        """Persist a runtime port move into the active HY-MT entry.
+
+        The manager learns the port the service really runs on either by
+        starting it (task success) or by reading the owned process's command
+        line (health probe adoption). The entry -- and with it the
+        translator's api_base -- must follow, or translations keep hitting
+        an endpoint nothing listens on while the monitor reports healthy.
+        """
+        models = self._current_settings.get("models", [])
+        active = self._current_settings.get("active_model")
+        if not (isinstance(active, int) and 0 <= active < len(models)):
+            return
+        model = models[active]
+        if not is_hy_mt_model(model):
+            return
+        if sync_managed_endpoint(model, self._mlx_manager.port):
+            _save_settings(self._current_settings)
+            self._refresh_model_list()
+            self._emit_models_list_changed()
+            self.model_changed.emit(model)
+            log.info(
+                "Managed MLX endpoint moved to port %s; settings updated",
+                self._mlx_manager.port,
+            )
 
     def request_mlx_health_check(self):
         if self._mlx_health_task is not None and self._mlx_health_task.isRunning():
@@ -1885,7 +1955,8 @@ class ControlPanel(QWidget):
             return
         self._close_after_mlx_task = False
         self.setEnabled(True)
-        QTimer.singleShot(0, self.close)
+        if self.isVisible():
+            QTimer.singleShot(0, self.close)
 
     def _emit_models_list_changed(self):
         models = self._current_settings.get("models", [])

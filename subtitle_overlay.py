@@ -482,6 +482,11 @@ class MonitorBar(QWidget):
         self._prompt_tokens = 0
         self._completion_tokens = 0
         self._cost = 0.0
+        # Segments the VAD threw away as noise. Shown only when non-zero: a
+        # discard emits nothing at all, so without this the user sees the app
+        # simply not reacting and has no way to tell "not heard" from
+        # "heard and dropped".
+        self._dropped = 0
 
         self._sys_timer = QTimer(self)
         self._sys_timer.timeout.connect(self._update_system)
@@ -489,9 +494,16 @@ class MonitorBar(QWidget):
         self._update_system()
         self._refresh_stats()
 
-    def update_audio(self, rms: float, vad: float, mic_rms=None):
+    def update_audio(self, rms: float, vad: float, mic_rms=None, dropped=None):
         self._rms_bar.setValue(min(100, int(rms * 500)))
         self._vad_bar.setValue(min(100, int(vad * 100)))
+        # Absolute count, never an increment: _flush_monitor coalesces, so any
+        # delta passed here would be lost whenever two pushes land in one 80ms
+        # window. None means "caller has nothing to report" (the pause/device
+        # -switch zeroing calls), which must not clear a real count.
+        if dropped is not None and dropped != self._dropped:
+            self._dropped = dropped
+            self._refresh_stats()
         mic_active = mic_rms is not None
         if self._mic_lbl.isVisible() != mic_active:
             self._mic_lbl.setVisible(mic_active)
@@ -542,6 +554,15 @@ class MonitorBar(QWidget):
             from i18n import get_lang
             symbol = "¥" if get_lang() == "zh" else "$"
             cost_str = f' <span style="color:#fa5;">{symbol}{self._cost:.4f}</span>'
+        # Same short-English-label convention as CPU/ASR/TL/Tok above, so it
+        # needs no i18n key. Absent while zero: the normal case must look
+        # exactly as it did before.
+        dropped_str = ""
+        if self._dropped > 0:
+            dropped_str = (
+                f' <span style="color:#555;">|</span> '
+                f'<span style="color:#e06c75;">Drop</span> {self._dropped}'
+            )
         self._stats_label.setText(
             f"{dev_str}"
             f'<span style="color:#e7b96f;">CPU</span> {self._cpu}% '
@@ -553,6 +574,7 @@ class MonitorBar(QWidget):
             f'<span style="color:#c8a982;">Tok</span> {tokens_str} '
             f'<span style="color:#666;">({self._prompt_tokens}\u2191{self._completion_tokens}\u2193)</span>'
             f'{cost_str}'
+            f'{dropped_str}'
         )
 
 
@@ -984,7 +1006,6 @@ class SubtitleOverlay(QWidget):
     update_streaming_signal = pyqtSignal(int, str)
     clear_signal = pyqtSignal()
     # Monitor signals (thread-safe)
-    update_monitor_signal = pyqtSignal(float, float, object)
     update_stats_signal = pyqtSignal(int, int, int, int, float)
     update_asr_device_signal = pyqtSignal(str)
 
@@ -1040,7 +1061,6 @@ class SubtitleOverlay(QWidget):
         self.update_translation_signal.connect(self._on_update_translation)
         self.update_streaming_signal.connect(self._on_update_streaming)
         self.clear_signal.connect(self._on_clear)
-        self.update_monitor_signal.connect(self._on_update_monitor)
         self.update_stats_signal.connect(self._on_update_stats)
         self.update_asr_device_signal.connect(self._on_update_asr_device)
 
@@ -1261,11 +1281,6 @@ class SubtitleOverlay(QWidget):
     def set_subtitle_checked(self, checked: bool):
         self._handle.set_subtitle_checked(checked)
 
-    @pyqtSlot(float, float, object)
-    def _on_update_monitor(self, rms: float, vad_conf: float, mic_rms):
-        with self._update_lock:
-            self._latest_monitor = (rms, vad_conf, mic_rms)
-
     def _flush_monitor(self):
         with self._update_lock:
             latest = self._latest_monitor
@@ -1443,9 +1458,15 @@ class SubtitleOverlay(QWidget):
         with self._update_lock:
             self._streaming_updates[msg_id] = partial_text
 
-    def update_monitor(self, rms, vad_conf, mic_rms=None):
+    def update_monitor(self, rms, vad_conf, mic_rms=None, dropped=None):
+        """Called from the capture thread; drained by _flush_monitor on Qt's.
+
+        ``dropped`` is VADProcessor.discarded_segments, an absolute count --
+        see MonitorBar.update_audio for why it must not be a delta. Leave it
+        None when the caller is only zeroing the level meters.
+        """
         with self._update_lock:
-            self._latest_monitor = (rms, vad_conf, mic_rms)
+            self._latest_monitor = (rms, vad_conf, mic_rms, dropped)
 
     def update_stats(self, asr_count, tl_count, prompt_tokens, completion_tokens, cost=0.0):
         self.update_stats_signal.emit(

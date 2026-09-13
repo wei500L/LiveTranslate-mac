@@ -59,7 +59,12 @@ from torch_backend import (
     normalize_device,
 )
 from platform_fonts import default_mono_font_family, default_ui_font_family
-from platform_app import configure_application, set_dock_visible
+from platform_app import (
+    configure_application,
+    present_window,
+    set_dock_visible,
+    window_is_foreground,
+)
 from platform_config import normalize_config
 from connection_config import (
     DEFAULT_REMOTE_ASR_URL,
@@ -1309,7 +1314,7 @@ class LiveTranslateApp:
             return
         with self._vad_lock:
             remaining = (
-                self._vad.force_flush() if self._interim_active else self._vad.flush()
+                self._vad.force_flush() if self._interim_active else self._vad.flush_final()
             )
         if remaining is None:
             return
@@ -2968,7 +2973,7 @@ class LiveTranslateApp:
                 self._process_interim_final(remaining)
         else:
             with self._vad_lock:
-                remaining = self._vad.flush()
+                remaining = self._vad.flush_final()
             if remaining is not None:
                 self._process_segment(remaining)
 
@@ -3021,7 +3026,7 @@ class LiveTranslateApp:
         with self._session_boundary_lock:
             with self._vad_lock:
                 remaining = (
-                    self._vad.force_flush() if self._interim_active else self._vad.flush()
+                    self._vad.force_flush() if self._interim_active else self._vad.flush_final()
                 )
             enqueued = False
             if remaining is not None and self._asr_ready:
@@ -3435,7 +3440,12 @@ class LiveTranslateApp:
             peek = self._vad.peek_buffer()
         if peek is None:
             return False
-        audio, duration = peek
+        # buf_epoch identifies the utterance this audio came from. The lock is
+        # dropped for the whole of recognition below, so by the time the trim
+        # runs the capture thread may have ended, split or discarded that
+        # utterance; trim_front checks the epoch and refuses rather than
+        # cutting into whatever is in the buffer now.
+        audio, duration, buf_epoch = peek
 
         # Don't bother with very short buffers
         if duration < 1.5:
@@ -3568,18 +3578,27 @@ class LiveTranslateApp:
             if trim_samples < min_trim and trim_samples > 0:
                 trim_samples = min(min_trim, total_samples // 2)
 
+        trimmed = False
         if trim_samples > 0:
             with self._vad_lock:
-                self._vad.trim_front(trim_samples)
+                trimmed = self._vad.trim_front(trim_samples, buf_epoch)
 
-        # Track committed text tail for echo dedup
+        # Both of these are kept even when the trim was refused. The sentences
+        # above are already written, and the utterance the refusal reports is
+        # one the capture thread has flushed whole -- its vad_flush is sitting
+        # in this same queue behind us. The echo tail is what stops that
+        # recognition from repeating the text we just committed, and
+        # _interim_active is what routes it through _process_interim_final,
+        # which is the only path that picks up _interim_pending. The
+        # vad_flush handler's finally clears both afterwards.
         self._interim_committed_tail = committed_text[-50:] if len(committed_text) > 50 else committed_text
 
         self._interim_active = True
         log.info(
             f"Interim ASR: consumed {len(committed_parts)} sentence(s) "
             f"({'committed' if actually_committed else 'buffered only'}), "
-            f"trimmed {trim_samples / 16000:.2f}s"
+            + (f"trimmed {trim_samples / 16000:.2f}s" if trimmed
+               else "trim refused (utterance already flushed)")
         )
         return actually_committed
 
@@ -3858,7 +3877,16 @@ class LiveTranslateApp:
             rms = float(np.sqrt(np.dot(chunk, chunk) / max(chunk.size, 1)))
 
             if self._overlay:
-                self._overlay.update_monitor(rms, self._vad.last_confidence, mic_rms)
+                # discarded_segments is read without _vad_lock: a display-only
+                # counter whose torn read costs at most one stale number for
+                # 80ms (see VADProcessor's class docstring on sanctioned
+                # unlocked reads). Passed absolute, never as a delta.
+                self._overlay.update_monitor(
+                    rms,
+                    self._vad.last_confidence,
+                    mic_rms,
+                    self._vad.discarded_segments,
+                )
 
             # Producer fence: the gate check, the VAD step and the enqueue
             # run under the session boundary lock, the same lock the end
@@ -4484,8 +4512,10 @@ def main():
                     3000,
                 )
         else:
-            overlay.show()
-            overlay.raise_()
+            # activate=False: the overlay is pinned on top and is shown
+            # without focus on purpose (WA_ShowWithoutActivating) so it never
+            # steals focus from the video it is translating.
+            present_window(overlay, activate=False)
             overlay_toggle_action.setText(t("tray_hide_overlay"))
 
     overlay_toggle_action.triggered.connect(on_toggle_overlay)
@@ -4525,8 +4555,7 @@ def main():
 
     def on_toggle_subwin(checked):
         if checked:
-            subwin.show()
-            subwin.raise_()
+            present_window(subwin, activate=False)
             if not _subwin_notified[0]:
                 _subwin_notified[0] = True
                 tray.showMessage(
@@ -4613,19 +4642,24 @@ def main():
     log_action = QAction(t("tray_show_log"))
     panel_action = QAction(t("tray_show_panel"))
 
+    # Both of these windows are ordinary floating windows: "visible" is not
+    # the same question as "the user can see it", and asking the wrong one is
+    # what made the Settings button look dead. A panel that is minimized,
+    # covered by another application, or sitting on the Space behind a
+    # fullscreen video still answers isVisible() -- so the old test hid the
+    # very window being asked for, and the click appeared to do nothing until
+    # a second one. Present unless the window is already in the user's face.
     def on_toggle_log():
-        if log_window.isVisible():
+        if window_is_foreground(log_window):
             log_window.hide()
         else:
-            log_window.show()
-            log_window.raise_()
+            present_window(log_window)
 
     def on_toggle_panel():
-        if panel.isVisible():
+        if window_is_foreground(panel):
             panel.hide()
         else:
-            panel.show()
-            panel.raise_()
+            present_window(panel)
 
     log_action.triggered.connect(on_toggle_log)
     panel_action.triggered.connect(on_toggle_panel)

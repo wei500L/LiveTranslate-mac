@@ -171,7 +171,7 @@ mlx_stop_before_prepare: "The HY-MT service is still running, so its model direc
 mlx_requires_apple_silicon: "HY-MT requires native Apple Silicon macOS."
 mlx_model_not_deployed: "The HY-MT model is not deployed: {path}. Click \u2018Prepare local model\u2019 in Translation settings."
 mlx_env_not_installed: "The MLX environment is not installed: {path}. Click \u2018Prepare local model\u2019 in Translation settings."
-mlx_port_occupied: "Port {port} is occupied by a non-MLX service; refusing to terminate it."
+mlx_port_occupied: "Every port from {port} through the next {attempts} candidates is occupied by another service; giving up on starting the local service (other processes are never terminated)."
 mlx_service_exited: "The MLX service exited with code {code}."
 mlx_start_timeout: "Timed out waiting for the MLX service at {url}"
 mlx_command_failed: "Command failed with exit code {code}: {command}"

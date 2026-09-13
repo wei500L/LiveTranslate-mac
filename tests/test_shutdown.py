@@ -278,6 +278,14 @@ class PausableApp:
             segment, self.segment = self.segment, None
             return segment
 
+        def flush_final(self):
+            # What pause()/session-end/stop actually call: no min-speech
+            # gate, because there is no next onset to merge a short
+            # remainder with.
+            self.flushed = "flush_final"
+            segment, self.segment = self.segment, None
+            return segment
+
         def force_flush(self):
             self.flushed = "force_flush"
             segment, self.segment = self.segment, None
@@ -294,7 +302,7 @@ def test_pause_hands_off_the_in_flight_utterance():
     app = PausableApp(buffered_segment="half a sentence")
     app.pause()
     assert app._paused is True
-    assert app._vad.flushed == "flush"
+    assert app._vad.flushed == "flush_final"
     assert _payloads(app._asr_queue) == [("vad_flush", "half a sentence")]
 
 

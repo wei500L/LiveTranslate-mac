@@ -22,10 +22,32 @@ def _window_handle(window):
     return handle
 
 
+def _platform_has_native_windows() -> bool:
+    """Whether this Qt platform plugin creates real native windows.
+
+    The offscreen plugin (tests, headless runs) fabricates a winId that is
+    not an NSView pointer, and handing it to objc.objc_object() dereferences
+    garbage -- a hard crash, not an exception we could catch. There is no
+    native window there to control in the first place, so every caller on
+    this path must simply report unavailable.
+    """
+    try:
+        from PyQt6.QtGui import QGuiApplication
+    except ImportError:
+        return False
+    if QGuiApplication.instance() is None:
+        return False
+    return QGuiApplication.platformName() != "offscreen"
+
+
 def _mac_ns_window(window):
     native = _window_handle(window)
     if hasattr(native, "setIgnoresMouseEvents_"):
         return native
+    if not _platform_has_native_windows():
+        raise ClickThroughUnavailableError(
+            "the offscreen platform has no native window to resolve"
+        )
     try:
         import objc
     except ImportError as exc:
@@ -90,6 +112,36 @@ _NS_WINDOW_COLLECTION_BEHAVIOR_CAN_JOIN_ALL_SPACES = 1 << 0
 _NS_WINDOW_COLLECTION_BEHAVIOR_FULLSCREEN_AUXILIARY = 1 << 8
 
 
+_NS_ALL_SPACES_BEHAVIOR = (
+    _NS_WINDOW_COLLECTION_BEHAVIOR_CAN_JOIN_ALL_SPACES
+    | _NS_WINDOW_COLLECTION_BEHAVIOR_FULLSCREEN_AUXILIARY
+)
+
+
+def set_visible_on_all_spaces(window, enabled: bool) -> bool:
+    """Let a window appear on whichever Space is active; return whether applied.
+
+    A plain window is bound to the Space it was opened on, so showing one
+    while another application is fullscreen creates it on the desktop
+    *behind* that fullscreen Space: Qt reports it visible, the user sees
+    nothing at all. Only the collection behavior is touched here -- the
+    window level is left alone, so this is the right call for a window that
+    should come to the front without then staying on top of everything.
+    """
+    if sys.platform != "darwin":
+        return False
+    try:
+        ns_window = _mac_ns_window(window)
+        behavior = int(ns_window.collectionBehavior())
+        if enabled:
+            ns_window.setCollectionBehavior_(behavior | _NS_ALL_SPACES_BEHAVIOR)
+        else:
+            ns_window.setCollectionBehavior_(behavior & ~_NS_ALL_SPACES_BEHAVIOR)
+    except Exception:
+        return False
+    return True
+
+
 def set_always_on_top(window, enabled: bool) -> bool:
     """Pin a window above other applications' windows; return whether applied.
 
@@ -109,20 +161,15 @@ def set_always_on_top(window, enabled: bool) -> bool:
         # No native window yet (created lazily), or PyObjC missing: the Qt
         # hint still applies, just without the Space pinning.
         return False
-    spaces = (
-        _NS_WINDOW_COLLECTION_BEHAVIOR_CAN_JOIN_ALL_SPACES
-        | _NS_WINDOW_COLLECTION_BEHAVIOR_FULLSCREEN_AUXILIARY
-    )
     try:
-        behavior = int(ns_window.collectionBehavior())
         if enabled:
             ns_window.setLevel_(_NS_MODAL_PANEL_WINDOW_LEVEL)
             if hasattr(ns_window, "setHidesOnDeactivate_"):
                 ns_window.setHidesOnDeactivate_(False)
-            ns_window.setCollectionBehavior_(behavior | spaces)
         else:
             ns_window.setLevel_(_NS_NORMAL_WINDOW_LEVEL)
-            ns_window.setCollectionBehavior_(behavior & ~spaces)
     except Exception:
         return False
-    return True
+    # The Space pinning is the same operation present_window() needs on a
+    # non-pinned window, so it lives in one place.
+    return set_visible_on_all_spaces(window, enabled)

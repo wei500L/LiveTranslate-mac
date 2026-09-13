@@ -171,7 +171,7 @@ mlx_stop_before_prepare: "HY-MT 服务仍在运行，无法替换模型目录。
 mlx_requires_apple_silicon: "HY-MT 需要原生 Apple Silicon macOS。"
 mlx_model_not_deployed: "HY-MT 模型尚未部署：{path}。请在翻译设置中点击\u2018准备本地模型\u2019。"
 mlx_env_not_installed: "MLX 运行环境尚未安装：{path}。请在翻译设置中点击\u2018准备本地模型\u2019。"
-mlx_port_occupied: "端口 {port} 被非 MLX 服务占用，已拒绝终止该进程。"
+mlx_port_occupied: "端口 {port} 起连续 {attempts} 个端口均被其他服务占用，已放弃启动本地服务（不会终止其他进程）。"
 mlx_service_exited: "MLX 服务退出，退出码 {code}。"
 mlx_start_timeout: "等待 MLX 服务启动超时：{url}"
 mlx_command_failed: "命令执行失败（退出码 {code}）：{command}"
