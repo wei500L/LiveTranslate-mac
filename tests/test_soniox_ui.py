@@ -1,6 +1,6 @@
 """Overlay UI tests for the Soniox cloud mode (offscreen Qt).
 
-Covers: latency chip suppression by provider, provisional colors, the
+Covers: timestamp/latency-chip removal, provisional colors, the
 one-live-card invariant (no per-token message creation), the MonitorBar
 connection status and the no-translation hint.
 """
@@ -36,33 +36,25 @@ def make_message(app, provider="", original="Привет", asr_ms=320.0):
     return msg
 
 
-def test_cloud_provider_hides_asr_chip(app):
-    msg = make_message(app, provider="soniox")
+def test_header_has_no_timestamp_or_latency_chips(app):
+    """The timestamp and ASR/TL latency chips were removed from the UI
+    (timestamps stay available for export; latency lives in PERF logs)."""
+    msg = make_message(app, provider="", original="Привет", asr_ms=320.0)
     html = msg._header_label.text()
+    assert "12:00:00" not in html
     assert "ASR" not in html
     assert "320" not in html
+    msg.set_translation("你好", 850.0)
+    trans = msg._trans_label.text()
+    assert "TL" not in trans and "850" not in trans
+    assert "你好" in trans
 
 
-def test_local_provider_keeps_asr_chip(app):
-    msg = make_message(app, provider="")
-    html = msg._header_label.text()
-    assert "ASR 320ms" in html
-
-
-def test_cloud_provider_hides_tl_chip(app):
+def test_header_keeps_language_tag(app):
     msg = make_message(app, provider="soniox")
-    msg.set_translation("你好", 850.0)
-    html = msg._trans_label.text()
-    assert "TL" not in html
-    assert "850" not in html
-    assert "你好" in html
-
-
-def test_local_provider_keeps_tl_chip(app):
-    msg = make_message(app, provider="")
-    msg.set_translation("你好", 850.0)
-    html = msg._trans_label.text()
-    assert "TL 850ms" in html
+    html = msg._header_label.text()
+    assert "[ru]" in html
+    assert "Привет" in html
 
 
 def test_provisional_live_uses_dim_colors(app):
@@ -158,8 +150,8 @@ def test_local_mode_shows_no_connection_status(app):
 
 def test_provider_survives_the_signal_path(app):
     """Regression: the stale 5-arg @pyqtSlot on _on_add_message truncated the
-    6th (provider) argument, so cloud cards showed a fake 'ASR 0ms' chip even
-    though direct construction suppressed it. The decorator must match the
+    6th (provider) argument, so cloud cards lost their provider identity and
+    later showed the wrong no-translation hint. The decorator must match the
     signal's arity."""
     overlay = subtitle_overlay.SubtitleOverlay({})
     overlay.add_message(7, "12:00:00", "Тест", "ru", 320.0, provider="soniox")
@@ -167,8 +159,14 @@ def test_provider_survives_the_signal_path(app):
         app.processEvents()
     msg = overlay._messages.get(7)
     assert msg is not None
-    html = msg._header_label.text()
-    assert "ASR" not in html and "320" not in html
+    # The provider arrived intact through the queued-signal path...
+    assert msg._provider == "soniox"
+    # ...and drives the cloud-specific no-translation hint on settle.
+    msg.set_translation("", 0.0)
+    from i18n import t
+
+    assert t("soniox_no_translation") in msg._trans_label.text()
+    assert "12:00:00" not in msg._header_label.text()
 
 
 def test_settle_reuses_the_provisional_card(app):
@@ -226,6 +224,50 @@ def test_provisional_cursor_marks_recognition_in_progress(app):
     assert "▍" in msg._header_label.text()
     msg.update_live("Говорю", "在讲", final=True)
     assert "▍" not in msg._header_label.text()
+
+
+def test_local_card_initial_state_is_not_dim(app):
+    """Local (non-cloud) cards never set _live_provisional: the original
+    line must use the normal original_color, with no cursor — only the
+    cloud live path dims."""
+    style = dict(subtitle_overlay.DEFAULT_STYLE)
+    msg = make_message(app, provider="")
+    subtitle_overlay.ChatMessage._current_style = style
+    html = msg._header_label.text()
+    assert style["original_color"] in html
+    assert style["provisional_original_color"] not in html
+    assert "▍" not in html
+
+
+def test_local_and_cloud_cards_share_the_render_path(app):
+    """update_streaming/set_translation (local) and update_live (cloud) all
+    funnel through _render(): after any mutation both lines' HTML can be
+    regenerated purely from state — e.g. apply_style must not lose the
+    provisional dim or a settled empty-translation hint."""
+    style = dict(subtitle_overlay.DEFAULT_STYLE)
+    subtitle_overlay.ChatMessage._current_style = style
+    # Cloud provisional card survives a style re-apply with dim + cursor.
+    cloud = make_message(app, provider="soniox")
+    cloud.update_live("Говорю", "在讲", final=False)
+    assert "▍" in cloud._header_label.text()
+    cloud.apply_style(style)
+    assert "▍" in cloud._header_label.text()
+    assert style["provisional_original_color"] in cloud._header_label.text()
+    assert style["provisional_translation_color"] in cloud._trans_label.text()
+    # Local card: streaming partial survives a style re-apply.
+    local = make_message(app, provider="")
+    local.update_streaming("正在翻")
+    local._flush_streaming()
+    assert "正在翻" in local._trans_label.text()
+    local.apply_style(style)
+    assert "正在翻" in local._trans_label.text()
+    # Settled-without-translation hint survives a style re-apply.
+    local.set_translation("", 100.0)
+    from i18n import t
+
+    assert t("same_language") in local._trans_label.text()
+    local.apply_style(style)
+    assert t("same_language") in local._trans_label.text()
 
 
 def test_duplicate_add_with_same_id_does_not_leak_widget(app):

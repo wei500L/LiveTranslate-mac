@@ -21,8 +21,10 @@ main = pytest.importorskip(
     "main", reason="main.py needs torch + PyQt6, which the offline job skips"
 )
 
+import logging  # noqa: E402
+
 from transcript_writer import TranscriptWriter  # noqa: E402
-from soniox_accumulator import SonioxSegment  # noqa: E402
+from soniox_accumulator import SonioxLiveState, SonioxSegment  # noqa: E402
 
 
 class RecordingOverlay:
@@ -102,6 +104,8 @@ class StandIn:
         self._session_state = main.SessionState.ACTIVE
         self._soniox_anchor = None
         self._soniox_live_msg_id = None
+        self._soniox_segment_started_at = None
+        self._soniox_last_token_at = None
         self._soniox_committed = set()
         self._msg_id = 0
         self._asr_count = 0
@@ -117,6 +121,7 @@ class StandIn:
 
         # Bind the real methods.
         self._commit_soniox_segment = main.LiveTranslateApp._commit_soniox_segment.__get__(self)
+        self._take_soniox_timing = main.LiveTranslateApp._take_soniox_timing.__get__(self)
         self._soniox_engine_active = main.LiveTranslateApp._soniox_engine_active.__get__(self)
         self._soniox_manager = main.LiveTranslateApp._soniox_manager.__get__(self)
         self._soniox_feed = main.LiveTranslateApp._soniox_feed.__get__(self)
@@ -179,6 +184,52 @@ def test_same_msg_id_recommit_is_refused_by_writer(app, tmp_path):
     app._transcript.set_recording(False)
     summary = app._transcript.end_session()
     assert summary["entries"] == 1
+
+
+def test_commit_logs_cloud_segment_timing(app, caplog):
+    """Cloud latency is never shown in the UI; the log is where it lives.
+
+    A segment that showed provisional text logs the two numbers measured
+    from the sink's stamps; a segment that never did (fast <end>) logs no
+    timing rather than a fabricated zero.
+    """
+    session_id = app._transcript.begin_session()
+    app._session_work.begin(app._session_generation)
+    app._soniox_anchor = (app._session_generation, session_id)
+
+    sink = main._SonioxSink(app)
+    sink.on_live(SonioxLiveState(original="Привет", translation=""))
+    with caplog.at_level(logging.INFO, logger="LiveTranslate"):
+        app._commit_soniox_segment(
+            SonioxSegment(original="Привет мир", translation="你好世界")
+        )
+    lines = [r.getMessage() for r in caplog.records if "Soniox segment" in r.getMessage()]
+    assert len(lines) == 1
+    assert "live " in lines[0] and "endpoint +" in lines[0]
+    assert "Привет мир" in lines[0]
+
+    # Stamps are consumed: a second segment with no provisionals of its own
+    # cannot inherit the first one's numbers.
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="LiveTranslate"):
+        app._commit_soniox_segment(
+            SonioxSegment(original="Вторая", translation="第二")
+        )
+    lines = [r.getMessage() for r in caplog.records if "Soniox segment" in r.getMessage()]
+    assert len(lines) == 1
+    assert "live " not in lines[0] and "endpoint" not in lines[0]
+
+
+def test_terminal_status_drops_the_pending_segment_timing(app):
+    """A dangling live card settled by FINISHED/FAILED never commits, so its
+    stamps must not leak into the next segment's log line."""
+    sink = main._SonioxSink(app)
+    sink.on_live(SonioxLiveState(original="Незаконченная", translation=""))
+    assert app._soniox_segment_started_at is not None
+    sink.on_status(main.SonioxStatus.FINISHED)
+    assert app._soniox_segment_started_at is None
+    assert app._soniox_last_token_at is None
+    assert app._take_soniox_timing() == ""
 
 
 def test_commit_without_anchor_is_display_only(app, tmp_path):

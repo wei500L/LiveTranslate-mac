@@ -35,11 +35,10 @@ DEFAULT_STYLE = {
     "border_radius": 8,
     "original_font_family": default_cjk_font_family(),
     "translation_font_family": default_cjk_font_family(),
-    "original_font_size": 11,
-    "translation_font_size": 14,
-    "original_color": "#cccccc",
+    "original_font_size": 10,
+    "translation_font_size": 15,
+    "original_color": "#9a9aa8",
     "translation_color": "#ffffff",
-    "timestamp_color": "#888899",
     # Dimmer variants for streaming (provisional) text — cloud live card.
     "provisional_original_color": "#7a7a8c",
     "provisional_translation_color": "#b8b8c0",
@@ -60,8 +59,8 @@ STYLE_PRESETS = {
     "compact": {
         **_BASE,
         "preset": "compact",
-        "original_font_size": 9,
-        "translation_font_size": 11,
+        "original_font_size": 8,
+        "translation_font_size": 12,
     },
     "light": {
         **_BASE,
@@ -70,9 +69,8 @@ STYLE_PRESETS = {
         "bg_opacity": 230,
         "header_color": "#c8c8d8",
         "header_opacity": 220,
-        "original_color": "#333333",
+        "original_color": "#555560",
         "translation_color": "#111111",
-        "timestamp_color": "#666688",
     },
     "dracula": {
         **_BASE,
@@ -81,9 +79,8 @@ STYLE_PRESETS = {
         "bg_opacity": 235,
         "header_color": "#44475a",
         "header_opacity": 230,
-        "original_color": "#f8f8f2",
+        "original_color": "#b4b4c2",
         "translation_color": "#f8f8f2",
-        "timestamp_color": "#6272a4",
     },
     "nord": {
         **_BASE,
@@ -94,7 +91,6 @@ STYLE_PRESETS = {
         "header_opacity": 230,
         "original_color": "#d8dee9",
         "translation_color": "#eceff4",
-        "timestamp_color": "#4c566a",
     },
     "monokai": {
         **_BASE,
@@ -103,9 +99,8 @@ STYLE_PRESETS = {
         "bg_opacity": 235,
         "header_color": "#3e3d32",
         "header_opacity": 230,
-        "original_color": "#f8f8f2",
+        "original_color": "#b8b8b0",
         "translation_color": "#f8f8f2",
-        "timestamp_color": "#75715e",
     },
     "solarized": {
         **_BASE,
@@ -116,7 +111,6 @@ STYLE_PRESETS = {
         "header_opacity": 230,
         "original_color": "#839496",
         "translation_color": "#eee8d5",
-        "timestamp_color": "#586e75",
     },
     "gruvbox": {
         **_BASE,
@@ -125,9 +119,8 @@ STYLE_PRESETS = {
         "bg_opacity": 235,
         "header_color": "#3c3836",
         "header_opacity": 230,
-        "original_color": "#ebdbb2",
+        "original_color": "#bdae93",
         "translation_color": "#fbf1c7",
-        "timestamp_color": "#928374",
     },
     "tokyo_night": {
         **_BASE,
@@ -138,7 +131,6 @@ STYLE_PRESETS = {
         "header_opacity": 230,
         "original_color": "#a9b1d6",
         "translation_color": "#c0caf5",
-        "timestamp_color": "#565f89",
     },
     "catppuccin": {
         **_BASE,
@@ -147,9 +139,8 @@ STYLE_PRESETS = {
         "bg_opacity": 235,
         "header_color": "#313244",
         "header_opacity": 230,
-        "original_color": "#cdd6f4",
+        "original_color": "#a6adc8",
         "translation_color": "#cdd6f4",
-        "timestamp_color": "#6c7086",
     },
     "one_dark": {
         **_BASE,
@@ -160,7 +151,6 @@ STYLE_PRESETS = {
         "header_opacity": 230,
         "original_color": "#abb2bf",
         "translation_color": "#e5c07b",
-        "timestamp_color": "#636d83",
     },
     "everforest": {
         **_BASE,
@@ -169,9 +159,8 @@ STYLE_PRESETS = {
         "bg_opacity": 235,
         "header_color": "#343f44",
         "header_opacity": 230,
-        "original_color": "#d3c6aa",
+        "original_color": "#9da9a0",
         "translation_color": "#d3c6aa",
-        "timestamp_color": "#859289",
     },
     "kanagawa": {
         **_BASE,
@@ -180,11 +169,78 @@ STYLE_PRESETS = {
         "bg_opacity": 235,
         "header_color": "#2a2a37",
         "header_opacity": 230,
-        "original_color": "#dcd7ba",
+        "original_color": "#c8c3a6",
         "translation_color": "#dcd7ba",
-        "timestamp_color": "#54546d",
     },
 }
+
+
+# Values shipped *before* the two-line hierarchy redesign. A stored style
+# whose field still equals the value its preset shipped back then was never
+# customized by the user, so it is safe to upgrade; any other value is a
+# deliberate choice and is left alone. Without this, apply_style's
+# `{**DEFAULT_STYLE, **style}` merge lets a style saved by an older build
+# pin the old look forever and the new layout never appears.
+_LEGACY_STYLE_DEFAULTS = {
+    "original_font_size": 11,
+    "translation_font_size": 14,
+    "original_color": "#cccccc",
+}
+
+# Presets whose pre-redesign value differed from the pre-redesign default.
+_LEGACY_PRESET_VALUES = {
+    "compact": {"original_font_size": 9, "translation_font_size": 11},
+    "light": {"original_color": "#333333"},
+    "dracula": {"original_color": "#f8f8f2"},
+    "monokai": {"original_color": "#f8f8f2"},
+    "gruvbox": {"original_color": "#ebdbb2"},
+    "catppuccin": {"original_color": "#cdd6f4"},
+    "everforest": {"original_color": "#d3c6aa"},
+    "kanagawa": {"original_color": "#dcd7ba"},
+}
+
+#: Style keys that no longer exist; dropped on load rather than carried.
+_REMOVED_STYLE_KEYS = ("timestamp_color",)
+
+
+def migrate_style(style: dict) -> tuple[dict, bool]:
+    """Carry a stored overlay style across the two-line hierarchy redesign.
+
+    Returns ``(style, changed)``. Removed keys are dropped, and each
+    hierarchy field still holding its pre-redesign shipped value is
+    upgraded to the current value for that preset; a field the user
+    actually changed keeps its value.
+
+    Idempotent: a migrated (or newly saved) style comes back unchanged.
+    """
+    if not isinstance(style, dict):
+        return style, False
+    out = dict(style)
+    changed = False
+    for key in _REMOVED_STYLE_KEYS:
+        if key in out:
+            del out[key]
+            changed = True
+
+    preset_key = out.get("preset", "default")
+    preset = STYLE_PRESETS.get(preset_key) or DEFAULT_STYLE
+    legacy_overrides = _LEGACY_PRESET_VALUES.get(preset_key, {})
+    for field, legacy_default in _LEGACY_STYLE_DEFAULTS.items():
+        if field not in out:
+            continue
+        legacy_value = legacy_overrides.get(field, legacy_default)
+        if out[field] == legacy_value and out[field] != preset[field]:
+            out[field] = preset[field]
+            changed = True
+    return out, changed
+
+
+# Fixed accent colors shared by every message card. They are deliberately
+# not style fields: the language tag / hint / provisional cursor are UI
+# chrome, not user-tintable content colors.
+_LANG_TAG_COLOR = "#e7b96f"
+_HINT_COLOR = "#999"
+_CURSOR_COLOR = "#666"
 
 
 def _hex_to_rgba(hex_color: str, opacity: int) -> str:
@@ -194,10 +250,17 @@ def _hex_to_rgba(hex_color: str, opacity: int) -> str:
 
 
 class ChatMessage(QWidget):
-    """Single chat message widget with original + async translation."""
+    """Single chat message widget: small original line + large translation
+    line (the visual hierarchy — the translation is the primary content).
+
+    Rendering is state-driven: the mutators (update_streaming /
+    set_translation / update_live / apply_style) only change state fields,
+    then one `_render()` derives both lines' HTML from that state. Local
+    cards and cloud (live) cards share this single path; the only cloud-only
+    visual is the provisional dim + cursor, driven by `_live_provisional`.
+    """
 
     _current_style = DEFAULT_STYLE
-    _compact_mode = False
 
     def __init__(
         self,
@@ -215,20 +278,27 @@ class ChatMessage(QWidget):
         self._translated = ""
         self._timestamp = timestamp
         self._source_lang = source_lang
-        self._asr_ms = asr_ms
-        # Cloud providers suppress the per-message latency chips: their
-        # latency is provider-side and not ours to display (never a fake
-        # "0ms"). Per-message so history cards keep their chips when the
-        # engine changes mid-run.
+        # asr_ms is accepted (the signal/slot arity and every caller pass it)
+        # but deliberately not stored: latency is not displayed anywhere any
+        # more, and local latency is measured in main.py's PERF log. Keeping a
+        # dead field here invited the belief that something renders it.
+        # The cloud provider id drives the no-translation hint wording
+        # (soniox_no_translation vs same_language) when a segment settles
+        # without a translation.
         self._provider = provider
-        self._translate_ms = 0.0
+        # Rendering state.
+        self._live_provisional = False  # cloud card: recognition still running
+        self._streaming_partial = None  # latest local streaming partial, if any
+        self._settled = False  # a final translation outcome was recorded
         self.setObjectName("chatMessage")
         self._layout = QVBoxLayout(self)
         self._layout.setContentsMargins(8, 4, 8, 4)
-        self._layout.setSpacing(2)
+        # Breathing room between the secondary original line and the
+        # primary translation line.
+        self._layout.setSpacing(4)
 
         s = self._current_style
-        self._header_label = QLabel(self._build_header_html(s))
+        self._header_label = QLabel()
         self._header_label.setFont(
             QFont(s["original_font_family"], s["original_font_size"])
         )
@@ -237,9 +307,7 @@ class ChatMessage(QWidget):
         self._header_label.setStyleSheet("background: transparent;")
         self._layout.addWidget(self._header_label)
 
-        self._trans_label = QLabel(
-            f'<span style="color:#999; font-style:italic;">{t("translating")}</span>'
-        )
+        self._trans_label = QLabel()
         self._trans_label.setFont(
             QFont(s["translation_font_family"], s["translation_font_size"])
         )
@@ -247,24 +315,72 @@ class ChatMessage(QWidget):
         self._trans_label.setWordWrap(True)
         self._trans_label.setStyleSheet("background: transparent;")
         self._layout.addWidget(self._trans_label)
+        self._render()
 
-    def _build_header_html(self, s):
-        if self._compact_mode:
-            return (
-                f'<span style="color:#e7b96f;">[{self._source_lang}]</span> '
-                f'<span style="color:{s["original_color"]};">{_escape(self._original)}</span>'
-            )
-        asr_chip = (
-            ""
-            if self._provider == "soniox"
-            else f'<span style="color:#8b8; font-size:9pt;">ASR {self._asr_ms:.0f}ms</span>'
-        )
+    # -- rendering ---------------------------------------------------------
+
+    def _decorate(self, escaped_text: str, role: str) -> str:
+        """Single extension point for per-role text decoration (e.g. future
+        terminology highlighting on original/translation lines). Identity
+        for now."""
+        return escaped_text
+
+    def _original_line_html(self, s) -> str:
+        if self._live_provisional:
+            color = s["provisional_original_color"]
+            # The dim colors alone read as "faded old text"; an explicit
+            # cursor makes "this line is still being recognized" unmistakable
+            # and vanishes the moment the segment settles.
+            cursor = f'<span style="color:{_CURSOR_COLOR};"> ▍</span>'
+        else:
+            color = s["original_color"]
+            cursor = ""
         return (
-            f'<span style="color:{s["timestamp_color"]};">[{self._timestamp}]</span> '
-            f'<span style="color:#e7b96f;">[{self._source_lang}]</span> '
-            f'<span style="color:{s["original_color"]};">{_escape(self._original)}</span> '
-            f'{asr_chip}'
+            f'<span style="color:{_LANG_TAG_COLOR};">[{self._source_lang}]</span> '
+            f'<span style="color:{color};">'
+            f'{self._decorate(_escape(self._original), "original")}</span>'
+            f"{cursor}"
         )
+
+    def _translation_line_html(self, s) -> str:
+        if self._streaming_partial is not None:
+            return (
+                f'<span style="color:{s["translation_color"]};">&gt; '
+                f'{self._decorate(_escape(self._streaming_partial), "translation")}</span>'
+            )
+        if self._live_provisional:
+            if self._translated:
+                return (
+                    f'<span style="color:{s["provisional_translation_color"]};">&gt; '
+                    f'{self._decorate(_escape(self._translated), "translation")}</span>'
+                )
+            return (
+                f'<span style="color:{_HINT_COLOR}; font-style:italic;">{t("translating")}</span>'
+            )
+        if self._translated:
+            return (
+                f'<span style="color:{s["translation_color"]};">&gt; '
+                f'{self._decorate(_escape(self._translated), "translation")}</span>'
+            )
+        if self._settled:
+            hint = (
+                t("soniox_no_translation")
+                if self._provider == "soniox"
+                else t("same_language")
+            )
+            return (
+                f'<span style="color:{_HINT_COLOR}; font-style:italic;">&gt; {hint}</span>'
+            )
+        return (
+            f'<span style="color:{_HINT_COLOR}; font-style:italic;">{t("translating")}</span>'
+        )
+
+    def _render(self):
+        s = self._current_style
+        self._header_label.setText(self._original_line_html(s))
+        self._trans_label.setText(self._translation_line_html(s))
+
+    # -- state mutators ----------------------------------------------------
 
     def update_streaming(self, partial_text: str):
         """Update translation label with partial streaming text (throttled)."""
@@ -283,110 +399,43 @@ class ChatMessage(QWidget):
         if text is None:
             return
         self._pending_streaming = None
-        s = self._current_style
-        self._trans_label.setText(
-            f'<span style="color:{s["translation_color"]};">&gt; {_escape(text)}</span>'
-        )
+        self._streaming_partial = text
+        self._render()
 
-    def set_translation(self, translated: str, translate_ms: float):
-        self._translated = translated or ""
-        self._translate_ms = translate_ms
-        # Stop streaming throttle if active
+    def _stop_streaming(self):
         if hasattr(self, "_streaming_timer"):
             self._streaming_timer.stop()
-            self._pending_streaming = None
-        s = self._current_style
-        if translated:
-            if self._compact_mode:
-                self._trans_label.setText(
-                    f'<span style="color:{s["translation_color"]};">&gt; {_escape(translated)}</span>'
-                )
-            else:
-                tl_chip = (
-                    ""
-                    if self._provider == "soniox"
-                    else f'<span style="color:#db8; font-size:9pt;">TL {translate_ms:.0f}ms</span>'
-                )
-                self._trans_label.setText(
-                    f'<span style="color:{s["translation_color"]};">&gt; {_escape(translated)}</span> '
-                    f'{tl_chip}'
-                )
-        else:
-            hint = (
-                t("soniox_no_translation")
-                if self._provider == "soniox"
-                else t("same_language")
-            )
-            self._trans_label.setText(
-                f'<span style="color:#aaa; font-style:italic;">&gt; {hint}</span>'
-            )
+        self._pending_streaming = None
+        self._streaming_partial = None
+
+    def set_translation(self, translated: str, translate_ms: float):
+        # translate_ms is accepted for the signal/slot arity but not stored —
+        # see the note in __init__.
+        self._translated = translated or ""
+        self._settled = True
+        self._stop_streaming()
+        self._render()
 
     def apply_style(self, s: dict):
-        self._header_label.setText(self._build_header_html(s))
         self._header_label.setFont(
             QFont(s["original_font_family"], s["original_font_size"])
         )
         self._trans_label.setFont(
             QFont(s["translation_font_family"], s["translation_font_size"])
         )
-        if self._translated:
-            if self._compact_mode:
-                self._trans_label.setText(
-                    f'<span style="color:{s["translation_color"]};">&gt; {_escape(self._translated)}</span>'
-                )
-            else:
-                tl_chip = (
-                    ""
-                    if self._provider == "soniox"
-                    else f'<span style="color:#db8; font-size:9pt;">TL {self._translate_ms:.0f}ms</span>'
-                )
-                self._trans_label.setText(
-                    f'<span style="color:{s["translation_color"]};">&gt; {_escape(self._translated)}</span> '
-                    f'{tl_chip}'
-                )
+        self._render()
 
     def update_live(self, original: str, translation: str, final: bool):
         """Cloud live card: render both lines in place, provisional (dim) or
         final (normal). Throttled by the overlay's batched flush, so this
         runs at most every 50ms, not per token."""
         self._original = original
-        s = self._current_style
-        orig_color = (
-            s["original_color"] if final else s["provisional_original_color"]
-        )
-        # The dim colors alone read as "faded old text"; an explicit cursor
-        # makes "this line is still being recognized" unmistakable and
-        # vanishes the moment the segment settles.
-        cursor = "" if final else '<span style="color:#666;"> ▍</span>'
-        self._header_label.setText(
-            f'<span style="color:{s["timestamp_color"]};">[{self._timestamp}]</span> '
-            f'<span style="color:#e7b96f;">[{self._source_lang}]</span> '
-            f'<span style="color:{orig_color};">{_escape(original)}</span>'
-            f"{cursor}"
-        )
-        if hasattr(self, "_streaming_timer"):
-            self._streaming_timer.stop()
-            self._pending_streaming = None
+        self._translated = translation
+        self._live_provisional = not final
         if final:
-            self._translated = translation
-            if translation:
-                self._trans_label.setText(
-                    f'<span style="color:{s["translation_color"]};">&gt; {_escape(translation)}</span>'
-                )
-            else:
-                self._trans_label.setText(
-                    f'<span style="color:#aaa; font-style:italic;">&gt; {t("soniox_no_translation")}</span>'
-                )
-        else:
-            if translation:
-                self._trans_label.setText(
-                    f'<span style="color:{s["provisional_translation_color"]};">'
-                    f'&gt; {_escape(translation)}</span>'
-                )
-            else:
-                self._trans_label.setText(
-                    f'<span style="color:#999; font-style:italic;">{t("translating")}</span>'
-                )
+            self._settled = True
+        self._stop_streaming()
+        self._render()
 
     def contextMenuEvent(self, event):
         menu = QMenu(self)
@@ -1098,6 +1147,13 @@ class DragHandle(QWidget):
     def set_mode(self, mode: str):
         if mode != self._mode:
             self._apply_mode(mode)
+            # Announce it, exactly like the toggle button does: callers that
+            # switch the mode programmatically (a menu, a restored window
+            # state) must get the same downstream effects as a click — the
+            # monitor bar hides, the app's own mode_changed fires. The old
+            # apply-without-emit left the header compact and the monitor bar
+            # still showing.
+            self.mode_changed.emit(mode)
 
     def set_subtitle_checked(self, checked: bool):
         self._subtitle_btn.setStyleSheet(
@@ -1361,10 +1417,6 @@ class SubtitleOverlay(QWidget):
     def _on_mode_changed(self, mode: str):
         compact = mode == "compact"
         self._monitor.setVisible(not compact)
-        ChatMessage._compact_mode = compact
-        s = ChatMessage._current_style
-        for msg in self._messages.values():
-            msg.apply_style(s)
         self.mode_changed.emit(mode)
 
         # Animate window height

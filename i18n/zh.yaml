@@ -85,7 +85,6 @@ label_original_color: "原文颜色:"
 label_translation_font: "译文字体:"
 label_translation_font_size: "译文字号:"
 label_translation_color: "译文颜色:"
-label_timestamp_color: "时间戳颜色:"
 group_window: "窗口"
 label_window_opacity: "窗口透明度:"
 

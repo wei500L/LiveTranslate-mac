@@ -162,9 +162,16 @@ segment before end_session(). pause()/resume() delegate to manager.pause/resume
 (SDK finalize on pause — no sentence splicing across the pause); stop() calls
 finish_and_drain then shutdown, all bounded. Overlay: one live card per segment
 (`_SonioxSink.on_live` allocates once, `update_live` updates in place, 50ms batched
-flush — never a card per token); `provider="soniox"` on ChatMessage suppresses the
-ASR/TL latency chips (per-message, not class-level — history cards keep their
-chips); MonitorBar shows the five-state connection indicator. Settings:
+flush — never a card per token); `provider="soniox"` on ChatMessage selects the
+cloud no-translation hint (`soniox_no_translation` vs `same_language`) and nothing
+else — latency is never displayed for any engine (see the message-card paragraph
+below); MonitorBar shows the five-state connection indicator. Per-segment cloud
+timing is recorded in the log, not the UI: `_SonioxSink.on_live` stamps
+`_soniox_segment_started_at` / `_soniox_last_token_at` (monotonic) as the segment's
+provisional text arrives, and `_commit_soniox_segment` consumes them through
+`_take_soniox_timing()` into its `Soniox segment [ru] (live …, endpoint +…)` line —
+a segment with no provisionals logs no timing rather than a fabricated zero.
+Settings:
 soniox_api_key (env SONIOX_API_KEY wins; filtered from the panel's settings log),
 soniox_context, soniox_segmentation (accuracy/balanced/low_latency endpoint
 presets; context/segmentation changes apply via manager.apply_config — a graceful
@@ -783,9 +790,43 @@ DragHandle is a 2-row header bar:
 
 MonitorBar displays: ASR device, CPU/RAM/GPU usage, ASR/TL counts, token usage with cost estimation (¥/$ based on UI language).
 
+Message cards (`ChatMessage`) are **state-driven, one render path** for both
+chains — local and cloud. `update_streaming` / `set_translation` / `update_live` /
+`apply_style` only mutate state fields (`_streaming_partial`, `_live_provisional`,
+`_settled`, `_translated`, `_original`); a single `_render()` derives both lines
+through `_original_line_html()` + `_translation_line_html()`. There is no
+`_build_header_html` and no per-path HTML: the cloud-only visual (dim +
+`▍` cursor) is driven by `_live_provisional`, which only `update_live` sets, so
+local cards never dim. `_decorate(escaped_text, role)` is the single extension
+point for per-role decoration (identity today; terminology highlighting would
+land there). The layout is a two-line hierarchy — small secondary original
+above, large high-contrast translation below (`original_font_size` 10 /
+`translation_font_size` 15 by default, spacing 4); every preset must keep
+`original_color != translation_color` and `original_font_size <
+translation_font_size` (tests/test_overlay_style.py guards it).
+
+**Timestamps and latency chips are not displayed** — for any engine. Timestamps
+survive in the model (`_timestamp`) for `export_messages` and in the transcript
+record; local ASR/translation latency lives in the PERF log
+(`_record_latency`), cloud per-segment timing in the `Soniox segment …` log line.
+`provider` is still a constructor field but only selects the settled
+no-translation hint. Consequence: window-level compact mode no longer changes
+card rendering at all (the removed-`_compact_mode` class variable is gone), so
+`_on_mode_changed` only hides the MonitorBar and re-emits.
+
+Removed style keys are dropped at load and hierarchy fields still holding a
+pre-redesign value are upgraded by `migrate_style()` (called from
+`control_panel.migrate_style_settings()` inside `_load_saved_settings`, then
+persisted). It must run at *load* time, before the panel fills its style
+controls: those write the whole dict back on the next auto-save, so a
+render-time-only migration would be reverted by the next settings save. A field
+the user actually customized keeps its value — only values equal to the
+pre-redesign shipped value for that preset are upgraded (`_LEGACY_STYLE_DEFAULTS`
+/ `_LEGACY_PRESET_VALUES`).
+
 Style system:
 - `DEFAULT_STYLE` and `STYLE_PRESETS` defined in `subtitle_overlay.py` — 14 presets including terminal themes (Dracula, Nord, Monokai, Solarized, Gruvbox, Tokyo Night, Catppuccin, One Dark, Everforest, Kanagawa)
-- Default style is high-contrast (pure black background, white translation text, 14pt)
+- Default style is high-contrast (pure black background, white translation text, 15pt)
 - Original and translation text have independent `font_family` fields (`original_font_family`, `translation_font_family`)
 - `SubtitleOverlay.apply_style(style)` updates container/header backgrounds, window opacity, and rebuilds all message HTML
 - Style dict stored in `user_settings.json` under `"style"` key; forwarded via `settings_changed` signal → `main.py` → `overlay.apply_style()`

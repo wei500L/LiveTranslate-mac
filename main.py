@@ -675,6 +675,8 @@ class _SonioxSink:
     def on_live(self, state: SonioxLiveState) -> None:
         app = self._app
         self._last_live = state
+        now = time.monotonic()
+        app._soniox_last_token_at = now
         # One live card per segment: the first provisional of a segment
         # allocates the card; every later provisional updates it in place
         # (never a new card per token).
@@ -687,6 +689,8 @@ class _SonioxSink:
             app._msg_id += 1
             msg_id = app._msg_id
             app._soniox_live_msg_id = msg_id
+            # First text of this segment on screen: the timing baseline.
+            app._soniox_segment_started_at = now
             timestamp = datetime.now().strftime("%H:%M:%S")
             if app._overlay:
                 app._overlay.add_message(
@@ -725,6 +729,10 @@ class _SonioxSink:
         if msg_id is None:
             return
         app._soniox_live_msg_id = None
+        # Terminal status: this segment never reached a commit, so its
+        # stamps must not describe the next one.
+        app._soniox_segment_started_at = None
+        app._soniox_last_token_at = None
         state = self._last_live
         if state is not None and (state.original or state.translation) and app._overlay:
             app._overlay.update_live(
@@ -787,6 +795,14 @@ class LiveTranslateApp:
         # lock by _commit_soniox_segment. None = display-only (no session).
         self._soniox_anchor = None
         self._soniox_live_msg_id = None
+        # Per-segment cloud timing, monotonic stamps taken by the sink:
+        # _soniox_segment_started_at when the segment's first provisional
+        # reached the overlay (its live card opened), _soniox_last_token_at
+        # on every event. Consumed by _take_soniox_timing() at commit. The
+        # UI deliberately shows no cloud latency; this is the log-side
+        # record of it.
+        self._soniox_segment_started_at = None
+        self._soniox_last_token_at = None
         # msg_ids already committed by the cloud path this session
         # generation: a replayed commit (duplicate <end> dispatch, a
         # drain-timeout straggler racing the flush) must not append a
@@ -2135,6 +2151,36 @@ class LiveTranslateApp:
             self._msg_id, datetime.now().strftime("%H:%M:%S"), message, ""
         )
 
+    def _take_soniox_timing(self) -> str:
+        """Consume the current segment's timing stamps into a log suffix.
+
+        Cloud latency is provider-side and is deliberately absent from the
+        UI; this is where it is recorded instead. Two numbers, both
+        measured against the stamps the sink takes on the supervisor
+        thread:
+
+          * ``live``     — first provisional text on screen → commit. This
+            is "how long the sentence occupied the live card", i.e. the
+            speech itself plus the endpoint detection that ended it.
+          * ``endpoint`` — last token event → commit: the endpoint
+            detector's own latency plus the finalize round trip, which is
+            the part a lag complaint is usually actually about.
+
+        A segment that never showed provisionals (a fast ``<end>``) has no
+        baseline and logs no timing rather than a fabricated zero.
+        """
+        started = self._soniox_segment_started_at
+        last_token = self._soniox_last_token_at
+        self._soniox_segment_started_at = None
+        self._soniox_last_token_at = None
+        now = time.monotonic()
+        parts = []
+        if started is not None:
+            parts.append(f"live {now - started:.2f}s")
+        if last_token is not None:
+            parts.append(f"endpoint +{now - last_token:.2f}s")
+        return f" ({', '.join(parts)})" if parts else ""
+
     def _commit_soniox_segment(self, segment: SonioxSegment) -> None:
         """Endpoint commit with the translation already provided.
 
@@ -2155,6 +2201,7 @@ class LiveTranslateApp:
         # needs its own id.
         msg_id = self._soniox_live_msg_id
         self._soniox_live_msg_id = None
+        timing = self._take_soniox_timing()
         if msg_id is None:
             self._msg_id += 1
             msg_id = self._msg_id
@@ -2166,7 +2213,7 @@ class LiveTranslateApp:
         self._soniox_committed.add(msg_id)
         timestamp = datetime.now().strftime("%H:%M:%S")
         self._asr_count += 1
-        log.info("Soniox segment [ru]: %s", original_text)
+        log.info("Soniox segment [ru]%s: %s", timing, original_text)
 
         with self._session_boundary_lock:
             anchor = self._soniox_anchor
@@ -2591,6 +2638,8 @@ class LiveTranslateApp:
                 # event raced or was lost, so the next cloud session cannot
                 # update a dead card.
                 self._soniox_live_msg_id = None
+                self._soniox_segment_started_at = None
+                self._soniox_last_token_at = None
                 if self._overlay:
                     self._overlay.update_connection(None)
             if self._running:

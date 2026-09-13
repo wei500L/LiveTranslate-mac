@@ -204,6 +204,27 @@ def migrate_performance_settings(settings: dict | None) -> dict | None:
     return settings
 
 
+def migrate_style_settings(settings: dict | None) -> bool:
+    """Upgrade a stored overlay style across the two-line hierarchy redesign.
+
+    Returns whether anything changed (so the caller can persist it). Runs at
+    load time, *before* the panel fills its style controls: those controls
+    write the whole style dict back on the next auto-save, so a migration
+    applied only at render time would be reverted by the next settings save.
+    """
+    if not isinstance(settings, dict):
+        return False
+    style = settings.get("style")
+    if not isinstance(style, dict):
+        return False
+    from subtitle_overlay import migrate_style
+
+    upgraded, changed = migrate_style(style)
+    if changed:
+        settings["style"] = upgraded
+    return changed
+
+
 def active_index_after_removal(removed: int, active: int, remaining: int) -> int:
     """Where active_model points after `removed` is deleted from the list.
 
@@ -240,10 +261,11 @@ def _load_saved_settings() -> dict | None:
             old_version = int(data.get("performance_profile_version", 0) or 0)
             migrate_funasr_settings(data)
             migrate_performance_settings(data)
+            style_migrated = migrate_style_settings(data)
             mlx_changed = ensure_hy_mt_model(data, activate_if_ready=False) if sys.platform == "darwin" else False
             if int(data.get("performance_profile_version", 0) or 0) != old_version:
                 _save_settings(data)
-            elif mlx_changed:
+            elif mlx_changed or style_migrated:
                 _save_settings(data)
             log.info(f"Loaded saved settings from {SETTINGS_FILE}")
             return data
@@ -1159,13 +1181,6 @@ class ControlPanel(QWidget):
         )
         text_layout.addWidget(self._trans_color_btn, 5, 1)
 
-        text_layout.addWidget(QLabel(t("label_timestamp_color")), 6, 0)
-        self._ts_color_btn = self._make_color_btn(
-            s.get("timestamp_color", DEFAULT_STYLE["timestamp_color"])
-        )
-        self._ts_color_btn.clicked.connect(lambda: self._pick_color(self._ts_color_btn))
-        text_layout.addWidget(self._ts_color_btn, 6, 1)
-
         layout.addWidget(text_group)
 
         # Window group
@@ -1223,7 +1238,6 @@ class ControlPanel(QWidget):
             "translation_font_size": self._trans_font_size.value(),
             "original_color": self._orig_color_btn.property("hex_color"),
             "translation_color": self._trans_color_btn.property("hex_color"),
-            "timestamp_color": self._ts_color_btn.property("hex_color"),
             "window_opacity": self._window_opacity.value(),
         }
 
@@ -1251,10 +1265,6 @@ class ControlPanel(QWidget):
         self._trans_color_btn.setProperty("hex_color", s["translation_color"])
         self._trans_color_btn.setStyleSheet(
             f"background-color: {s['translation_color']}; border: 1px solid #888; border-radius: 3px;"
-        )
-        self._ts_color_btn.setProperty("hex_color", s["timestamp_color"])
-        self._ts_color_btn.setStyleSheet(
-            f"background-color: {s['timestamp_color']}; border: 1px solid #888; border-radius: 3px;"
         )
         self._window_opacity.setValue(s["window_opacity"])
 

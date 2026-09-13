@@ -85,7 +85,6 @@ label_original_color: "Original Color:"
 label_translation_font: "Translation Font:"
 label_translation_font_size: "Translation Font Size:"
 label_translation_color: "Translation Color:"
-label_timestamp_color: "Timestamp Color:"
 group_window: "Window"
 label_window_opacity: "Window Opacity:"
 
