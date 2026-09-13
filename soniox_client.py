@@ -46,6 +46,13 @@ log = logging.getLogger("LiveTranslate.soniox")
 SONIOX_MODEL = "stt-rt-v5"
 SONIOX_SAMPLE_RATE = 16000
 SONIOX_LANGUAGE_HINTS = ["ru"]
+# Code-switching profile: measured on mixed ru+en lecture audio, a strict
+# ["ru"]-only hint transliterates English terms into Cyrillic ("algorithm
+# complexity" -> "алгоритм комплексити"), while ["ru", "en"] keeps them in
+# Latin script and the Chinese translation preserves the terms verbatim
+# ("学习 algorithm complexity") — the classroom reality of ru lecturers
+# reading English terminology.
+SONIOX_MIXED_LANGUAGE_HINTS = ["ru", "en"]
 SONIOX_TARGET_LANGUAGE = "zh"
 
 # Reconnect backoff schedule (seconds), capped at the last value.
@@ -106,6 +113,7 @@ class SonioxRuntimeConfig:
     api_key: str
     context_text: str = ""
     segmentation: str = "accuracy"
+    mixed_language: bool = False
     enable_language_identification: bool = False
 
 
@@ -323,7 +331,7 @@ class SonioxServiceManager:
             if self._stop_requested:
                 return
             changed = False
-            for key in ("context_text", "segmentation"):
+            for key in ("context_text", "segmentation", "mixed_language"):
                 if key in changes and changes[key] != getattr(self._config, key):
                     setattr(self._config, key, changes[key])
                     changed = True
@@ -451,13 +459,21 @@ class SonioxServiceManager:
         preset = SEGMENTATION_PRESETS.get(
             self._config.segmentation, SEGMENTATION_PRESETS["accuracy"]
         )
+        hints = (
+            SONIOX_MIXED_LANGUAGE_HINTS
+            if self._config.mixed_language
+            else SONIOX_LANGUAGE_HINTS
+        )
         cfg = RealtimeSTTConfig(
             model=SONIOX_MODEL,
             audio_format="pcm_s16le",
             sample_rate=SONIOX_SAMPLE_RATE,
             num_channels=1,
-            language_hints=SONIOX_LANGUAGE_HINTS,
-            language_hints_strict=True,
+            language_hints=hints,
+            # strict is documented as "best results with one language hint";
+            # with two hints (code-switching) the non-strict bias lets the
+            # model follow the actual switches.
+            language_hints_strict=not self._config.mixed_language,
             enable_endpoint_detection=True,
             translation=TranslationConfig(
                 type="one_way", target_language=SONIOX_TARGET_LANGUAGE,

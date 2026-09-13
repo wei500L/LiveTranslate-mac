@@ -28,6 +28,7 @@ from PyQt6.QtWidgets import (
     QProgressBar,
     QStackedWidget,
     QAbstractItemView,
+    QCheckBox,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -710,18 +711,27 @@ class ControlPanel(QWidget):
         self._soniox_seg_combo.setCurrentIndex(seg_idx)
         self._soniox_seg_combo.currentIndexChanged.connect(self._auto_save)
         soniox_layout.addWidget(self._soniox_seg_combo, 2, 1)
-        soniox_layout.addWidget(QLabel(t("label_soniox_context")), 3, 0)
+        # Code-switching: measured on mixed ru+en lecture audio, the strict
+        # ru-only hint transliterates English terms into Cyrillic; with this
+        # checkbox the hints become ["ru","en"] and English terms survive in
+        # Latin script (and in the Chinese translation) verbatim.
+        self._soniox_mixed_cb = QCheckBox(t("label_soniox_mixed"))
+        self._soniox_mixed_cb.setToolTip(t("soniox_mixed_tooltip"))
+        self._soniox_mixed_cb.setChecked(bool(s.get("soniox_mixed_language", False)))
+        self._soniox_mixed_cb.toggled.connect(self._auto_save)
+        soniox_layout.addWidget(self._soniox_mixed_cb, 3, 0, 1, 2)
+        soniox_layout.addWidget(QLabel(t("label_soniox_context")), 4, 0)
         self._soniox_context_edit = QPlainTextEdit(
             (s.get("soniox_context") or "").strip()
         )
         self._soniox_context_edit.setPlaceholderText(t("soniox_context_placeholder"))
         self._soniox_context_edit.setMaximumHeight(96)
         self._soniox_context_edit.textChanged.connect(self._auto_save)
-        soniox_layout.addWidget(self._soniox_context_edit, 3, 1)
+        soniox_layout.addWidget(self._soniox_context_edit, 4, 1)
         cloud_note = QLabel(t("soniox_note_cloud"))
         cloud_note.setWordWrap(True)
         cloud_note.setStyleSheet("color: #888; font-size: 11px;")
-        soniox_layout.addWidget(cloud_note, 4, 0, 1, 2)
+        soniox_layout.addWidget(cloud_note, 5, 0, 1, 2)
         layout.addWidget(self._soniox_group)
         self._soniox_group.setVisible(engine_idx == 5)
 
@@ -829,8 +839,6 @@ class ControlPanel(QWidget):
         timing_layout.addWidget(self._silence_mode, 2, 1)
         timing_layout.addWidget(QLabel(t("label_silence_dur")), 3, 0)
         timing_layout.addWidget(self._silence_duration, 3, 1)
-
-        from PyQt6.QtWidgets import QCheckBox
 
         self._incremental_asr_cb = QCheckBox(t("label_incremental_asr"))
         self._incremental_asr_cb.setToolTip(t("incremental_asr_tooltip"))
@@ -2308,6 +2316,9 @@ class ControlPanel(QWidget):
             self._current_settings["soniox_segmentation"] = seg_values[
                 self._soniox_seg_combo.currentIndex()
             ]
+            self._current_settings["soniox_mixed_language"] = (
+                self._soniox_mixed_cb.isChecked()
+            )
         self._current_settings["funasr_model"] = self._selected_funasr_model()
         if hasattr(self, "_remote_url_edit"):
             url = self._remote_url_edit.text().strip()

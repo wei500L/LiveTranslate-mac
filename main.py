@@ -679,6 +679,11 @@ class _SonioxSink:
         # allocates the card; every later provisional updates it in place
         # (never a new card per token).
         if app._soniox_live_msg_id is None:
+            if not (state.original or state.translation):
+                # Post-<end> cleared snapshot: there is nothing to show.
+                # Opening a card here leaves an empty bubble stuck on
+                # "translating" until the next utterance.
+                return
             app._msg_id += 1
             msg_id = app._msg_id
             app._soniox_live_msg_id = msg_id
@@ -1693,7 +1698,12 @@ class LiveTranslateApp:
             )
         # `settings` is the full settings dict on every auto-save, so a key being
         # present says nothing about the user having changed it. Compare values.
-        if "soniox_context" in settings or "soniox_segmentation" in settings:
+        if any(
+            key in settings
+            for key in (
+                "soniox_context", "soniox_segmentation", "soniox_mixed_language",
+            )
+        ):
             manager = self._soniox_manager()
             if manager is not None:
                 changes = {}
@@ -1702,6 +1712,10 @@ class LiveTranslateApp:
                 if "soniox_segmentation" in settings:
                     changes["segmentation"] = (
                         settings.get("soniox_segmentation") or "accuracy"
+                    )
+                if "soniox_mixed_language" in settings:
+                    changes["mixed_language"] = bool(
+                        settings.get("soniox_mixed_language")
                     )
                 manager.apply_config(**changes)
         if "audio_device" in settings:
@@ -1900,6 +1914,7 @@ class LiveTranslateApp:
                 api_key=config.get("soniox_api_key"),
                 context_text=config.get("soniox_context") or "",
                 segmentation=config.get("soniox_segmentation") or "accuracy",
+                mixed_language=bool(config.get("soniox_mixed_language")),
                 sink=self._soniox_sink,
             )
         return self._load_asr_client(config)
@@ -2408,6 +2423,11 @@ class LiveTranslateApp:
             ),
             "soniox_segmentation": (
                 settings.get("soniox_segmentation", "accuracy")
+                if engine_type == "soniox"
+                else None
+            ),
+            "soniox_mixed_language": (
+                bool(settings.get("soniox_mixed_language"))
                 if engine_type == "soniox"
                 else None
             ),

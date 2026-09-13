@@ -339,3 +339,64 @@ def test_sink_terminal_status_without_live_card_is_noop():
     sink = main._SonioxSink(app)
     sink.on_status(main.SonioxStatus.FINISHED)
     assert overlay.live == []
+
+
+def test_engine_shim_starts_its_manager():
+    """Regression: SonioxASREngine used to build the manager but never call
+    start() — the engine loaded, audio queued, and the connection never
+    began (manager stuck in CONNECTING forever). The offline tests all
+    passed because they started their own managers; only the real app path
+    exposed it. The shim must come up running."""
+    asr_soniox = pytest.importorskip(
+        "asr_soniox", reason="asr_soniox needs the soniox package"
+    )
+
+    started = []
+
+    class FakeManager:
+        def __init__(self):
+            self.status = "ready"
+            self.shutdown_calls = 0
+
+        def start(self):
+            started.append(True)
+
+        def shutdown(self, timeout=5.0):
+            self.shutdown_calls += 1
+
+    # asr_soniox binds the class at import time; patch its own namespace.
+    original = asr_soniox.SonioxServiceManager
+    asr_soniox.SonioxServiceManager = lambda config, sink: FakeManager()
+    try:
+        engine = asr_soniox.SonioxASREngine(
+            api_key="k", sink=_NullSink()
+        )
+        assert started, "engine constructed without starting its manager"
+        assert engine.status == "ready"
+        engine.shutdown()
+    finally:
+        asr_soniox.SonioxServiceManager = original
+
+
+class _NullSink:
+    def on_live(self, s): pass
+    def on_segments(self, s): pass
+    def on_status(self, s): pass
+    def on_error(self, m): pass
+    def on_metrics(self, m): pass
+
+
+def test_sink_does_not_open_card_for_empty_provisional():
+    """Post-<end> cleared snapshots must not spawn an empty card stuck on
+    'translating'."""
+    overlay = RecordingOverlay()
+    app = SinkApp(overlay)
+    sink = main._SonioxSink(app)
+    from soniox_accumulator import SonioxLiveState
+
+    sink.on_live(SonioxLiveState(original="", translation=""))
+    assert overlay.messages == []
+    assert app._soniox_live_msg_id is None
+    # Real speech opens the card as before.
+    sink.on_live(SonioxLiveState(original="Речь", translation=""))
+    assert len(overlay.messages) == 1

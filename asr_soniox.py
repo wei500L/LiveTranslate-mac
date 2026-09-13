@@ -35,6 +35,7 @@ class SonioxASREngine:
         api_key: str | None,
         context_text: str = "",
         segmentation: str = "accuracy",
+        mixed_language: bool = False,
         sink: SonioxSink,
     ) -> None:
         if not api_key:
@@ -54,9 +55,16 @@ class SonioxASREngine:
                 api_key=api_key,
                 context_text=context_text,
                 segmentation=segmentation,
+                mixed_language=mixed_language,
             ),
             sink,
         )
+        # The manager must actually start here: nothing else in the app calls
+        # start() (the standalone tests do, which is exactly why a missing
+        # call here passed every offline test and only failed in the real
+        # app — the engine loaded, audio queued, and the connection never
+        # even began, the manager sitting in CONNECTING forever).
+        self._manager.start()
         self._stopped = False
         log.info(
             "Soniox engine created (key %s, segmentation=%s)",
