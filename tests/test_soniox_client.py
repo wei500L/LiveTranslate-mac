@@ -486,6 +486,54 @@ def test_duplicate_events_dropped(factory):
     manager.shutdown(timeout=3.0)
 
 
+class FakeErrorEvent:
+    def __init__(self, error_code, error_type, message):
+        self.tokens = []
+        self.finished = False
+        self.error_code = error_code
+        self.error_type = error_type
+        self.error_message = message
+
+
+def test_unauthenticated_error_type_is_fatal_no_retry(factory):
+    """The docs say to branch on error_type (stable), not error_code. An
+    unauthenticated event must stop the manager FAILED with no reconnect
+    loop (the WS handshake does not validate the key; the rejection arrives
+    in-session)."""
+    manager, sink = make_manager(factory)
+    manager.start()
+    assert factory.session_ready.wait(timeout=5.0)
+    session = factory.sessions[0]
+    session.push_events([
+        FakeErrorEvent(401, "unauthenticated", "Incorrect API key provided."),
+        "BLOCK",
+    ])
+    assert wait_until(lambda: manager.status() == SonioxStatus.FAILED, timeout=5)
+    # No reconnect was attempted (exactly one session ever).
+    assert len(factory.sessions) == 1
+    assert sink.errors
+    manager.shutdown(timeout=2)
+
+
+def test_max_duration_reached_reconnects_immediately(factory):
+    """413 max_duration_reached (the 300-minute session cap) is a normal
+    ending: reconnect at once, attempt budget intact — a double-header
+    lecture must not burn the 5-retry budget on polite session rollovers."""
+    manager, sink = make_manager(factory)
+    manager.start()
+    assert factory.session_ready.wait(timeout=5.0)
+    factory.session_ready.clear()
+    session = factory.sessions[0]
+    session.push_events([
+        FakeErrorEvent(413, "max_duration_reached", "max duration reached"),
+        "BLOCK",
+    ])
+    # A second session appears without any backoff wait.
+    assert factory.session_ready.wait(timeout=5), "no immediate reconnect"
+    assert manager.status() in (SonioxStatus.LIVE, SonioxStatus.CONNECTING)
+    manager.shutdown(timeout=2)
+
+
 def test_send_failure_reconnects_and_replays_only_unsent(factory):
     manager, sink = make_manager(factory)
     manager.start()

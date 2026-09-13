@@ -264,6 +264,11 @@ class SonioxServiceManager:
         self._session: Any = None  # current SDK session (send-thread target)
         self._accumulator = SonioxAccumulator()
         self._last_event_key: Any = None  # identical-event drop
+        # The error_type of the event that ended the last session (None =
+        # clean close). Initialized here because the supervisor reads it
+        # after _receive_loop returns, and a session can end without the
+        # loop body ever running (e.g. shutdown closing the socket).
+        self._last_error_type: str | None = None
 
     # ------------------------------------------------------------------
     # Public API (called from the Qt thread / capture thread / end thread)
@@ -385,16 +390,25 @@ class SonioxServiceManager:
                 return
             self._stop_requested = True
             self._finish_requested = True
-            session = self._session
+            self._reconnect_requested = False
             self._send_cond.notify_all()
             self._restart_session.set()
-        if session is not None:
-            # close() sends end-of-audio and closes the socket — the only
-            # way to unblock a receive_events() iteration parked on recv().
+        # Close whatever session exists NOW (the supervisor may have rotated
+        # to a fresh one between our flag set and this read): close() sends
+        # end-of-audio and closes the socket — the only way to unblock a
+        # receive_events() parked on recv(). The loop-top stop check makes
+        # any reconnect race exit before connecting again; a session created
+        # in that window is closed on the retry below.
+        for _ in range(3):
+            with self._lock:
+                session = self._session
+            if session is None:
+                break
             try:
                 session.close()
             except Exception:  # noqa: BLE001 — teardown must not raise
                 log.debug("Soniox session close during shutdown raised", exc_info=True)
+            time.sleep(0.05)
         if self._supervisor_thread is not None:
             self._supervisor_thread.join(timeout=timeout + 2.0)
         send_thread = self._send_thread
@@ -599,6 +613,17 @@ class SonioxServiceManager:
                 with self._lock:
                     self._set_status_locked(SonioxStatus.FAILED)
                 return
+            if self._last_error_type in ("max_duration_reached",
+                                         "service_unavailable"):
+                # Normal operational endings, not failures: the session cap
+                # is 300 minutes (a double-header lecture exceeds it) and
+                # the docs instruct an immediate new request. Reconnect at
+                # once with the attempt budget intact.
+                log.info(
+                    "Soniox session ended (%s); reconnecting immediately",
+                    self._last_error_type,
+                )
+                continue
             with self._lock:
                 restart = self._reconnect_requested
                 finish = (
@@ -670,13 +695,19 @@ class SonioxServiceManager:
             time.sleep(min(0.2, max(0.0, deadline - time.monotonic())))
         return True
 
-    # Server-side error codes that no reconnect can fix. The WebSocket
-    # handshake itself does NOT validate the API key (verified against the
-    # live service: a bogus key connects fine and the 401 arrives as an
-    # in-session error event ~0.2s later) — without this set, a bad key
-    # would loop RECONNECTING->LIVE forever, billing nothing but hiding the
-    # real problem from the user.
-    FATAL_ERROR_CODES = frozenset({401, 403})
+    # Server-side error types that no reconnect can fix. The official
+    # error-handling docs say to branch on error_type ("stable across
+    # releases"), not error_code or the human-readable message — error_code
+    # is kept as a pre-extra-fields fallback. The WebSocket handshake does
+    # NOT validate the API key (verified live: a bogus key connects fine
+    # and the 401/unauthenticated arrives as an in-session error event
+    # ~0.2s later), so without this set a bad key loops
+    # RECONNECTING->LIVE forever, hiding the real problem from the user.
+    FATAL_ERROR_TYPES = frozenset({
+        "unauthenticated",      # bad/expired key: retrying cannot fix it
+        "api_key_invalid",
+        "permission_denied",
+    })
 
     def _receive_loop(self, session: Any, session_generation: int) -> str:
         """Iterate receive_events until the session closes. Returns the
@@ -686,13 +717,17 @@ class SonioxServiceManager:
         try:
             for event in session.receive_events():
                 error_code = getattr(event, "error_code", None)
-                if error_code in self.FATAL_ERROR_CODES:
+                error_type = getattr(event, "error_type", None)
+                self._last_error_type = error_type
+                if error_type in self.FATAL_ERROR_TYPES or (
+                    error_type is None and error_code in (401, 403)
+                ):
                     message = (
                         getattr(event, "error_message", "") or "authentication failed"
                     )
                     log.error(
                         "Soniox auth error %s: %s",
-                        error_code,
+                        error_type or error_code,
                         redact_key(str(message), self._config.api_key),
                     )
                     self._safe_call(
