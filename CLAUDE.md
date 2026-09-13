@@ -161,8 +161,8 @@ writes by msg_id without dedup). ENDING: after the gate goes up, a bounded
 segment before end_session(). pause()/resume() delegate to manager.pause/resume
 (SDK finalize on pause — no sentence splicing across the pause); stop() calls
 finish_and_drain then shutdown, all bounded. Overlay: one live card per segment
-(`_SonioxSink.on_live` allocates once, `update_live` updates in place, 50ms batched
-flush — never a card per token); `provider="soniox"` on ChatMessage selects the
+(`_SonioxSink.on_live` allocates once, `update_live` updates in place, one-frame
+batched flush — never a card per token); `provider="soniox"` on ChatMessage selects the
 cloud no-translation hint (`soniox_no_translation` vs `same_language`) and nothing
 else — latency is never displayed for any engine (see the message-card paragraph
 below); MonitorBar shows the five-state connection indicator. Per-segment cloud
@@ -795,15 +795,44 @@ chains — local and cloud. `update_streaming` / `set_translation` / `update_liv
 `apply_style` only mutate state fields (`_streaming_partial`, `_live_provisional`,
 `_settled`, `_translated`, `_original`); a single `_render()` derives both lines
 through `_original_line_html()` + `_translation_line_html()`. There is no
-`_build_header_html` and no per-path HTML: the cloud-only visual (dim +
-`▍` cursor) is driven by `_live_provisional`, which only `update_live` sets, so
-local cards never dim. `_decorate(escaped_text, role)` is the single extension
-point for per-role decoration (identity today; terminology highlighting would
-land there). The layout is a two-line hierarchy — small secondary original
-above, large high-contrast translation below (`original_font_size` 10 /
-`translation_font_size` 15 by default, spacing 4); every preset must keep
-`original_color != translation_color` and `original_font_size <
-translation_font_size` (tests/test_overlay_style.py guards it).
+`_build_header_html` and no per-path HTML: the cloud-only visual (the dim colors)
+is driven by `_live_provisional`, which only `update_live` sets, so local cards
+never dim. No cursor glyph: two were shipped (a `▍` block, then a thin `│` bar)
+and both were removed — any trailing glyph crowds the last letter and, being
+part of the same text run, is what wraps onto a new line first; provisional text
+is carried by the dim color alone. `_decorate(escaped_text, role)` is the single
+extension point for per-role decoration (identity today; terminology
+highlighting would land there). The layout is a two-line hierarchy — small
+secondary original above, large high-contrast translation below
+(`original_font_size` 12 / `translation_font_size` 23 at the reference width,
+spacing 4); every preset must keep `original_color != translation_color` and
+`original_font_size < translation_font_size` at every scale
+(tests/test_overlay_style.py guards both).
+
+**Font sizes scale with the window width** (`scale_with_window`, default on).
+`font_scale_for_width()` maps width to a factor clamped to
+[`FONT_SCALE_MIN` 0.7, `FONT_SCALE_MAX` 1.8] against
+`FONT_SCALE_REFERENCE_WIDTH` 620 (the width the overlay opens at, so the
+settings numbers are what you see at the default size); `scaled_font_size()`
+rounds half up — never `round()`, whose banker's rounding can stall or shrink a
+size as the window grows. The overlay keeps `_base_style` (what the user
+configured, what gets persisted) separate from `_font_scale` /
+`_scaled_sizes` (derived): **`_applied_style` and `ChatMessage._current_style`
+must always hold the BASE style.** A derived value reaching either one makes
+each rescale multiply an already-scaled size (23 → 41 → 74) and makes the next
+panel auto-save find the styles unequal, re-running the full path. That full
+path costs ~70ms for 50 cards — and the cost is *not* the fonts (measured
+0.1ms for 50 cards' `setFont`; `_render` is ~0.0ms): it is the two
+`setStyleSheet` calls (whole-subtree re-polish) and `setWindowOpacity`
+(compositor on macOS). `ChatMessage.apply_font_scale()` therefore touches fonts
+only, and `_apply_font_scale()` never re-runs the QSS/opacity work.
+`_schedule_font_scale()` (from `resizeEvent`, behind a 150ms single-shot,
+deliberately not `_pos_save_timer`) compares *derived sizes*, not factors — the
+factor moves continuously, but a 23pt line only moves a point after ~27px of
+width, so an ordinary drag never even arms the timer. The compact-mode height
+animation preserves width, so it cannot trigger a rescale at all. New cards pick
+the scale up in `_append_card` (the single creation entry) rather than from a
+class variable, which would leak into tests that construct cards directly.
 
 **Timestamps and latency chips are not displayed** — for any engine. Timestamps
 survive in the model (`_timestamp`) for `export_messages` and in the transcript
@@ -815,14 +844,18 @@ card rendering at all (the removed-`_compact_mode` class variable is gone), so
 `_on_mode_changed` only hides the MonitorBar and re-emits.
 
 Removed style keys are dropped at load and hierarchy fields still holding a
-pre-redesign value are upgraded by `migrate_style()` (called from
+superseded shipped value are upgraded by `migrate_style()` (called from
 `control_panel.migrate_style_settings()` inside `_load_saved_settings`, then
 persisted). It must run at *load* time, before the panel fills its style
 controls: those write the whole dict back on the next auto-save, so a
 render-time-only migration would be reverted by the next settings save. A field
-the user actually customized keeps its value — only values equal to the
-pre-redesign shipped value for that preset are upgraded (`_LEGACY_STYLE_DEFAULTS`
-/ `_LEGACY_PRESET_VALUES`).
+the user actually customized keeps its value — only values in the superseded
+sets for that preset are upgraded (`_SUPERSEDED_STYLE_VALUES` /
+`_SUPERSEDED_PRESET_VALUES`). Those are **sets of every value ever shipped and
+since retuned** (11/14, 10/15 and 12/17 for the font sizes), not just the
+pre-redesign one: retuning the hierarchy again means adding the outgoing value to the set,
+or a style saved by the interim build is frozen at it. tests/test_overlay_style.py
+guards the table against a preset being retuned without extending it.
 
 Style system:
 - `DEFAULT_STYLE` and `STYLE_PRESETS` defined in `subtitle_overlay.py` — 14 presets including terminal themes (Dracula, Nord, Monokai, Solarized, Gruvbox, Tokyo Night, Catppuccin, One Dark, Everforest, Kanagawa)
@@ -835,7 +868,7 @@ Style system:
 Key overlay features:
 - **Top-most**: Toggles `WindowStaysOnTopHint`; requires `setWindowFlags()` + `show()` to take effect
 - **Click-through**: Uses Win32 `WS_EX_TRANSPARENT` on the scroll area while keeping header interactive
-- **Auto-scroll**: Controls whether new messages/translations auto-scroll to bottom
+- **Auto-scroll**: Controls whether new messages/translations auto-scroll to bottom. The view sticks to the bottom by *following the scrollbar's range change* (`_follow_bottom` / `_scroll_max`), so content that grows after layout is still followed; the follow is dropped when the user scrolls up, and `_follow_bottom` is compared against the last known maximum — never the live one, which our own `setValue` would have already grown inside the `rangeChanged` handler
 - **Model combo**: Populated from `user_settings.json` models list; switching emits `model_switch_requested` signal
 - **Target Language combo**: Emits `target_language_changed`; synced from settings on startup
 - **Compact mode animation**: Toggles between full and minimumHeight with 200ms size animation; uses `frameGeometry()` for actual window size to avoid Windows MINMAXINFO mismatch; skips animation when height difference < 10px
@@ -916,7 +949,7 @@ Continuous speech is processed incrementally to reduce latency (enabled by `incr
 - `Translator._build_system_prompt` catches format errors in user prompt templates, falls back to DEFAULT_PROMPT
 - Translation prompt presets: `PROMPT_PRESETS` in `translator.py` (daily/esports/anime), selectable via control panel combo
 - `translate_iter()` is a generator that yields accumulated partial text for streaming UI; `translate()` is the blocking equivalent
-- Streaming UI: `update_streaming_signal` → `ChatMessage.update_streaming()` with 50ms QTimer throttle; `set_translation()` finalizes
+- Streaming UI: `update_streaming_signal` → `ChatMessage.update_streaming()`, which renders immediately (the overlay's one-frame drain is the only batching; a second card-level throttle used to add up to another 50ms); `set_translation()` finalizes
 - `RepetitionError` raised when model output contains repetition loops (pattern length 8+); caught in `_translate_async`, shows user-facing warning
 - Changelog: `i18n/CHANGELOG_{lang}.md` files rendered as HTML in Settings → Changelog tab via `_load_latest_changelog()`. **Any user-visible change updates both `CHANGELOG_zh.md` and `CHANGELOG_en.md`** under a `## YYYY-MM-DD` heading — this is the project's established habit and every recent commit follows it. Write what changed for the user and why it mattered, not the diff; reference an issue number when there is one. Engineering-only changes (CI, packaging, dependencies) belong there too when they affect how the app is built or installed.
 

@@ -15,8 +15,14 @@ sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
 from subtitle_overlay import (  # noqa: E402
     DEFAULT_STYLE,
+    FONT_SCALE_MAX,
+    FONT_SCALE_MIN,
+    FONT_SCALE_REFERENCE_WIDTH,
+    MIN_SCALED_FONT_PT,
     STYLE_PRESETS,
+    font_scale_for_width,
     migrate_style,
+    scaled_font_size,
 )
 
 
@@ -85,8 +91,11 @@ def test_migrate_style_uses_the_stored_preset_as_the_baseline():
     migrated, changed = migrate_style(stored)
     assert changed is True
     assert migrated["original_color"] == STYLE_PRESETS["dracula"]["original_color"]
-    # A compact-preset stored size upgrades to the compact sizes.
-    compact = migrate_style({"preset": "compact", "original_font_size": 9,
+    # A compact-preset stored size upgrades to the compact sizes. The sampled
+    # values must be genuinely superseded ones (8 was compact's original size
+    # two generations back; 9 is the current value and would make this half of
+    # the test vacuous).
+    compact = migrate_style({"preset": "compact", "original_font_size": 8,
                              "translation_font_size": 11})[0]
     assert compact["original_font_size"] == STYLE_PRESETS["compact"]["original_font_size"]
     assert compact["translation_font_size"] == STYLE_PRESETS["compact"]["translation_font_size"]
@@ -105,3 +114,109 @@ def test_migrate_style_is_idempotent():
     assert changed is False
     # A style saved by the current build is untouched.
     assert migrate_style(dict(DEFAULT_STYLE)) == (dict(DEFAULT_STYLE), False)
+
+
+def test_migrate_style_carries_an_interim_style_forward():
+    """A style saved by the *first* two-line build (10/15) must keep moving to
+    the current sizes: the superseded sets hold every generation, so skipping
+    a release does not freeze a stored style at an interim value."""
+    interim = {
+        "preset": "default",
+        "original_font_size": 10,
+        "translation_font_size": 15,
+        "original_color": "#9a9aa8",
+    }
+    migrated, changed = migrate_style(interim)
+    assert changed is True
+    assert migrated["translation_font_size"] == DEFAULT_STYLE["translation_font_size"]
+    assert migrated["original_font_size"] == DEFAULT_STYLE["original_font_size"]
+    assert migrated["original_color"] == DEFAULT_STYLE["original_color"]
+    # And the result is stable under a second pass.
+    assert migrate_style(migrated) == (migrated, False)
+
+
+def test_migration_covers_every_preset_that_was_retuned():
+    """For each preset, a style carrying that preset's superseded values must
+    land exactly on the preset's current values — the guard against retuning a
+    preset without extending the superseded table."""
+    from subtitle_overlay import (
+        _SUPERSEDED_PRESET_VALUES,
+        _SUPERSEDED_STYLE_VALUES,
+    )
+
+    for preset_key, preset in STYLE_PRESETS.items():
+        stored = {"preset": preset_key}
+        for field, superseded in _SUPERSEDED_STYLE_VALUES.items():
+            values = _SUPERSEDED_PRESET_VALUES.get(preset_key, {}).get(field, superseded)
+            # Pick a superseded value that is not already the current one.
+            stale = sorted(v for v in values if v != preset[field])
+            if stale:
+                stored[field] = stale[0]
+        if len(stored) == 1:
+            continue
+        migrated, _ = migrate_style(stored)
+        for field in stored:
+            if field == "preset":
+                continue
+            assert migrated[field] == preset[field], (
+                f"{preset_key}.{field}: superseded {stored[field]!r} did not "
+                f"upgrade to the current {preset[field]!r}"
+            )
+
+
+# ── window-driven font scaling ────────────────────────────────────────────
+
+
+def test_font_scale_is_one_at_the_reference_width():
+    assert font_scale_for_width(FONT_SCALE_REFERENCE_WIDTH) == 1.0
+    assert scaled_font_size(DEFAULT_STYLE["translation_font_size"], 1.0) == (
+        DEFAULT_STYLE["translation_font_size"]
+    )
+
+
+def test_font_scale_clamps_at_both_ends():
+    assert font_scale_for_width(300) == FONT_SCALE_MIN
+    assert font_scale_for_width(4000) == FONT_SCALE_MAX
+    # The reachable shrink end (the window's minimum width) sits inside the
+    # clamp, so the floor is margin rather than a value users hit.
+    assert FONT_SCALE_MIN < font_scale_for_width(480) < 1.0
+
+
+def test_font_scale_handles_a_degenerate_width():
+    for width in (0, -1, None):
+        assert font_scale_for_width(width) == 1.0
+
+
+def test_scaled_size_rounds_half_up_not_bankers():
+    """Python's round() is banker's rounding: round(34.5) == 34. A size that
+    stalls — or drops — as the window grows is exactly the jitter this avoids."""
+    assert scaled_font_size(23, 1.5) == 35
+    assert round(23 * 1.5) == 34  # what round() would have produced
+    assert scaled_font_size(12, 1.5) == 18
+
+
+def test_scaled_size_never_reaches_zero():
+    assert scaled_font_size(1, FONT_SCALE_MIN) == MIN_SCALED_FONT_PT
+    assert scaled_font_size(6, FONT_SCALE_MIN) >= MIN_SCALED_FONT_PT
+
+
+def test_every_preset_keeps_the_two_line_hierarchy_at_every_scale():
+    """The multiplicative companion to the check above: scaling both lines by
+    the same factor must not let them collapse into each other at any
+    reachable window width."""
+    factors = [FONT_SCALE_MIN + i * 0.1 for i in range(12)]
+    for name, preset in STYLE_PRESETS.items():
+        for factor in factors:
+            original = scaled_font_size(preset["original_font_size"], factor)
+            translation = scaled_font_size(preset["translation_font_size"], factor)
+            assert original < translation, (
+                f"preset {name} @factor {factor:.1f}: {original}pt is not "
+                f"smaller than {translation}pt"
+            )
+
+
+def test_default_style_ships_window_scaling_on():
+    assert DEFAULT_STYLE["scale_with_window"] is True
+    # Every preset inherits it from the base.
+    for name, preset in STYLE_PRESETS.items():
+        assert preset.get("scale_with_window") is True, name

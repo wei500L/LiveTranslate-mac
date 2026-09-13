@@ -35,14 +35,18 @@ DEFAULT_STYLE = {
     "border_radius": 8,
     "original_font_family": default_cjk_font_family(),
     "translation_font_family": default_cjk_font_family(),
-    "original_font_size": 10,
-    "translation_font_size": 15,
+    "original_font_size": 12,
+    "translation_font_size": 23,
     "original_color": "#9a9aa8",
     "translation_color": "#ffffff",
     # Dimmer variants for streaming (provisional) text — cloud live card.
     "provisional_original_color": "#7a7a8c",
     "provisional_translation_color": "#b8b8c0",
     "window_opacity": 95,
+    # Font sizes scale with the overlay's width by default (see
+    # font_scale_for_width). Off means the sizes above are used literally,
+    # exactly as before this setting existed.
+    "scale_with_window": True,
 }
 
 _BASE = DEFAULT_STYLE
@@ -59,8 +63,8 @@ STYLE_PRESETS = {
     "compact": {
         **_BASE,
         "preset": "compact",
-        "original_font_size": 8,
-        "translation_font_size": 12,
+        "original_font_size": 9,
+        "translation_font_size": 17,
     },
     "light": {
         **_BASE,
@@ -175,28 +179,33 @@ STYLE_PRESETS = {
 }
 
 
-# Values shipped *before* the two-line hierarchy redesign. A stored style
-# whose field still equals the value its preset shipped back then was never
-# customized by the user, so it is safe to upgrade; any other value is a
-# deliberate choice and is left alone. Without this, apply_style's
-# `{**DEFAULT_STYLE, **style}` merge lets a style saved by an older build
-# pin the old look forever and the new layout never appears.
-_LEGACY_STYLE_DEFAULTS = {
-    "original_font_size": 11,
-    "translation_font_size": 14,
-    "original_color": "#cccccc",
+# Every value these hierarchy fields have *ever* shipped with and that has
+# since been superseded (11/14 were the pre-redesign sizes, 10/15 the first
+# two-line sizes, 12/17 the sizes before window scaling landed). A stored field still holding one of them was never
+# customized by the user, so it is safe to upgrade to the current value;
+# anything else is a deliberate choice and is left alone. A set rather than a
+# single value because a style saved by an *interim* build must keep moving
+# forward too — the very first migration shipped 10/15.
+#
+# Without this, apply_style's `{**DEFAULT_STYLE, **style}` merge lets a style
+# saved by an older build pin the old look forever and new defaults never
+# appear.
+_SUPERSEDED_STYLE_VALUES = {
+    "original_font_size": {11, 10},
+    "translation_font_size": {14, 15, 17},
+    "original_color": {"#cccccc", "#9a9aa8"},
 }
 
-# Presets whose pre-redesign value differed from the pre-redesign default.
-_LEGACY_PRESET_VALUES = {
-    "compact": {"original_font_size": 9, "translation_font_size": 11},
-    "light": {"original_color": "#333333"},
-    "dracula": {"original_color": "#f8f8f2"},
-    "monokai": {"original_color": "#f8f8f2"},
-    "gruvbox": {"original_color": "#ebdbb2"},
-    "catppuccin": {"original_color": "#cdd6f4"},
-    "everforest": {"original_color": "#d3c6aa"},
-    "kanagawa": {"original_color": "#dcd7ba"},
+# Presets whose superseded value differed from the superseded default.
+_SUPERSEDED_PRESET_VALUES = {
+    "compact": {"original_font_size": {9, 8}, "translation_font_size": {11, 12, 13}},
+    "light": {"original_color": {"#333333"}},
+    "dracula": {"original_color": {"#f8f8f2"}},
+    "monokai": {"original_color": {"#f8f8f2"}},
+    "gruvbox": {"original_color": {"#ebdbb2"}},
+    "catppuccin": {"original_color": {"#cdd6f4"}},
+    "everforest": {"original_color": {"#d3c6aa"}},
+    "kanagawa": {"original_color": {"#dcd7ba"}},
 }
 
 #: Style keys that no longer exist; dropped on load rather than carried.
@@ -207,9 +216,11 @@ def migrate_style(style: dict) -> tuple[dict, bool]:
     """Carry a stored overlay style across the two-line hierarchy redesign.
 
     Returns ``(style, changed)``. Removed keys are dropped, and each
-    hierarchy field still holding its pre-redesign shipped value is
-    upgraded to the current value for that preset; a field the user
-    actually changed keeps its value.
+    hierarchy field still holding a superseded shipped value is upgraded to
+    the current value for that preset; a field the user actually changed
+    keeps its value. Run once per release that retunes the hierarchy — the
+    superseded sets carry every generation, so a style that skipped one
+    upgrade still catches up.
 
     Idempotent: a migrated (or newly saved) style comes back unchanged.
     """
@@ -224,29 +235,70 @@ def migrate_style(style: dict) -> tuple[dict, bool]:
 
     preset_key = out.get("preset", "default")
     preset = STYLE_PRESETS.get(preset_key) or DEFAULT_STYLE
-    legacy_overrides = _LEGACY_PRESET_VALUES.get(preset_key, {})
-    for field, legacy_default in _LEGACY_STYLE_DEFAULTS.items():
+    preset_overrides = _SUPERSEDED_PRESET_VALUES.get(preset_key, {})
+    for field, superseded_default in _SUPERSEDED_STYLE_VALUES.items():
         if field not in out:
             continue
-        legacy_value = legacy_overrides.get(field, legacy_default)
-        if out[field] == legacy_value and out[field] != preset[field]:
+        superseded = preset_overrides.get(field, superseded_default)
+        if out[field] in superseded and out[field] != preset[field]:
             out[field] = preset[field]
             changed = True
     return out, changed
 
 
 # Fixed accent colors shared by every message card. They are deliberately
-# not style fields: the language tag / hint / provisional cursor are UI
-# chrome, not user-tintable content colors.
+# not style fields: the language tag and the hint are UI chrome, not
+# user-tintable content colors.
 _LANG_TAG_COLOR = "#e7b96f"
 _HINT_COLOR = "#999"
-_CURSOR_COLOR = "#666"
 
 
 def _hex_to_rgba(hex_color: str, opacity: int) -> str:
     hex_color = hex_color.lstrip("#")
     r, g, b = int(hex_color[0:2], 16), int(hex_color[2:4], 16), int(hex_color[4:6], 16)
     return f"rgba({r},{g},{b},{opacity})"
+
+
+#: The window width at which the style's font sizes are used verbatim. The
+#: overlay opens at this width, so it doubles as the "design width": the
+#: number in the settings panel is what you see at the default window size.
+FONT_SCALE_REFERENCE_WIDTH = 620
+#: Scale bounds. The floor 0.7 covers the whole reachable shrink range (the
+#: window's minimum width is 480 -> 0.774) with margin, and still leaves the
+#: original line at 8pt; the ceiling 1.8 is 1116px wide / 41pt translation,
+#: past which a two-line card eats the screen.
+FONT_SCALE_MIN = 0.7
+FONT_SCALE_MAX = 1.8
+#: Floor for a derived size: no stored value may ever scale down to 0pt.
+MIN_SCALED_FONT_PT = 4
+#: Debounce after a resize before re-laying out the cards. Scaling itself is
+#: cheap (measured 0.1ms for 50 cards' setFont); this exists so a drag does
+#: not reflow every wrapping card on each frame, not to save CPU.
+FONT_SCALE_DEBOUNCE_MS = 150
+#: How often the batched live updates are drained to the cards. One frame:
+#: the drain is a lock plus two dict swaps, and the render count is bounded
+#: by the arrival rate (one render per msg_id per tick), not by this number.
+LIVE_FLUSH_INTERVAL_MS = 16
+
+
+def font_scale_for_width(width: int) -> float:
+    """Font-size multiplier for a given overlay width, clamped.
+
+    Width is the single input on purpose: the compact-mode height animation
+    preserves width, so it cannot trigger a rescale at all.
+    """
+    if not width or width <= 0:
+        return 1.0
+    return min(
+        FONT_SCALE_MAX, max(FONT_SCALE_MIN, width / FONT_SCALE_REFERENCE_WIDTH)
+    )
+
+
+def scaled_font_size(base_size: float, factor: float) -> int:
+    """Round half up, deliberately not ``round()``: Python's banker's rounding
+    turns 34.5 into 34, so a size could stay put — or shrink — as the window
+    grows."""
+    return max(MIN_SCALED_FONT_PT, int(base_size * factor + 0.5))
 
 
 class ChatMessage(QWidget):
@@ -290,6 +342,7 @@ class ChatMessage(QWidget):
         self._live_provisional = False  # cloud card: recognition still running
         self._streaming_partial = None  # latest local streaming partial, if any
         self._settled = False  # a final translation outcome was recorded
+        self._live_state = None  # last rendered cloud snapshot, for the above
         self.setObjectName("chatMessage")
         self._layout = QVBoxLayout(self)
         self._layout.setContentsMargins(8, 4, 8, 4)
@@ -326,20 +379,19 @@ class ChatMessage(QWidget):
         return escaped_text
 
     def _original_line_html(self, s) -> str:
-        if self._live_provisional:
-            color = s["provisional_original_color"]
-            # The dim colors alone read as "faded old text"; an explicit
-            # cursor makes "this line is still being recognized" unmistakable
-            # and vanishes the moment the segment settles.
-            cursor = f'<span style="color:{_CURSOR_COLOR};"> ▍</span>'
-        else:
-            color = s["original_color"]
-            cursor = ""
+        # Provisional text is carried by the dim color alone. A cursor glyph
+        # was tried twice (a heavy ▍ block, then a thin │ bar) and dropped:
+        # any trailing glyph crowds the last letter, and being part of the
+        # same text run it is what wraps onto a new line first.
+        color = (
+            s["provisional_original_color"]
+            if self._live_provisional
+            else s["original_color"]
+        )
         return (
             f'<span style="color:{_LANG_TAG_COLOR};">[{self._source_lang}]</span> '
             f'<span style="color:{color};">'
             f'{self._decorate(_escape(self._original), "original")}</span>'
-            f"{cursor}"
         )
 
     def _translation_line_html(self, s) -> str:
@@ -383,29 +435,18 @@ class ChatMessage(QWidget):
     # -- state mutators ----------------------------------------------------
 
     def update_streaming(self, partial_text: str):
-        """Update translation label with partial streaming text (throttled)."""
-        self._pending_streaming = partial_text
-        if not hasattr(self, "_streaming_timer"):
-            self._streaming_timer = QTimer()
-            self._streaming_timer.setSingleShot(True)
-            self._streaming_timer.setInterval(50)
-            self._streaming_timer.timeout.connect(self._flush_streaming)
-        if not self._streaming_timer.isActive():
-            self._flush_streaming()
-            self._streaming_timer.start()
+        """Render partial streaming text immediately.
 
-    def _flush_streaming(self):
-        text = getattr(self, "_pending_streaming", None)
-        if text is None:
-            return
-        self._pending_streaming = None
-        self._streaming_partial = text
+        No throttle of its own: the overlay already batches these at
+        LIVE_FLUSH_INTERVAL_MS and calls this at most once per card per
+        tick, so a second 50ms single-shot here only added another tick of
+        latency (up to 100ms before a local partial reached the screen).
+        """
+        self._streaming_partial = partial_text
         self._render()
 
     def _stop_streaming(self):
-        if hasattr(self, "_streaming_timer"):
-            self._streaming_timer.stop()
-        self._pending_streaming = None
+        """The one place that clears the streaming state."""
         self._streaming_partial = None
 
     def set_translation(self, translated: str, translate_ms: float):
@@ -425,16 +466,53 @@ class ChatMessage(QWidget):
         )
         self._render()
 
+    def apply_font_scale(self, factor: float) -> None:
+        """Re-apply just the fonts at a window-derived scale.
+
+        Deliberately narrow: this is the resize path, and the expensive part
+        of apply_style is not the fonts (measured 0.1ms for 50 cards) but the
+        container/header setStyleSheet re-polish and setWindowOpacity — ~70ms
+        together, and the latter goes to the compositor on macOS.
+
+        `_current_style` stays the *base* style here. Writing the derived
+        size back into it would make the next rescale multiply an
+        already-scaled value (23 -> 41 -> 74).
+        """
+        s = self._current_style
+        self._header_label.setFont(
+            QFont(
+                s["original_font_family"],
+                scaled_font_size(s["original_font_size"], factor),
+            )
+        )
+        self._trans_label.setFont(
+            QFont(
+                s["translation_font_family"],
+                scaled_font_size(s["translation_font_size"], factor),
+            )
+        )
+
     def update_live(self, original: str, translation: str, final: bool):
         """Cloud live card: render both lines in place, provisional (dim) or
-        final (normal). Throttled by the overlay's batched flush, so this
-        runs at most every 50ms, not per token."""
+        final (normal). Batched by the overlay's flush, so this runs at most
+        once per card per tick, not per token."""
         self._original = original
         self._translated = translation
         self._live_provisional = not final
         if final:
             self._settled = True
+        # The producer re-sends the whole snapshot on every token, so the
+        # same (original, translation, final) triple arrives repeatedly. The
+        # short-circuit is what makes a one-frame flush cadence affordable:
+        # a render happens per *change*, not per tick. It must sit after the
+        # state assignment and check whether a streaming partial is being
+        # cleared — that clearing is itself a render input.
+        had_partial = self._streaming_partial is not None
         self._stop_streaming()
+        state = (original, translation, final)
+        if state == self._live_state and not had_partial:
+            return
+        self._live_state = state
         self._render()
 
     def contextMenuEvent(self, event):
@@ -1200,6 +1278,11 @@ class SubtitleOverlay(QWidget):
         self._messages_dropped = 0
         self._transcript_paths = {}
         self._click_through = False
+        # Scroll-follow state: whether the view is pinned to the bottom, and
+        # the last maximum seen (see _on_scroll_value_changed for why the live
+        # one is the wrong thing to compare against).
+        self._follow_bottom = True
+        self._scroll_max = 0
         self._height_before_compact = None
         self._mode_anim = None
         self._pos_save_timer = QTimer(self)
@@ -1207,6 +1290,21 @@ class SubtitleOverlay(QWidget):
         self._pos_save_timer.setInterval(500)
         self._pos_save_timer.timeout.connect(lambda: self.position_changed.emit())
         self._last_saved_geo = None
+        # The user's style as configured, and the window-derived factor
+        # currently rendered from it. `_base_style` is the source the rescale
+        # reads; it is never written with derived values.
+        self._base_style = dict(DEFAULT_STYLE)
+        self._font_scale = 1.0
+        # The sizes currently rendered, so a resize can tell whether it would
+        # change anything at all (see _schedule_font_scale).
+        self._scaled_sizes = (
+            DEFAULT_STYLE["original_font_size"],
+            DEFAULT_STYLE["translation_font_size"],
+        )
+        self._font_scale_timer = QTimer(self)
+        self._font_scale_timer.setSingleShot(True)
+        self._font_scale_timer.setInterval(FONT_SCALE_DEBOUNCE_MS)
+        self._font_scale_timer.timeout.connect(self._apply_font_scale)
         self._update_lock = threading.Lock()
         self._latest_monitor = None
         self._monitor_timer = QTimer(self)
@@ -1220,7 +1318,7 @@ class SubtitleOverlay(QWidget):
         # Last style actually rendered, so an unchanged one is a no-op.
         self._applied_style = None
         self._streaming_timer = QTimer(self)
-        self._streaming_timer.setInterval(50)
+        self._streaming_timer.setInterval(LIVE_FLUSH_INTERVAL_MS)
         self._streaming_timer.timeout.connect(self._flush_streaming)
         self._streaming_timer.start()
         self._setup_ui()
@@ -1233,6 +1331,12 @@ class SubtitleOverlay(QWidget):
         self.clear_signal.connect(self._on_clear)
         self.update_stats_signal.connect(self._on_update_stats)
         self.update_asr_device_signal.connect(self._on_update_asr_device)
+        # Settle the scale for the width we were constructed at. main.py only
+        # calls apply_style when a style was ever saved, and it restores the
+        # archived window size before that — so without this a user who never
+        # touched the style page would see base sizes in a wider window until
+        # the first resize.
+        self._apply_font_scale(force=True)
 
     def _setup_ui(self):
         self.setWindowFlags(
@@ -1323,6 +1427,12 @@ class SubtitleOverlay(QWidget):
 
         grip_row = QHBoxLayout()
         grip_row.addStretch()
+        # Follow content that grows after layout (the immediate scroll above
+        # can only see the previous maximum).
+        scrollbar = self._scroll.verticalScrollBar()
+        scrollbar.rangeChanged.connect(self._on_scroll_range_changed)
+        scrollbar.valueChanged.connect(self._on_scroll_value_changed)
+
         self._grip = QSizeGrip(self)
         self._grip.setFixedSize(16, 16)
         self._grip.setStyleSheet("background: transparent;")
@@ -1350,6 +1460,7 @@ class SubtitleOverlay(QWidget):
     def resizeEvent(self, event):
         super().resizeEvent(event)
         self._schedule_pos_save()
+        self._schedule_font_scale()
 
     def set_running(self, running: bool):
         self._handle.set_running(running)
@@ -1455,6 +1566,13 @@ class SubtitleOverlay(QWidget):
             self._monitor.update_audio(*latest)
 
     def _flush_streaming(self):
+        # Runs every LIVE_FLUSH_INTERVAL_MS whether or not anything arrived.
+        # Reading the dicts without the lock is safe here: a truth test on a
+        # dict is atomic under the GIL, and the worst case is deferring a
+        # just-arrived snapshot to the next tick. Taking the lock on every
+        # idle tick would be pure overhead.
+        if not self._streaming_updates and not self._live_updates:
+            return
         with self._update_lock:
             updates = self._streaming_updates
             self._streaming_updates = {}
@@ -1467,7 +1585,11 @@ class SubtitleOverlay(QWidget):
             if msg is not None:
                 msg.update_live(original, translation, final)
         if live:
-            QTimer.singleShot(50, self._scroll_to_bottom)
+            # Immediately, not in 50ms: the follow-up used to be a deferred
+            # jump, so the text appeared first and the view snapped after.
+            # Growth that only lands after layout is followed by the
+            # scrollbar's rangeChanged handler.
+            self._scroll_to_bottom()
 
     @pyqtSlot(str)
     def _on_update_connection(self, status):
@@ -1503,6 +1625,12 @@ class SubtitleOverlay(QWidget):
     def _append_card(self, msg: "ChatMessage") -> None:
         self._messages[msg.msg_id] = msg
         self._msg_layout.addWidget(msg)
+        # Every card is created here (_on_add_message and _on_settle_live both
+        # route through it), so this is the one place a new card picks up the
+        # current scale. No class-level factor: that would leak into the
+        # tests that construct ChatMessage directly.
+        if self._font_scale != 1.0:
+            msg.apply_font_scale(self._font_scale)
         if len(self._messages) > self._max_messages:
             oldest_id = min(self._messages.keys())
             old_msg = self._messages.pop(oldest_id)
@@ -1511,7 +1639,7 @@ class SubtitleOverlay(QWidget):
             # Remember that the view is no longer the whole session, so an
             # export can say so instead of quietly handing over a partial log.
             self._messages_dropped += 1
-        QTimer.singleShot(50, self._scroll_to_bottom)
+        self._scroll_to_bottom()
 
     @pyqtSlot(int, str, str, str, str)
     def _on_settle_live(self, msg_id, timestamp, original, translation,
@@ -1536,7 +1664,7 @@ class SubtitleOverlay(QWidget):
         msg = self._messages.get(msg_id)
         if msg:
             msg.set_translation(translated, translate_ms)
-            QTimer.singleShot(50, self._scroll_to_bottom)
+            self._scroll_to_bottom()
 
     def _on_update_streaming(self, msg_id, partial_text):
         msg = self._messages.get(msg_id)
@@ -1553,11 +1681,80 @@ class SubtitleOverlay(QWidget):
         # out by the cap — a later export must not claim truncation for it.
         self._messages_dropped = 0
 
+    def _scale_factor_for_width(self) -> float:
+        if not self._base_style.get("scale_with_window", True):
+            return 1.0
+        return font_scale_for_width(self.width())
+
+    def _scaled_sizes_for(self, factor: float) -> tuple[int, int]:
+        """The (original, translation) point sizes a factor would produce."""
+        s = self._base_style
+        return (
+            scaled_font_size(s["original_font_size"], factor),
+            scaled_font_size(s["translation_font_size"], factor),
+        )
+
+    def _schedule_font_scale(self):
+        """Queue a rescale only if the width would change an actual size.
+
+        Width is the only input: the compact-mode height animation resizes
+        with `QSize(self.width(), h)`, so it cannot land here at all. The
+        guard compares *derived sizes*, not factors: the factor moves
+        continuously, but a 23pt line only moves a point after ~27px of
+        width, so an ordinary drag never starts the timer.
+        """
+        if self._scaled_sizes_for(self._scale_factor_for_width()) == self._scaled_sizes:
+            return
+        # No cards means nothing to reflow, and the debounce would only make
+        # the first frame after startup carry the wrong size (main.py restores
+        # the archived window size right after construction). Apply at once;
+        # cards created later pick the scale up in _append_card.
+        if not self._messages:
+            self._apply_font_scale()
+            return
+        self._font_scale_timer.start()
+
+    def _apply_font_scale(self, force: bool = False) -> None:
+        """Re-lay out every card's fonts for the current window width.
+
+        Touches fonts only — never the container/header stylesheets or the
+        window opacity (see ChatMessage.apply_font_scale).
+
+        `_base_style` is the user's style and `_font_scale` the derived
+        factor; `_applied_style` and `ChatMessage._current_style` must keep
+        holding the *base* style, or the next panel save would find them
+        unequal, re-run the full ~70ms path, and persist a derived size.
+        """
+        factor = self._scale_factor_for_width()
+        sizes = self._scaled_sizes_for(factor)
+        if not force and sizes == self._scaled_sizes:
+            self._font_scale = factor
+            return
+        self._font_scale = factor
+        self._scaled_sizes = sizes
+        for msg in self._messages.values():
+            msg.apply_font_scale(factor)
+
     def _scroll_to_bottom(self):
         if not self._handle.auto_scroll:
             return
         sb = self._scroll.verticalScrollBar()
+        # A setText that just happened has not been laid out yet, so maximum()
+        # may still describe the previous content. Growth that lands after
+        # this is followed by _on_scroll_range_changed.
         sb.setValue(sb.maximum())
+
+    def _on_scroll_value_changed(self, value: int):
+        # Compare against the last known maximum, never the live one: our own
+        # setValue below runs inside the rangeChanged handler, where the live
+        # maximum may already have grown — comparing against it would read as
+        # "the user scrolled up" and silently drop the follow.
+        self._follow_bottom = value >= self._scroll_max - 2
+
+    def _on_scroll_range_changed(self, _minimum: int, maximum: int):
+        self._scroll_max = maximum
+        if self._handle.auto_scroll and self._follow_bottom:
+            self._scroll.verticalScrollBar().setValue(maximum)
 
     def apply_style(self, style: dict):
         s = {**DEFAULT_STYLE, **style}
@@ -1572,6 +1769,7 @@ class SubtitleOverlay(QWidget):
         if s == self._applied_style:
             return
         self._applied_style = dict(s)
+        self._base_style = dict(s)
         # Container background
         bg_rgba = _hex_to_rgba(s["bg_color"], s["bg_opacity"])
         self._container.setStyleSheet(
@@ -1586,6 +1784,11 @@ class SubtitleOverlay(QWidget):
         ChatMessage._current_style = s
         for msg in self._messages.values():
             msg.apply_style(s)
+        # The base sizes may have changed while the factor did not, and this
+        # runs on startup too (an archived window width is rarely exactly the
+        # reference width) — so the first frame already carries the right
+        # size instead of being corrected on the first resize.
+        self._apply_font_scale(force=True)
 
     def export_messages(self, mode: str, parent=None):
         """Export captured messages to a .txt file.

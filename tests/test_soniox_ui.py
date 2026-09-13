@@ -23,6 +23,12 @@ subtitle_overlay = pytest.importorskip(
 
 from PyQt6.QtWidgets import QApplication  # noqa: E402
 
+#: Glyphs that must never appear in a card. Two cursors were shipped and
+#: removed (the heavy block and the thin bar); keeping them named here turns
+#: "provisional text carries no cursor" into a regression guard.
+CURSOR = "│"
+OLD_CURSOR = "▍"
+
 
 @pytest.fixture(scope="module")
 def app():
@@ -196,7 +202,7 @@ def test_settle_reuses_the_provisional_card(app):
     # And it is settled: final text, final colors, no cursor.
     html = same_id[0]._header_label.text()
     assert "Как у тебя?" in html
-    assert "▍" not in html
+    assert CURSOR not in html and OLD_CURSOR not in html
     trans = same_id[0]._trans_label.text()
     assert "你好吗？" in trans
     assert "翻译中" not in trans and "translating" not in trans
@@ -216,14 +222,23 @@ def test_settle_without_provisional_card_creates_final_card(app):
     assert "ASR" not in msg._header_label.text()
 
 
-def test_provisional_cursor_marks_recognition_in_progress(app):
+def test_provisional_text_carries_no_cursor(app):
+    """Provisional state is expressed by the dim colors alone. Two cursor
+    glyphs were shipped and removed (they crowded the last letter and, being
+    part of the text run, wrapped onto a new line first) — neither may come
+    back."""
     style = dict(subtitle_overlay.DEFAULT_STYLE)
     msg = make_message(app, provider="soniox")
     subtitle_overlay.ChatMessage._current_style = style
     msg.update_live("Говорю", "在讲", final=False)
-    assert "▍" in msg._header_label.text()
+    html = msg._header_label.text()
+    assert CURSOR not in html and OLD_CURSOR not in html
+    # ...but the provisional state IS visible, as the dim color.
+    assert style["provisional_original_color"] in html
     msg.update_live("Говорю", "在讲", final=True)
-    assert "▍" not in msg._header_label.text()
+    html = msg._header_label.text()
+    assert CURSOR not in html and OLD_CURSOR not in html
+    assert style["original_color"] in html
 
 
 def test_local_card_initial_state_is_not_dim(app):
@@ -246,18 +261,18 @@ def test_local_and_cloud_cards_share_the_render_path(app):
     provisional dim or a settled empty-translation hint."""
     style = dict(subtitle_overlay.DEFAULT_STYLE)
     subtitle_overlay.ChatMessage._current_style = style
-    # Cloud provisional card survives a style re-apply with dim + cursor.
+    # Cloud provisional card survives a style re-apply with its dim colors.
     cloud = make_message(app, provider="soniox")
     cloud.update_live("Говорю", "在讲", final=False)
-    assert "▍" in cloud._header_label.text()
-    cloud.apply_style(style)
-    assert "▍" in cloud._header_label.text()
     assert style["provisional_original_color"] in cloud._header_label.text()
+    cloud.apply_style(style)
+    assert style["provisional_original_color"] in cloud._header_label.text()
+    assert CURSOR not in cloud._header_label.text()
     assert style["provisional_translation_color"] in cloud._trans_label.text()
-    # Local card: streaming partial survives a style re-apply.
+    # Local card: a streaming partial is on screen immediately (no second
+    # throttle inside the card) and survives a style re-apply.
     local = make_message(app, provider="")
     local.update_streaming("正在翻")
-    local._flush_streaming()
     assert "正在翻" in local._trans_label.text()
     local.apply_style(style)
     assert "正在翻" in local._trans_label.text()

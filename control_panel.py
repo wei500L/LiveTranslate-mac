@@ -1130,7 +1130,9 @@ class ControlPanel(QWidget):
 
         text_layout.addWidget(QLabel(t("label_original_font_size")), 1, 0)
         self._orig_font_size = QSpinBox()
-        self._orig_font_size.setRange(6, 24)
+        # 24 was the ceiling before window scaling: the translation base ships
+        # at 23, so a user could not raise it. Old values stay valid.
+        self._orig_font_size.setRange(6, 32)
         self._orig_font_size.setValue(
             s.get("original_font_size", DEFAULT_STYLE["original_font_size"])
         )
@@ -1163,7 +1165,7 @@ class ControlPanel(QWidget):
 
         text_layout.addWidget(QLabel(t("label_translation_font_size")), 4, 0)
         self._trans_font_size = QSpinBox()
-        self._trans_font_size.setRange(6, 24)
+        self._trans_font_size.setRange(6, 32)
         self._trans_font_size.setValue(
             s.get("translation_font_size", DEFAULT_STYLE["translation_font_size"])
         )
@@ -1180,6 +1182,14 @@ class ControlPanel(QWidget):
             lambda: self._pick_color(self._trans_color_btn)
         )
         text_layout.addWidget(self._trans_color_btn, 5, 1)
+
+        # Scales the two sizes above with the overlay's width; the sizes are
+        # then the values used at the reference width (620px).
+        self._scale_with_window = QCheckBox(t("label_scale_with_window"))
+        self._scale_with_window.setChecked(s.get("scale_with_window", True))
+        self._scale_with_window.toggled.connect(self._on_style_value_changed)
+        self._scale_with_window.toggled.connect(self._auto_save)
+        text_layout.addWidget(self._scale_with_window, 6, 0, 1, 2)
 
         layout.addWidget(text_group)
 
@@ -1238,6 +1248,7 @@ class ControlPanel(QWidget):
             "translation_font_size": self._trans_font_size.value(),
             "original_color": self._orig_color_btn.property("hex_color"),
             "translation_color": self._trans_color_btn.property("hex_color"),
+            "scale_with_window": self._scale_with_window.isChecked(),
             "window_opacity": self._window_opacity.value(),
         }
 
@@ -1266,6 +1277,7 @@ class ControlPanel(QWidget):
         self._trans_color_btn.setStyleSheet(
             f"background-color: {s['translation_color']}; border: 1px solid #888; border-radius: 3px;"
         )
+        self._scale_with_window.setChecked(s.get("scale_with_window", True))
         self._window_opacity.setValue(s["window_opacity"])
 
     def _on_preset_changed(self, index):
@@ -1311,6 +1323,7 @@ class ControlPanel(QWidget):
             self._trans_font_combo,
             self._orig_font_size,
             self._trans_font_size,
+            self._scale_with_window,
             self._window_opacity,
         ):
             w.blockSignals(block)
