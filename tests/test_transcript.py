@@ -1099,6 +1099,9 @@ class _AdoptionApp:
         # The ENDING-flush hand-off (_flush_for_session_end) gates on ASR
         # readiness; tests that need the not-ready branch flip it.
         self._asr_ready = True
+        # Local-engine stand-in: the Soniox ENDING drain is dead code here.
+        self._asr_type = "whisper"
+        self._asr = None
         self._target_language = "ru"
         self._asr_count = 0
         self._msg_id = 0
@@ -1153,6 +1156,7 @@ class _AdoptionApp:
     _flush_for_session_end = None
     _enqueue_final_segment = None
     _run_session_end = None
+    _soniox_engine_active = None  # bound in _bind() with the real method
     pause = None
     resume = None
 
@@ -1173,6 +1177,7 @@ def _make_adoption_app(tmp_path):
             "_do_interim_asr", "_reset_interim_state",
             "_process_interim_final", "_flush_for_session_end",
             "_enqueue_final_segment", "_run_session_end",
+            "_soniox_engine_active", "_soniox_manager",
             "pause", "resume",
         ):
             setattr(_AdoptionApp, name, getattr(real, name))

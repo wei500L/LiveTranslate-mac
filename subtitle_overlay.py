@@ -40,6 +40,9 @@ DEFAULT_STYLE = {
     "original_color": "#cccccc",
     "translation_color": "#ffffff",
     "timestamp_color": "#888899",
+    # Dimmer variants for streaming (provisional) text — cloud live card.
+    "provisional_original_color": "#7a7a8c",
+    "provisional_translation_color": "#b8b8c0",
     "window_opacity": 95,
 }
 
@@ -204,6 +207,7 @@ class ChatMessage(QWidget):
         source_lang: str,
         asr_ms: float,
         parent=None,
+        provider: str = "",
     ):
         super().__init__(parent)
         self.msg_id = msg_id
@@ -212,6 +216,11 @@ class ChatMessage(QWidget):
         self._timestamp = timestamp
         self._source_lang = source_lang
         self._asr_ms = asr_ms
+        # Cloud providers suppress the per-message latency chips: their
+        # latency is provider-side and not ours to display (never a fake
+        # "0ms"). Per-message so history cards keep their chips when the
+        # engine changes mid-run.
+        self._provider = provider
         self._translate_ms = 0.0
         self.setObjectName("chatMessage")
         self._layout = QVBoxLayout(self)
@@ -245,11 +254,16 @@ class ChatMessage(QWidget):
                 f'<span style="color:#e7b96f;">[{self._source_lang}]</span> '
                 f'<span style="color:{s["original_color"]};">{_escape(self._original)}</span>'
             )
+        asr_chip = (
+            ""
+            if self._provider == "soniox"
+            else f'<span style="color:#8b8; font-size:9pt;">ASR {self._asr_ms:.0f}ms</span>'
+        )
         return (
             f'<span style="color:{s["timestamp_color"]};">[{self._timestamp}]</span> '
             f'<span style="color:#e7b96f;">[{self._source_lang}]</span> '
             f'<span style="color:{s["original_color"]};">{_escape(self._original)}</span> '
-            f'<span style="color:#8b8; font-size:9pt;">ASR {self._asr_ms:.0f}ms</span>'
+            f'{asr_chip}'
         )
 
     def update_streaming(self, partial_text: str):
@@ -288,13 +302,23 @@ class ChatMessage(QWidget):
                     f'<span style="color:{s["translation_color"]};">&gt; {_escape(translated)}</span>'
                 )
             else:
+                tl_chip = (
+                    ""
+                    if self._provider == "soniox"
+                    else f'<span style="color:#db8; font-size:9pt;">TL {translate_ms:.0f}ms</span>'
+                )
                 self._trans_label.setText(
                     f'<span style="color:{s["translation_color"]};">&gt; {_escape(translated)}</span> '
-                    f'<span style="color:#db8; font-size:9pt;">TL {translate_ms:.0f}ms</span>'
+                    f'{tl_chip}'
                 )
         else:
+            hint = (
+                t("soniox_no_translation")
+                if self._provider == "soniox"
+                else t("same_language")
+            )
             self._trans_label.setText(
-                f'<span style="color:#aaa; font-style:italic;">&gt; {t("same_language")}</span>'
+                f'<span style="color:#aaa; font-style:italic;">&gt; {hint}</span>'
             )
 
     def apply_style(self, s: dict):
@@ -311,9 +335,52 @@ class ChatMessage(QWidget):
                     f'<span style="color:{s["translation_color"]};">&gt; {_escape(self._translated)}</span>'
                 )
             else:
+                tl_chip = (
+                    ""
+                    if self._provider == "soniox"
+                    else f'<span style="color:#db8; font-size:9pt;">TL {self._translate_ms:.0f}ms</span>'
+                )
                 self._trans_label.setText(
                     f'<span style="color:{s["translation_color"]};">&gt; {_escape(self._translated)}</span> '
-                    f'<span style="color:#db8; font-size:9pt;">TL {self._translate_ms:.0f}ms</span>'
+                    f'{tl_chip}'
+                )
+
+    def update_live(self, original: str, translation: str, final: bool):
+        """Cloud live card: render both lines in place, provisional (dim) or
+        final (normal). Throttled by the overlay's batched flush, so this
+        runs at most every 50ms, not per token."""
+        self._original = original
+        s = self._current_style
+        orig_color = (
+            s["original_color"] if final else s["provisional_original_color"]
+        )
+        self._header_label.setText(
+            f'<span style="color:{s["timestamp_color"]};">[{self._timestamp}]</span> '
+            f'<span style="color:#e7b96f;">[{self._source_lang}]</span> '
+            f'<span style="color:{orig_color};">{_escape(original)}</span>'
+        )
+        if hasattr(self, "_streaming_timer"):
+            self._streaming_timer.stop()
+            self._pending_streaming = None
+        if final:
+            self._translated = translation
+            if translation:
+                self._trans_label.setText(
+                    f'<span style="color:{s["translation_color"]};">&gt; {_escape(translation)}</span>'
+                )
+            else:
+                self._trans_label.setText(
+                    f'<span style="color:#aaa; font-style:italic;">&gt; {t("soniox_no_translation")}</span>'
+                )
+        else:
+            if translation:
+                self._trans_label.setText(
+                    f'<span style="color:{s["provisional_translation_color"]};">'
+                    f'&gt; {_escape(translation)}</span>'
+                )
+            else:
+                self._trans_label.setText(
+                    f'<span style="color:#999; font-style:italic;">{t("translating")}</span>'
                 )
 
     def contextMenuEvent(self, event):
@@ -487,6 +554,8 @@ class MonitorBar(QWidget):
         # simply not reacting and has no way to tell "not heard" from
         # "heard and dropped".
         self._dropped = 0
+        # Cloud-engine connection status (None = hidden, local engines).
+        self._connection = None
 
         self._sys_timer = QTimer(self)
         self._sys_timer.timeout.connect(self._update_system)
@@ -539,6 +608,23 @@ class MonitorBar(QWidget):
             self._gpu_text = "N/A"
         self._refresh_stats()
 
+    def update_connection(self, status):
+        """Cloud connection status: None hides the indicator (local modes
+        are unchanged); otherwise a colored localized label."""
+        status = status or None
+        if status != self._connection:
+            self._connection = status
+            self._refresh_stats()
+
+    _CONNECTION_STYLES = {
+        # status-value -> (i18n key, color)
+        "connecting": ("soniox_status_connecting", "#e7b96f"),
+        "live": ("soniox_status_live", "#9caf91"),
+        "reconnecting": ("soniox_status_reconnecting", "#e7b96f"),
+        "paused": ("soniox_status_paused", "#9a9aa5"),
+        "failed": ("soniox_status_failed", "#e06c75"),
+    }
+
     def _refresh_stats(self):
         total = self._prompt_tokens + self._completion_tokens
         tokens_str = f"{total / 1000:.1f}k" if total >= 1000 else str(total)
@@ -547,6 +633,15 @@ class MonitorBar(QWidget):
             dev_color = "#9caf91" if "cuda" in self._asr_device.lower() else "#e7b96f"
             dev_str = (
                 f'<span style="color:{dev_color};">{self._asr_device}</span> '
+                f'<span style="color:#555;">|</span> '
+            )
+        conn_str = ""
+        if self._connection is not None:
+            key, color = self._CONNECTION_STYLES.get(
+                self._connection, ("soniox_status_connecting", "#e7b96f")
+            )
+            conn_str = (
+                f'<span style="color:{color};">[{t(key)}]</span> '
                 f'<span style="color:#555;">|</span> '
             )
         cost_str = ""
@@ -565,6 +660,7 @@ class MonitorBar(QWidget):
             )
         self._stats_label.setText(
             f"{dev_str}"
+            f"{conn_str}"
             f'<span style="color:#e7b96f;">CPU</span> {self._cpu}% '
             f'<span style="color:#e7b96f;">RAM</span> {self._ram_mb:.0f}MB '
             f'<span style="color:#e7b96f;">GPU</span> {self._gpu_text} '
@@ -951,6 +1047,12 @@ class DragHandle(QWidget):
     def set_source_language_enabled(self, enabled: bool):
         self._source_lang.setEnabled(enabled)
 
+    def set_target_language_enabled(self, enabled: bool):
+        # blockSignals so a programmatic "zh" (the Soniox lock) does not
+        # fire target_language_changed back into the app.
+        self._target_lang.blockSignals(not enabled)
+        self._target_lang.setEnabled(enabled)
+
     def set_models(self, models: list, active_index: int = 0):
         self._model_combo.blockSignals(True)
         self._model_combo.clear()
@@ -1001,8 +1103,9 @@ class DragHandle(QWidget):
 class SubtitleOverlay(QWidget):
     """Chat-style overlay window for displaying live transcription."""
 
-    add_message_signal = pyqtSignal(int, str, str, str, float)
+    add_message_signal = pyqtSignal(int, str, str, str, float, str)
     update_translation_signal = pyqtSignal(int, str, float)
+    update_connection_signal = pyqtSignal(str)
     update_streaming_signal = pyqtSignal(int, str)
     clear_signal = pyqtSignal()
     # Monitor signals (thread-safe)
@@ -1049,6 +1152,9 @@ class SubtitleOverlay(QWidget):
         self._monitor_timer.timeout.connect(self._flush_monitor)
         self._monitor_timer.start()
         self._streaming_updates = {}
+        # Cloud live-card updates, batched by the same 50ms timer: keys are
+        # msg_ids, values (original, translation, final) tuples.
+        self._live_updates = {}
         # Last style actually rendered, so an unchanged one is a no-op.
         self._applied_style = None
         self._streaming_timer = QTimer(self)
@@ -1059,6 +1165,7 @@ class SubtitleOverlay(QWidget):
 
         self.add_message_signal.connect(self._on_add_message)
         self.update_translation_signal.connect(self._on_update_translation)
+        self.update_connection_signal.connect(self._on_update_connection)
         self.update_streaming_signal.connect(self._on_update_streaming)
         self.clear_signal.connect(self._on_clear)
         self.update_stats_signal.connect(self._on_update_stats)
@@ -1292,8 +1399,20 @@ class SubtitleOverlay(QWidget):
         with self._update_lock:
             updates = self._streaming_updates
             self._streaming_updates = {}
+            live = self._live_updates
+            self._live_updates = {}
         for msg_id, partial_text in updates.items():
             self._on_update_streaming(msg_id, partial_text)
+        for msg_id, (original, translation, final) in live.items():
+            msg = self._messages.get(msg_id)
+            if msg is not None:
+                msg.update_live(original, translation, final)
+        if live:
+            QTimer.singleShot(50, self._scroll_to_bottom)
+
+    @pyqtSlot(str)
+    def _on_update_connection(self, status):
+        self._monitor.update_connection(status or None)
 
     @pyqtSlot(int, int, int, int, float)
     def _on_update_stats(self, asr_count, tl_count, prompt_tokens, completion_tokens, cost):
@@ -1306,8 +1425,11 @@ class SubtitleOverlay(QWidget):
         self._monitor.update_asr_device(device)
 
     @pyqtSlot(int, str, str, str, float)
-    def _on_add_message(self, msg_id, timestamp, original, source_lang, asr_ms):
-        msg = ChatMessage(msg_id, timestamp, original, source_lang, asr_ms)
+    def _on_add_message(self, msg_id, timestamp, original, source_lang, asr_ms,
+                         provider=""):
+        msg = ChatMessage(
+            msg_id, timestamp, original, source_lang, asr_ms, provider=provider
+        )
         self._messages[msg_id] = msg
         self._msg_layout.addWidget(msg)
 
@@ -1446,8 +1568,21 @@ class SubtitleOverlay(QWidget):
         self._transcript_paths = dict(paths or {})
 
     # Thread-safe public API
-    def add_message(self, msg_id, timestamp, original, source_lang, asr_ms):
-        self.add_message_signal.emit(msg_id, timestamp, original, source_lang, asr_ms)
+    def add_message(self, msg_id, timestamp, original, source_lang, asr_ms,
+                    provider=""):
+        self.add_message_signal.emit(
+            msg_id, timestamp, original, source_lang, asr_ms, provider
+        )
+
+    def update_live(self, msg_id, original, translation, final: bool):
+        """Cloud live card: batched in-place update (never a new message per
+        token). Drained by the 50ms _streaming_timer flush."""
+        with self._update_lock:
+            self._live_updates[msg_id] = (original, translation, final)
+
+    def update_connection(self, status):
+        """Cloud connection status for the monitor bar; None hides it."""
+        self.update_connection_signal.emit(status or "")
 
     def update_translation(self, msg_id, translated, translate_ms):
         with self._update_lock:
@@ -1484,6 +1619,9 @@ class SubtitleOverlay(QWidget):
 
     def set_source_language_enabled(self, enabled: bool):
         self._handle.set_source_language_enabled(enabled)
+
+    def set_target_language_enabled(self, enabled: bool):
+        self._handle.set_target_language_enabled(enabled)
 
     def set_models(self, models: list, active_index: int = 0):
         self._handle.set_models(models, active_index)

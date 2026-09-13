@@ -23,6 +23,7 @@ Windows/macOS 实时音频翻译工具。Windows 使用 WASAPI loopback，macOS 
 - **实时翻译管线**：系统音频 → VAD → ASR → LLM 翻译 → 字幕显示
 - **多 ASR 引擎**：faster-whisper、SenseVoice、FunASR Nano、Anime-Whisper、GigaAM（俄语）
 - **远程 ASR**：通过 HTTP 把语音识别放到 GPU 机器上跑 —— 见 [REMOTE_ASR.md](REMOTE_ASR.md)
+- **Soniox 云端实时（俄语→中文）**：连续音频直传云端、不经本地 VAD，安静远距离课堂语音也能识别，译文同流返回 —— 见下文专节
 - **兼容任意 OpenAI 格式 API**：DeepSeek、Grok、Qwen、GPT、Ollama、vLLM 等
 - **会议记录中心**：每场会议自动存档（原文/译文/Markdown/元数据），可搜索、筛选、重命名，正在记录/已暂停/正在保存/异常中断各有明确标注。一场记录可以随时「结束本次记录」收尾——后台等待最后的识别与翻译完成（最多 30 秒，没等到的按原文保存），不退出应用、不卸载模型；结束后应用停止监听（模型驻留内存），记录立即选中且不再被任何后台结果改动，可生成 AI 纪要或导出 PDF；「开始新记录」先建新会话再恢复监听，同秒连开也不会写串文件
 - **AI 会议纪要**：从你已配置的模型中独立选择供应商，把整场记录生成为结构化 Markdown 纪要（会议/课堂双模板），可编辑、可标记过期后重新生成；长会议自动分块提取再逐级汇总。⚠️ 云端供应商会把完整记录发送给第三方，介意隐私请选本地模型（LM Studio、Ollama 等）
@@ -58,6 +59,31 @@ LiveTranslate 通过 Transformers 加载官方 [`ai-sage/GigaAM-v3`](https://hug
 官方资料：[GigaAM-v3 模型](https://huggingface.co/ai-sage/GigaAM-v3) ·
 [GigaAM 项目主页](https://github.com/salute-developers/GigaAM) ·
 [官方推理说明](https://github.com/salute-developers/GigaAM#model-inference)
+
+### Soniox 云端实时（俄语 → 中文）
+
+面向大学课堂、会议和远距离教师讲话的云端模式：音频**连续**上传 Soniox（`stt-rt-v5`，俄语），中文译文从同一条 WebSocket 流式返回，不再调用本地/远程翻译器。
+
+**与本地模式的区别**：本地链路依赖本地 VAD 判断哪些音频是语音——老师声音小、离麦克风远时整句会被漏掉。Soniox 模式把连续音频（含安静片段）直接上传，由云端识别；VAD 阈值、最短/最长语音等设置对该模式不生效（设置页中会隐藏）。
+
+**使用步骤**：
+
+1. 在 [Soniox Console](https://console.soniox.com/) 注册并创建 API Key。
+2. 配置 Key（二选一，环境变量优先）：`export SONIOX_API_KEY=你的Key`，或在 设置 → VAD/ASR 选择该引擎后在 API Key 输入框填写。Key 以**明文**保存在本机 `user_settings.json`（与翻译模型 Key 相同的保存方式），不会出现在日志中。
+3. 说话即可。悬浮窗底部一条实时卡片：第一行俄语原文（较小）、第二行中文译文（较大），未定稿内容颜色较淡；到语义分段点自动固化为历史消息。
+4. 可选：填写「课程主题 / 专业术语」——每行一个主题/人名/术语；写成 `俄语词 => 中文译名` 的行会强制按该译名翻译（如 `предел => 极限`）。
+
+**分段模式**：准确率优先（默认）/ 平衡 / 低延迟。
+
+**网络中断**：自动指数退避重连（悬浮窗显示「正在重连」）；连续失败达到上限后停止重试并提示，重新选择引擎即可恢复。
+
+**费用提醒**：云端按音频流时长计费，选择该引擎即开始产生费用；不用时请切回本地引擎。
+
+**可选的真实连通测试**（默认测试不访问网络）：
+
+```bash
+SONIOX_API_KEY=你的Key RUN_SONIOX_LIVE_TEST=1 python -m pytest tests/test_soniox_live.py -q
+```
 
 ## 更新日志
 

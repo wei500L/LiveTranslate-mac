@@ -7,10 +7,10 @@ import pytest
 INSTALL_ENTRYPOINTS = ("install.ps1", "update.bat", "build_release.ps1")
 
 
-def _requirement_lines() -> set[str]:
+def _requirement_lines(name: str = "requirements.txt") -> set[str]:
     return {
         line.split("#", 1)[0].strip().lower()
-        for line in Path("requirements.txt").read_text(encoding="utf-8").splitlines()
+        for line in Path(name).read_text(encoding="utf-8").splitlines()
         if line.split("#", 1)[0].strip()
     }
 
@@ -25,6 +25,15 @@ def test_funasr_uses_published_dependency_metadata():
         "soundfile>=0.12.1",
     } <= requirements
     assert "editdistance-s>=1.0.0" not in requirements
+
+
+def test_soniox_sdk_is_pinned_in_both_requirement_files():
+    """The Soniox cloud engine depends on the official SDK in both platforms'
+    requirement files — the symmetry test alone would also accept it in
+    neither."""
+    for path in ("requirements.txt", "requirements-mac.txt"):
+        lines = _requirement_lines(path) if "mac" in path else _requirement_lines()
+        assert "soniox>=2.9,<3" in lines, f"{path} must pin soniox>=2.9,<3"
 
 
 def test_numpy_numba_versions_support_python_312_resolution():

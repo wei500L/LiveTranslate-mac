@@ -114,6 +114,65 @@ Additional ASR backends and the remote path:
 asr_gigaam.py    GigaAM-v3 backend (ai-sage, Russian-only, fixed language "ru")
 asr_remote.py    RemoteASREngine client — binary protocol to a separate ASR server
 asr_server.py    Standalone FastAPI ASR server (see REMOTE_ASR.md)
+
+Soniox cloud realtime engine (ru -> zh, streaming, bypasses local VAD):
+
+```
+soniox_accumulator.py  Pure token state machine (no I/O/SDK/Qt deps): provisional
+                       tokens REPLACE (never append-duplicate), final tokens append
+                       exactly once routed by translation_status (original/none ->
+                       original side, translation -> zh side), `<end>` never displayed
+                       and commits the segment exactly once (multiple <end> per event
+                       commit multiple segments; a second on empty state is a no-op),
+                       finished commits trailing finals exactly once (_tail_committed),
+                       flush() is the hard boundary (pause/ending), reset() drops all.
+soniox_client.py       SonioxServiceManager: supervisor thread (connect/receive/
+                       reconnect) + send thread (bounded PCM16 deque). Key invariant:
+                       a chunk is popped from the deque only AFTER send_byte_chunk
+                       returns — reconnect replays the unsent remainder once, never
+                       re-sends sent audio. feed() never blocks/raises (drop-oldest
+                       + counted metric beyond ~10s buffered). Generation is snapshotted
+                       at session start; every dispatched result carries it, so
+                       bump_generation() retroactively invalidates the whole in-flight
+                       session (capturing it per-event made the guard a tautology).
+                       The send runs OUTSIDE the manager lock (phase-2 unlock) — a slow
+                       socket must never block feed(). API key redaction: mask_key()
+                       output is the only logged form; redact_key() strips the key from
+                       exception text (SDK exceptions can embed the request URL).
+asr_soniox.py          SonioxASREngine: the in-process ASRClient-compatible shim
+                       (mirrors asr_remote.RemoteASREngine — status/pid=None/no-op
+                       setters). Streaming-only: transcribe() raises (unreachable —
+                       _run_asr is bypassed); audio flows via manager.feed() from the
+                       capture loop.
+```
+
+main.py Soniox integration: the capture loop branches INSIDE the producer fence
+right after the session-end gate check (`_soniox_engine_active()` -> `_soniox_feed`
+-> continue; the local VAD path is untouched for local engines — quiet audio goes
+to the cloud exactly like loud speech). Commits go through `_commit_soniox_segment`
+(the dedicated path — NOT _process_segment_text, which would re-submit to the
+translation executor): mirrors the boundary-fence section with a `_soniox_anchor`
+(generation, expected_session) set by begin_recording_session/_activate_asr and
+cleared by end/stop; write_original -> register/adopt -> write_translation /
+finalize_no_translation -> release in one fenced section; `_soniox_committed`
+msg_id set is the exactly-once guard against replayed commits (the writer accepts
+writes by msg_id without dedup). ENDING: after the gate goes up, a bounded
+`manager.finalize_for_end(deadline)` (sharing the 30s budget) drains the last
+segment before end_session(). pause()/resume() delegate to manager.pause/resume
+(SDK finalize on pause — no sentence splicing across the pause); stop() calls
+finish_and_drain then shutdown, all bounded. Overlay: one live card per segment
+(`_SonioxSink.on_live` allocates once, `update_live` updates in place, 50ms batched
+flush — never a card per token); `provider="soniox"` on ChatMessage suppresses the
+ASR/TL latency chips (per-message, not class-level — history cards keep their
+chips); MonitorBar shows the five-state connection indicator. Settings:
+soniox_api_key (env SONIOX_API_KEY wins; filtered from the panel's settings log),
+soniox_context, soniox_segmentation (accuracy/balanced/low_latency endpoint
+presets; context/segmentation changes apply via manager.apply_config — a graceful
+reconnect — without a full engine reload; a key change is a signature change and
+reloads). Language locks: source ru, target zh (GigaAM lock pattern). Offline
+tests: tests/test_soniox_{accumulator,client,pipeline,ui,sdk_contract}.py; the
+gated live test (SONIOX_API_KEY + RUN_SONIOX_LIVE_TEST=1) is the only network
+toucher.
 ```
 
 Cross-cutting modules:

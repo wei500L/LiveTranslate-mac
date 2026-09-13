@@ -1,5 +1,6 @@
 """LiveTranslate cross-platform real-time audio translation application."""
 
+import hashlib
 import sys
 import signal
 import logging
@@ -75,6 +76,12 @@ from connection_config import (
 from vad_processor import VADProcessor
 from asr_client import ASRClient, ASRWorkerError, ASRWorkerExited, ASRWorkerTimeout
 from asr_remote import RemoteASRError
+from soniox_accumulator import SonioxLiveState, SonioxSegment
+from soniox_client import (
+    SonioxServiceManager,
+    SonioxStatus,
+    resolve_api_key,
+)
 from translator import RepetitionError, translator_from_model_config
 from mlx_service import MLXServiceManager, is_hy_mt_model
 from transcript_writer import TranscriptWriter
@@ -652,6 +659,71 @@ def load_config():
     )
 
 
+class _SonioxSink:
+    """Adapts SonioxServiceManager callbacks onto LiveTranslateApp.
+
+    Runs on the manager's supervisor thread; touches only thread-safe app
+    surfaces (the boundary lock, the writer, the overlay facade — which emits
+    Qt signals internally). Localizes status/errors here so the manager stays
+    i18n-free.
+    """
+
+    def __init__(self, app: "LiveTranslateApp"):
+        self._app = app
+
+    def on_live(self, state: SonioxLiveState) -> None:
+        app = self._app
+        # One live card per segment: the first provisional of a segment
+        # allocates the card; every later provisional updates it in place
+        # (never a new card per token).
+        if app._soniox_live_msg_id is None:
+            app._msg_id += 1
+            msg_id = app._msg_id
+            app._soniox_live_msg_id = msg_id
+            timestamp = datetime.now().strftime("%H:%M:%S")
+            if app._overlay:
+                app._overlay.add_message(
+                    msg_id, timestamp, state.original, "ru", 0.0,
+                    provider="soniox",
+                )
+            return
+        if app._overlay:
+            app._overlay.update_live(
+                app._soniox_live_msg_id, state.original, state.translation,
+                final=False,
+            )
+
+    def on_segments(self, segments: list) -> None:
+        for segment in segments:
+            self._app._commit_soniox_segment(segment)
+
+    def on_status(self, status: SonioxStatus) -> None:
+        app = self._app
+        if app._overlay:
+            app._overlay.update_connection(
+                None if status in (SonioxStatus.FINISHED,) else status.value
+            )
+
+    def on_error(self, message: str) -> None:
+        # The manager reports facts; the user-facing text is localized here
+        # (the manager never imports i18n). Surfaced as an overlay system
+        # message — never a Qt dialog, this runs on the supervisor thread.
+        log.warning("Soniox error: %s", message)
+        if "not installed" in message:
+            text = t("error_soniox_sdk_missing")
+        elif "API key" in message or "authentication" in message:
+            # The live 401 (the WS handshake does not validate the key; the
+            # rejection arrives as an in-session error event).
+            text = t("error_soniox_no_key")
+        else:
+            text = t("soniox_reconnect_failed")
+        self._app._show_soniox_error(text)
+
+    def on_metrics(self, metrics: dict) -> None:
+        # Diagnosable overflow: surfaced at DEBUG, never spamming info logs.
+        log.debug("Soniox metrics: %s", metrics)
+
+
 class LiveTranslateApp:
     def __init__(self, config):
         self._config = config
@@ -681,6 +753,20 @@ class LiveTranslateApp:
         self._asr = None
         self._asr_signature = None
         self._asr_config = None
+        # Soniox streaming state. The anchor is the write-time identity for
+        # cloud segment commits, exactly like the (generation, expected_session)
+        # pair a queue item carries in the local pipeline: set under the
+        # session boundary lock by begin/end/activate, read under the same
+        # lock by _commit_soniox_segment. None = display-only (no session).
+        self._soniox_anchor = None
+        self._soniox_live_msg_id = None
+        # msg_ids already committed by the cloud path this session
+        # generation: a replayed commit (duplicate <end> dispatch, a
+        # drain-timeout straggler racing the flush) must not append a
+        # second entry — the writer accepts writes by msg_id without
+        # dedup, so this set is the exactly-once guard.
+        self._soniox_committed = set()
+        self._soniox_sink = _SonioxSink(self)
         self._asr_error_count = 0
         self._asr_device = normalize_device(config["asr"]["device"])
         self._whisper_model_size = config["asr"]["model_size"]
@@ -942,6 +1028,12 @@ class LiveTranslateApp:
                 return None
             self._session_generation += 1
             self._session_work.begin(self._session_generation)
+            # Cloud commits adopt the same write-time identity the queue
+            # items carry: (generation, expected_session).
+            self._soniox_anchor = (
+                self._session_generation, session_id,
+            )
+            self._soniox_committed = set()
             self._record_session_info()
             self._publish_transcript_paths()
             if not self._running:
@@ -1188,13 +1280,29 @@ class LiveTranslateApp:
             self._session_work.start_closing(generation)
             self._session_end_gating = True
         try:
+            # 1b) Cloud mode: the gate above already stops the capture loop
+            #     from feeding the manager. Finalize the current utterance
+            #     and wait (bounded, sharing the ENDING budget) for the last
+            #     segment commit before the writer closes the session.
+            if self._soniox_engine_active():
+                manager = self._soniox_manager()
+                if manager is not None:
+                    deadline = time.monotonic() + SessionState.ENDING_TIMEOUT_S
+                    ok = manager.finalize_for_end(deadline)
+                    if not ok:
+                        log.warning(
+                            "Session end: Soniox drain timed out; "
+                            "stragglers refused by the anchor/generation guards"
+                        )
+
             # 2) Flush the last VAD buffer into the ASR queue through the
             #    controlled final-registration entry (the only new work
             #    allowed while CLOSING), registered before it is enqueued.
             #    The flush itself never resets the interim state — not even
             #    when it has nothing to enqueue; see its docstring for the
             #    ownership rule and step 3 for the one reset point.
-            self._flush_for_session_end(generation)
+            if not self._soniox_engine_active():
+                self._flush_for_session_end(generation)
 
             # 3) Two waits over ONE budget: the 30s ENDING cap is shared,
             #    not doubled. Phase A waits for this generation's *queue*
@@ -1258,6 +1366,11 @@ class LiveTranslateApp:
             #    terminal path. Releasing an already-cleared generation is a
             #    no-op, so double releases cannot corrupt anything.
             self._session_work.supersede(generation)
+            # The cloud anchor goes with it: a drain-timeout straggler
+            # arriving after this must not write into the next meeting.
+            with self._session_boundary_lock:
+                self._soniox_anchor = None
+                self._soniox_committed = set()
             return summary
         finally:
             # Order matters: pause first, *then* lift the capture gate. The
@@ -1547,6 +1660,7 @@ class LiveTranslateApp:
                 "funasr_model",
                 "gigaam_model",
                 "hub",
+                "soniox_api_key",
             )
         ):
             self._switch_asr_engine(
@@ -1557,6 +1671,17 @@ class LiveTranslateApp:
             )
         # `settings` is the full settings dict on every auto-save, so a key being
         # present says nothing about the user having changed it. Compare values.
+        if "soniox_context" in settings or "soniox_segmentation" in settings:
+            manager = self._soniox_manager()
+            if manager is not None:
+                changes = {}
+                if "soniox_context" in settings:
+                    changes["context_text"] = settings.get("soniox_context", "")
+                if "soniox_segmentation" in settings:
+                    changes["segmentation"] = (
+                        settings.get("soniox_segmentation") or "accuracy"
+                    )
+                manager.apply_config(**changes)
         if "audio_device" in settings:
             old_device = self._audio._device_name
             new_device = settings["audio_device"]
@@ -1664,6 +1789,8 @@ class LiveTranslateApp:
             self._gigaam_model_key
         ):
             language = "ru"
+        if self._asr_type == "soniox":
+            language = "ru"  # cloud engine is fixed ru -> zh
         with self._asr_pending_lock:
             self._asr_pending_language = language
 
@@ -1678,6 +1805,8 @@ class LiveTranslateApp:
             self._gigaam_model_key
         ):
             return "ru"
+        if self._asr_type == "soniox":
+            return "ru"  # cloud engine is fixed ru -> zh
         return configured
 
     def _set_asr_padding(self, engine_type: str, pad_seconds):
@@ -1737,6 +1866,20 @@ class LiveTranslateApp:
             if language:
                 engine.set_language(language)
             return engine
+        if config.get("engine_type") == "soniox":
+            from asr_soniox import SonioxASREngine
+
+            # Streaming-only engine: no worker process, no transcribe().
+            # The sink adapter is app-owned so the engine shim stays
+            # re-instantiable on every switch. Missing key / missing SDK
+            # raise ConnectionError subclasses -> the expected-failure path
+            # restores the previous engine with an actionable message.
+            return SonioxASREngine(
+                api_key=config.get("soniox_api_key"),
+                context_text=config.get("soniox_context") or "",
+                segmentation=config.get("soniox_segmentation") or "accuracy",
+                sink=self._soniox_sink,
+            )
         return self._load_asr_client(config)
 
     def _load_asr_client(self, worker_config: dict) -> ASRClient:
@@ -1753,6 +1896,13 @@ class LiveTranslateApp:
             raise
 
     def _on_target_language_changed(self, lang: str):
+        if self._asr_type == "soniox" and lang != "zh":
+            # The cloud engine's one-way translation is configured for zh;
+            # a different target would silently mismatch what the cloud
+            # returns. The overlay combo is locked, this covers any other
+            # entry point (tray, panel reload races).
+            log.info("Target language locked to zh in Soniox mode")
+            lang = "zh"
         self._target_language = lang
         log.info(f"Target language: {lang}")
         if self._translator:
@@ -1907,6 +2057,163 @@ class LiveTranslateApp:
                 self._translation_pending = max(0, self._translation_pending - 1)
             return True
 
+    # ------------------------------------------------------------------
+    # Soniox cloud streaming engine
+
+    def _soniox_engine_active(self) -> bool:
+        """True when the active engine is the Soniox cloud stream.
+
+        Unlocked reads by design (same discipline as the _asr_ready reads in
+        _capture_loop): this only routes audio between two paths, and the
+        engine switch tears the manager down before flipping _asr_type.
+        """
+        return (
+            self._asr_type == "soniox"
+            and self._asr is not None
+            and self._asr.status == "ready"
+        )
+
+    def _soniox_manager(self) -> SonioxServiceManager | None:
+        client = self._asr
+        manager = getattr(client, "manager", None)
+        return manager if self._soniox_engine_active() else None
+
+    def _soniox_feed(self, chunk: np.ndarray) -> None:
+        """Capture-thread entry: PCM16 conversion + bounded enqueue.
+
+        Never blocks, never raises (see SonioxServiceManager.feed). The local
+        VAD is bypassed entirely in cloud mode: quiet or distant speech is
+        uploaded exactly like loud speech.
+        """
+        manager = self._soniox_manager()
+        if manager is not None:
+            manager.feed(chunk)
+
+    def _show_soniox_error(self, message: str) -> None:
+        """Surface a Soniox failure on the overlay (thread-safe facade)."""
+        if not self._overlay:
+            return
+        self._msg_id += 1
+        msg_id = self._msg_id
+        self._overlay.add_message(
+            msg_id, datetime.now().strftime("%H:%M:%S"),
+            message, "ru", 0.0, provider="soniox",
+        )
+        # Final live render with no translation: shows the cloud-mode
+        # "no translation" hint rather than a stuck "translating".
+        self._overlay.update_live(msg_id, message, "", final=True)
+
+    def _commit_soniox_segment(self, segment: SonioxSegment) -> None:
+        """Endpoint commit with the translation already provided.
+
+        The dedicated path (not _process_segment_text, which would re-submit
+        to the translation executor — double translation, extra cost, extra
+        latency). Mirrors _process_segment_text's boundary-fence section:
+        identity check → write_original → register/adopt →
+        write_translation/finalize_no_translation → release. Runs on the
+        Soniox supervisor thread; only short local work runs under the
+        fence.
+        """
+        original_text = segment.original.strip()
+        if not original_text:
+            return
+
+        # The live card allocated a msg_id during the provisional phase; a
+        # segment that never showed provisionals (e.g. a fast <end>) still
+        # needs its own id.
+        msg_id = self._soniox_live_msg_id
+        self._soniox_live_msg_id = None
+        if msg_id is None:
+            self._msg_id += 1
+            msg_id = self._msg_id
+        if msg_id in self._soniox_committed:
+            # Exactly-once: this msg_id already produced its record entry
+            # (a replayed event); the writer would happily append again.
+            log.debug("Soniox: dropping replayed commit for msg %s", msg_id)
+            return
+        self._soniox_committed.add(msg_id)
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        self._asr_count += 1
+        log.info("Soniox segment [ru]: %s", original_text)
+
+        with self._session_boundary_lock:
+            anchor = self._soniox_anchor
+            if anchor is None:
+                # No meeting session (or it belongs to a closed one):
+                # display-only. Never write_original(session=None) — that is
+                # the legacy auto-open wildcard, and cloud commits must not
+                # open ghost sessions.
+                if self._overlay:
+                    self._overlay.update_live(
+                        msg_id, original_text, segment.translation, final=True
+                    )
+                return
+            msg_generation, expected_session = anchor
+            if msg_generation != self._session_generation:
+                # The session this audio belongs to already ended; a late
+                # commit must not land in the next meeting's files.
+                log.info(
+                    "Dropping Soniox segment from superseded session "
+                    "generation %s (current %s)",
+                    msg_generation, self._session_generation,
+                )
+                if self._overlay:
+                    self._overlay.update_live(
+                        msg_id, original_text, segment.translation, final=True
+                    )
+                return
+            if self._overlay:
+                self._overlay.add_message(
+                    msg_id, timestamp, original_text, "ru", 0.0,
+                    provider="soniox",
+                )
+            result = self._transcript.write_original(
+                msg_id, timestamp, original_text,
+                language="ru", session=expected_session,
+            )
+            if result == TranscriptWriter.WRITE_SESSION_MISMATCH:
+                self._finalize_untranslated(
+                    msg_id, "soniox segment belongs to a closed session",
+                    user_visible=False,
+                )
+                return
+            if result == TranscriptWriter.WRITE_RECORDED:
+                self._session_work.register_msg(msg_generation, msg_id)
+                # Same adoption helper as the local paths; on the legacy
+                # auto-open the anchor re-snapshots to the claimed session.
+                msg_generation = self._adopt_auto_opened_session(
+                    msg_id, msg_generation
+                )
+                self._soniox_anchor = (
+                    msg_generation,
+                    self._transcript.active_session(),
+                )
+                if segment.translation:
+                    self._transcript.write_translation(
+                        msg_id, segment.translation, session=expected_session
+                    )
+                else:
+                    self._transcript.finalize_no_translation(
+                        msg_id, session=expected_session
+                    )
+                self._translate_count += 1
+                self._session_work.release_msg(msg_generation, msg_id)
+            elif self._overlay:
+                # WRITE_SKIPPED / WRITE_FAILED: subtitle-only display.
+                self._overlay.update_live(
+                    msg_id, original_text, segment.translation, final=True
+                )
+        if self._overlay:
+            self._overlay.update_stats(
+                self._asr_count, self._translate_count,
+                self._total_prompt_tokens, self._total_completion_tokens,
+                self._compute_cost(),
+            )
+        # The standalone subtitle window gets the final pair like every
+        # other completed entry.
+        if self._subwin and self._subwin.isVisible() and segment.translation:
+            self._subwin.update_text(original_text, {"zh": segment.translation})
+
     def _finalize_untranslated(self, msg_id, reason: str, user_visible: bool):
         """Close out a message that will never receive a translation.
 
@@ -1988,6 +2295,13 @@ class LiveTranslateApp:
             signature_model = (
                 f"{gigaam_model_id(gigaam_model)}@{gigaam_revision(gigaam_model)}"
             )
+        elif engine_type == "soniox":
+            # One-way hash of the key: a different key is a different
+            # engine identity (reconnects), while the key itself never
+            # enters the signature (which can be logged).
+            signature_model = "cloud:" + hashlib.sha256(
+                (resolve_api_key(settings) or "").encode("utf-8")
+            ).hexdigest()[:8]
         else:
             signature_model = engine_type
         signature = (engine_type, signature_model, device, hub, compute)
@@ -2062,6 +2376,19 @@ class LiveTranslateApp:
             "download_root": str((MODELS_DIR / "huggingface" / "hub").resolve()),
             "display_name": display_name,
             "remote_asr_url": remote_asr_url,
+            # Soniox runtime config (never logged: _asr_config logging is
+            # filtered to non-secret keys elsewhere, but these ride the
+            # worker_config dict which IS logged — keep the key out of it
+            # and re-resolve at load time instead).
+            "soniox_api_key": resolve_api_key(settings) if engine_type == "soniox" else None,
+            "soniox_context": (
+                settings.get("soniox_context", "") if engine_type == "soniox" else None
+            ),
+            "soniox_segmentation": (
+                settings.get("soniox_segmentation", "accuracy")
+                if engine_type == "soniox"
+                else None
+            ),
         }
         target_state = {
             "type": engine_type,
@@ -2208,6 +2535,15 @@ class LiveTranslateApp:
                 self._asr_restart_count = 0
                 self._asr_worker_baseline_mb = None
                 self._asr_generation += 1
+            if state["type"] == "soniox":
+                # A cloud engine activating mid-session (engine switch during
+                # a live meeting) adopts the writer's open session so its
+                # commits land in the current meeting.
+                with self._session_boundary_lock:
+                    self._soniox_anchor = (
+                        self._session_generation,
+                        self._transcript.active_session(),
+                    )
             if self._running:
                 self._record_session_info()
 
@@ -2885,6 +3221,10 @@ class LiveTranslateApp:
                 self._session_generation += 1  # supersedes any in-flight ENDING
                 self._notify_session_state(SessionState.IDLE)
             self._session_end_gating = False
+            # Cloud commits have no queue item to carry identity: the anchor
+            # is the identity, and teardown clears it (display-only after).
+            self._soniox_anchor = None
+            self._soniox_committed = set()
         self._transcript.set_recording(False)
         # Nothing is waited on anymore; late releases for the old
         # generations are no-ops by design.
@@ -2962,6 +3302,13 @@ class LiveTranslateApp:
             log.error("Cleanup step failed: %s", what, exc_info=True)
 
     def _flush_on_stop(self):
+        if self._soniox_engine_active():
+            manager = self._soniox_manager()
+            if manager is not None:
+                # end-of-audio: the server finalizes everything pending and
+                # the receive loop commits the trailing segment. Bounded.
+                manager.finish_and_drain(timeout=5.0)
+            return
         if not self._asr_ready:
             with self._vad_lock:
                 self._vad._reset()
@@ -3011,6 +3358,19 @@ class LiveTranslateApp:
 
     def pause(self):
         self._paused = True
+        if self._soniox_engine_active():
+            # Cloud mode: the capture loop already stops feeding on
+            # _paused. Finalize the current utterance server-side (bounded,
+            # on this thread) so the segment commits now and post-resume
+            # speech starts a fresh segment — no sentence splicing across
+            # the pause.
+            manager = self._soniox_manager()
+            if manager is not None:
+                manager.pause()
+            if self._overlay:
+                self._overlay.update_monitor(0.0, 0.0)
+            log.info("Pipeline paused (soniox)")
+            return
         # Hand off whatever was mid-utterance. Leaving it in the buffer meant
         # audio from after the resume was appended to it, so a pause taken in
         # the middle of a sentence produced one line spliced across the gap —
@@ -3072,6 +3432,10 @@ class LiveTranslateApp:
 
     def resume(self):
         self._paused = False
+        if self._soniox_engine_active():
+            manager = self._soniox_manager()
+            if manager is not None:
+                manager.resume()
         log.info("Pipeline resumed")
 
     def _process_segment(self, speech_segment, work_id=None, generation=None,
@@ -3901,6 +4265,17 @@ class LiveTranslateApp:
                     # meeting. The monitor above still updates (the user sees
                     # the level); the buffer is left to the ENDING thread's
                     # flush.
+                    continue
+
+                if self._soniox_engine_active():
+                    # Cloud streaming mode: continuous upload, no local VAD.
+                    # Quiet/low-confidence audio goes to the cloud exactly
+                    # like loud speech — the whole point of this engine
+                    # (distant lecturer). Still inside the producer fence and
+                    # after the gate check, so the session-boundary semantics
+                    # are identical to the VAD path. The silence-feed branch
+                    # above is inert here (_vad._is_speaking stays False).
+                    self._soniox_feed(chunk)
                     continue
 
                 with self._vad_lock:
@@ -4837,9 +5212,14 @@ def main():
         combo = getattr(panel, "_gigaam_model_combo", None)
         return gigaam_is_russian_only(combo.currentData() if combo else None)
 
+    def _soniox_locks_ru(index=None):
+        """True when the Soniox cloud engine (fixed ru -> zh) is selected."""
+        idx = panel._asr_engine.currentIndex() if index is None else index
+        return idx == 5
+
     def _sync_asr_language_controls(index=None):
         """Keep every source-language entry point consistent with GigaAM."""
-        lock_ru = _gigaam_locks_ru(index)
+        lock_ru = _gigaam_locks_ru(index) or _soniox_locks_ru(index)
         if lock_ru:
             ru_idx = panel._asr_lang.findData("ru")
             if ru_idx >= 0 and panel._asr_lang.currentData() != "ru":
@@ -4853,6 +5233,13 @@ def main():
         for action in _asr_lang_actions.values():
             action.setEnabled(not lock_ru)
             action.setChecked(action.data() == selected)
+        # Soniox fixes the target at zh (one-way cloud translation); every
+        # other engine keeps the user's target choice.
+        lock_zh = _soniox_locks_ru(index)
+        overlay.set_target_language_enabled(not lock_zh)
+        if lock_zh:
+            live_trans._target_language = "zh"
+            overlay.set_target_language("zh")
 
     panel._asr_engine.currentIndexChanged.connect(_sync_asr_language_controls)
     if hasattr(panel, "_gigaam_model_combo"):
@@ -4872,7 +5259,7 @@ def main():
     def _on_tray_asr_lang(code):
         from control_panel import _save_settings
 
-        if _gigaam_locks_ru():
+        if _gigaam_locks_ru() or _soniox_locks_ru():
             code = "ru"
         live_trans._set_asr_language(code)
         settings = panel.get_settings()

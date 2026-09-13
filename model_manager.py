@@ -145,6 +145,7 @@ ASR_DISPLAY_NAMES = {
     "anime-whisper": "Anime-Whisper",
     "remote-whisper": "Remote-Whisper",
     "gigaam": "GigaAM (ru)",
+    "soniox": "Soniox Cloud (ru→zh)",
 }
 
 _MODEL_SIZE_BYTES = {

@@ -20,6 +20,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QPlainTextEdit,
     QMessageBox,
     QPushButton,
     QSlider,
@@ -470,6 +471,7 @@ class ControlPanel(QWidget):
                 "Anime-Whisper (ja, anime/galgame)",
                 t("asr_gigaam"),
                 "Remote Whisper (remote GPU server)",
+                t("asr_soniox"),
             ]
         )
         engine_map_idx = {
@@ -478,6 +480,7 @@ class ControlPanel(QWidget):
             "anime-whisper": 2,
             "gigaam": 3,
             "remote-whisper": 4,
+            "soniox": 5,
         }
         engine_idx = engine_map_idx.get(s.get("asr_engine"), 0)
         self._asr_engine.setCurrentIndex(engine_idx)
@@ -509,7 +512,8 @@ class ControlPanel(QWidget):
             if self._asr_device.itemText(i).startswith(saved_dev):
                 self._asr_device.setCurrentIndex(i)
                 break
-        asr_layout.addWidget(QLabel(t("label_device")), 2, 0)
+        self._asr_device_label = QLabel(t("label_device"))
+        asr_layout.addWidget(self._asr_device_label, 2, 0)
         asr_layout.addWidget(self._asr_device, 2, 1)
         self._asr_device.currentIndexChanged.connect(self._auto_save)
 
@@ -627,7 +631,8 @@ class ControlPanel(QWidget):
         self._hub_combo.addItems([t("hub_modelscope"), t("hub_huggingface")])
         saved_hub = s.get("hub", "ms")
         self._hub_combo.setCurrentIndex(0 if saved_hub == "ms" else 1)
-        asr_layout.addWidget(QLabel(t("label_hub")), 8, 0)
+        self._hub_label = QLabel(t("label_hub"))
+        asr_layout.addWidget(self._hub_label, 8, 0)
         asr_layout.addWidget(self._hub_combo, 8, 1)
         self._hub_combo.currentIndexChanged.connect(self._auto_save)
 
@@ -682,8 +687,46 @@ class ControlPanel(QWidget):
         layout.addWidget(self._remote_group)
         self._remote_group.setVisible(engine_idx == 4)
 
-        mode_group = QGroupBox(t("group_vad_mode"))
-        mode_layout = QVBoxLayout(mode_group)
+        # --- Soniox cloud engine settings (visible only at engine index 5) ---
+        self._soniox_group = QGroupBox(t("group_soniox"))
+        soniox_layout = QGridLayout(self._soniox_group)
+        soniox_layout.addWidget(QLabel(t("label_soniox_api_key")), 0, 0)
+        self._soniox_key_edit = QLineEdit((s.get("soniox_api_key") or "").strip())
+        self._soniox_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self._soniox_key_edit.editingFinished.connect(self._auto_save)
+        soniox_layout.addWidget(self._soniox_key_edit, 0, 1)
+        key_hint = QLabel(t("soniox_api_key_hint"))
+        key_hint.setWordWrap(True)
+        key_hint.setStyleSheet("color: #888; font-size: 11px;")
+        soniox_layout.addWidget(key_hint, 1, 0, 1, 2)
+        soniox_layout.addWidget(QLabel(t("label_soniox_segmentation")), 2, 0)
+        self._soniox_seg_combo = QComboBox()
+        seg_keys = ("soniox_seg_accuracy", "soniox_seg_balanced", "soniox_seg_low_latency")
+        seg_values = ("accuracy", "balanced", "low_latency")
+        self._soniox_seg_combo.addItems([t(k) for k in seg_keys])
+        seg_idx = seg_values.index(
+            s.get("soniox_segmentation", "accuracy")
+        ) if s.get("soniox_segmentation", "accuracy") in seg_values else 0
+        self._soniox_seg_combo.setCurrentIndex(seg_idx)
+        self._soniox_seg_combo.currentIndexChanged.connect(self._auto_save)
+        soniox_layout.addWidget(self._soniox_seg_combo, 2, 1)
+        soniox_layout.addWidget(QLabel(t("label_soniox_context")), 3, 0)
+        self._soniox_context_edit = QPlainTextEdit(
+            (s.get("soniox_context") or "").strip()
+        )
+        self._soniox_context_edit.setPlaceholderText(t("soniox_context_placeholder"))
+        self._soniox_context_edit.setMaximumHeight(96)
+        self._soniox_context_edit.textChanged.connect(self._auto_save)
+        soniox_layout.addWidget(self._soniox_context_edit, 3, 1)
+        cloud_note = QLabel(t("soniox_note_cloud"))
+        cloud_note.setWordWrap(True)
+        cloud_note.setStyleSheet("color: #888; font-size: 11px;")
+        soniox_layout.addWidget(cloud_note, 4, 0, 1, 2)
+        layout.addWidget(self._soniox_group)
+        self._soniox_group.setVisible(engine_idx == 5)
+
+        self._vad_mode_group = QGroupBox(t("group_vad_mode"))
+        mode_layout = QVBoxLayout(self._vad_mode_group)
         self._vad_mode = QComboBox()
         self._vad_mode.addItems([t("vad_silero"), t("vad_energy"), t("vad_disabled")])
         mode_map = {"silero": 0, "energy": 1, "disabled": 2}
@@ -691,10 +734,10 @@ class ControlPanel(QWidget):
         self._vad_mode.currentIndexChanged.connect(self._on_vad_mode_changed)
         self._vad_mode.currentIndexChanged.connect(self._auto_save)
         mode_layout.addWidget(self._vad_mode)
-        layout.addWidget(mode_group)
+        layout.addWidget(self._vad_mode_group)
 
-        silero_group = QGroupBox(t("group_silero_threshold"))
-        silero_layout = QGridLayout(silero_group)
+        self._silero_group = QGroupBox(t("group_silero_threshold"))
+        silero_layout = QGridLayout(self._silero_group)
         self._vad_threshold_slider = QSlider(Qt.Orientation.Horizontal)
         # Floor at 5%, not 0: at threshold 0.0 `confidence >= threshold` is
         # always true, so every chunk counts as speech, silence never
@@ -726,10 +769,10 @@ class ControlPanel(QWidget):
         silero_layout.addWidget(QLabel(t("label_threshold")), 0, 0)
         silero_layout.addWidget(self._vad_threshold_slider, 0, 1)
         silero_layout.addWidget(self._vad_threshold_label, 0, 2)
-        layout.addWidget(silero_group)
+        layout.addWidget(self._silero_group)
 
-        energy_group = QGroupBox(t("group_energy_threshold"))
-        energy_layout = QGridLayout(energy_group)
+        self._energy_group = QGroupBox(t("group_energy_threshold"))
+        energy_layout = QGridLayout(self._energy_group)
         self._energy_slider = QSlider(Qt.Orientation.Horizontal)
         self._energy_slider.setRange(1, 100)
         energy_pm = int(s.get("energy_threshold", 0.03) * 1000)
@@ -741,10 +784,10 @@ class ControlPanel(QWidget):
         energy_layout.addWidget(QLabel(t("label_threshold")), 0, 0)
         energy_layout.addWidget(self._energy_slider, 0, 1)
         energy_layout.addWidget(self._energy_label, 0, 2)
-        layout.addWidget(energy_group)
+        layout.addWidget(self._energy_group)
 
-        timing_group = QGroupBox(t("group_timing"))
-        timing_layout = QGridLayout(timing_group)
+        self._timing_group = QGroupBox(t("group_timing"))
+        timing_layout = QGridLayout(self._timing_group)
         timing_layout.setColumnStretch(0, 1)
         timing_layout.setColumnMinimumWidth(1, 180)
         self._min_speech = QDoubleSpinBox()
@@ -805,10 +848,11 @@ class ControlPanel(QWidget):
         self._interim_interval_spin.valueChanged.connect(self._on_timing_changed)
         self._interim_interval_spin.valueChanged.connect(self._auto_save)
         self._incremental_asr_cb.toggled.connect(self._interim_interval_spin.setEnabled)
-        timing_layout.addWidget(QLabel(t("label_interim_interval")), 5, 0)
+        self._interim_interval_label = QLabel(t("label_interim_interval"))
+        timing_layout.addWidget(self._interim_interval_label, 5, 0)
         timing_layout.addWidget(self._interim_interval_spin, 5, 1)
 
-        layout.addWidget(timing_group)
+        layout.addWidget(self._timing_group)
 
         layout.addStretch()
         return widget
@@ -1519,8 +1563,44 @@ class ControlPanel(QWidget):
         self._whisper_group.setVisible(index == 0)
         is_funasr = index == 1
         is_gigaam = index == 3
+        # Soniox streams continuous audio to the cloud: every local-engine
+        # knob below would mislead the user into tuning parameters that have
+        # no effect on the cloud path, so they are hidden, not just disabled.
+        is_soniox = index == 5
+        if hasattr(self, "_soniox_group"):
+            self._soniox_group.setVisible(is_soniox)
+        if hasattr(self, "_vad_mode_group"):
+            self._vad_mode_group.setVisible(not is_soniox)
+        if hasattr(self, "_silero_group"):
+            self._silero_group.setVisible(not is_soniox)
+        if hasattr(self, "_energy_group"):
+            self._energy_group.setVisible(not is_soniox)
+        if hasattr(self, "_timing_group"):
+            self._timing_group.setVisible(not is_soniox)
+        if hasattr(self, "_incremental_asr_cb"):
+            self._incremental_asr_cb.setVisible(not is_soniox)
+        if hasattr(self, "_interim_interval_spin"):
+            interim_visible = not is_soniox
+            if hasattr(self, "_interim_interval_label"):
+                self._interim_interval_label.setVisible(interim_visible)
+            self._interim_interval_spin.setVisible(interim_visible)
+        if hasattr(self, "_asr_device"):
+            self._asr_device.setVisible(not is_soniox)
+            if hasattr(self, "_asr_device_label"):
+                self._asr_device_label.setVisible(not is_soniox)
+        if hasattr(self, "_hub_combo"):
+            self._hub_combo.setVisible(not is_soniox)
+            if hasattr(self, "_hub_label"):
+                self._hub_label.setVisible(not is_soniox)
+        if is_soniox and hasattr(self, "_asr_lang"):
+            self._asr_lang.setEnabled(False)
+            ru_idx = self._asr_lang.findData("ru")
+            if ru_idx >= 0:
+                self._asr_lang.blockSignals(True)
+                self._asr_lang.setCurrentIndex(ru_idx)
+                self._asr_lang.blockSignals(False)
         if hasattr(self, "_asr_lang"):
-            self._asr_lang.setEnabled(not is_gigaam)
+            self._asr_lang.setEnabled(not (is_gigaam or is_soniox))
             if is_gigaam:
                 ru_idx = self._asr_lang.findData("ru")
                 if ru_idx >= 0:
@@ -2202,7 +2282,9 @@ class ControlPanel(QWidget):
 
     def _apply_settings(self):
         self._current_settings["asr_language"] = (
-            "ru" if self._asr_engine.currentIndex() == 3 else self._get_asr_lang_code()
+            "ru"
+            if self._asr_engine.currentIndex() in (3, 5)
+            else self._get_asr_lang_code()
         )
         engine_map = {
             0: "whisper",
@@ -2210,10 +2292,22 @@ class ControlPanel(QWidget):
             2: "anime-whisper",
             3: "gigaam",
             4: "remote-whisper",
+            5: "soniox",
         }
         self._current_settings["asr_engine"] = engine_map.get(
             self._asr_engine.currentIndex(), "whisper"
         )
+        if hasattr(self, "_soniox_key_edit"):
+            self._current_settings["soniox_api_key"] = (
+                self._soniox_key_edit.text().strip()
+            )
+            self._current_settings["soniox_context"] = (
+                self._soniox_context_edit.toPlainText().strip()
+            )
+            seg_values = ("accuracy", "balanced", "low_latency")
+            self._current_settings["soniox_segmentation"] = seg_values[
+                self._soniox_seg_combo.currentIndex()
+            ]
         self._current_settings["funasr_model"] = self._selected_funasr_model()
         if hasattr(self, "_remote_url_edit"):
             url = self._remote_url_edit.text().strip()
@@ -2265,7 +2359,7 @@ class ControlPanel(QWidget):
         safe = {
             k: v
             for k, v in self._current_settings.items()
-            if k not in ("models", "system_prompt")
+            if k not in ("models", "system_prompt", "soniox_api_key")
         }
         log.info(f"Settings applied: {safe}")
         self.settings_changed.emit(dict(self._current_settings))
