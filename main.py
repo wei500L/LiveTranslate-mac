@@ -85,6 +85,8 @@ from soniox_client import (
 from translator import RepetitionError, translator_from_model_config
 from mlx_service import MLXServiceManager, is_hy_mt_model
 from transcript_writer import TranscriptWriter
+from terminology import EMPTY_GLOSSARY, parse_glossary
+from audio_recorder import AudioArtifacts, AudioRecorder
 
 from PyQt6.QtWidgets import (
     QApplication,
@@ -108,6 +110,7 @@ from PyQt6.QtCore import QObject, QThread, QTimer, Qt, pyqtSignal
 
 from subtitle_overlay import SubtitleOverlay
 from subtitle_window import SubtitleWindow
+from subtitle_state import SubtitleSegment, SubtitleStatus
 from log_window import LogWindow
 from control_panel import (
     ControlPanel,
@@ -868,6 +871,7 @@ class LiveTranslateApp:
             config["translation"].get("context_window", 0)
         )
         self._overlay = None
+        self._glossary = EMPTY_GLOSSARY
         self._subwin = None
         self._panel = None
         self._capture_thread = None
@@ -893,6 +897,9 @@ class LiveTranslateApp:
         self._translation_pending = 0
 
         self._transcript = TranscriptWriter(Path(__file__).parent / "transcripts")
+        self._audio_recorder = AudioRecorder(Path(__file__).parent / "transcripts")
+        self._audio_recording_enabled = True
+        self._audio_recording_quality = "high"
 
         # Memory diagnostic state
         import psutil
@@ -966,6 +973,7 @@ class LiveTranslateApp:
 
     def set_overlay(self, overlay: SubtitleOverlay):
         self._overlay = overlay
+        self._overlay.set_glossary(self._glossary)
         self._publish_transcript_paths()
 
     def _record_session_info(self):
@@ -1031,6 +1039,44 @@ class LiveTranslateApp:
     def session_generation(self) -> int:
         return self._session_generation
 
+    def _start_audio_recording(self, session_id: str | None) -> None:
+        if not session_id or not self._audio_recording_enabled:
+            return
+        try:
+            self._audio_recorder.start(
+                session_id, quality=self._audio_recording_quality
+            )
+            self._transcript.set_audio_artifacts(
+                wav=self._audio_recorder.wav_path,
+                status="recording",
+            )
+        except Exception:
+            log.warning("Could not start session audio recorder", exc_info=True)
+
+    def _push_recording_audio(self, chunk) -> None:
+        if self._audio_recording_enabled and self._audio_recorder.active:
+            self._audio_recorder.push(
+                chunk,
+                sample_rate=int(self._config["audio"].get("sample_rate", 16000)),
+                channels=1,
+            )
+
+    def _finish_audio_recording(self, timeout: float = 30.0) -> AudioArtifacts:
+        if not self._audio_recorder.active:
+            return AudioArtifacts()
+        artifacts = self._audio_recorder.finish(timeout=timeout)
+        try:
+            self._transcript.set_audio_artifacts(
+                wav=artifacts.wav,
+                mp3=artifacts.mp3,
+                status=artifacts.status,
+                duration_seconds=artifacts.duration_seconds,
+                error=artifacts.error,
+            )
+        except Exception:
+            log.warning("Could not attach audio artifacts to transcript", exc_info=True)
+        return artifacts
+
     def begin_recording_session(self) -> str | None:
         """Start a new meeting record (the "Start new recording" button).
 
@@ -1069,6 +1115,8 @@ class LiveTranslateApp:
                     "begin_recording_session: writer has no session (disabled?)"
                 )
                 return None
+            if hasattr(self, "_start_audio_recording"):
+                self._start_audio_recording(session_id)
             self._session_generation += 1
             self._session_work.begin(self._session_generation)
             # Cloud commits adopt the same write-time identity the queue
@@ -1089,6 +1137,8 @@ class LiveTranslateApp:
                     "begin_recording_session: pipeline not running; "
                     "closing the session"
                 )
+                if hasattr(self, "_finish_audio_recording"):
+                    self._finish_audio_recording(timeout=5.0)
                 self._transcript.end_session()
                 self._session_work.supersede(self._session_generation)
                 return None
@@ -1152,6 +1202,8 @@ class LiveTranslateApp:
                 # No bump (see the docstring). begin() adopts an auto-created
                 # entry in place — its pre-adoption queue-item counts survive,
                 # which is exactly what an ENDING wait must see.
+                if hasattr(self, "_start_audio_recording"):
+                    self._start_audio_recording(adopted)
                 self._session_work.begin(current)
                 # Idempotent when the caller already registered under this
                 # same generation (a set add).
@@ -1398,6 +1450,14 @@ class LiveTranslateApp:
             if generation != self._session_generation:
                 return None
 
+            # The capture gate is already up, so the recorder can drain its
+            # final queued frames without racing new audio. Attach its result
+            # before the transcript seal commits the final sidecar.
+            if hasattr(self, "_finish_audio_recording"):
+                self._finish_audio_recording(
+                    timeout=max(0.1, deadline - time.monotonic())
+                )
+
             # 5) Close: entries that never got their translation are flushed
             #    as untranslated, the footer and final sidecar are written,
             #    the files close. After this the session is immutable: late
@@ -1583,6 +1643,13 @@ class LiveTranslateApp:
 
     def set_panel(self, panel: ControlPanel):
         self._panel = panel
+        # Settings are loaded before this signal connection exists. Apply the
+        # saved glossary once here so highlighting works immediately at
+        # startup, not only after the user edits and saves the panel.
+        initial_settings = panel.get_settings()
+        self._glossary = parse_glossary(initial_settings.get("soniox_glossary", ""))
+        if self._overlay:
+            self._overlay.set_glossary(self._glossary)
         # One manager, not two. The panel starts the service and the app stops
         # it, so separate instances meant the stopping one had never spawned the
         # process: it could not reap its own child, held a stale version cache,
@@ -1682,6 +1749,10 @@ class LiveTranslateApp:
             self._overlay.set_models(models, active_idx)
 
     def _on_settings_changed(self, settings):
+        if "soniox_glossary" in settings:
+            self._glossary = parse_glossary(settings.get("soniox_glossary", ""))
+            if self._overlay:
+                self._overlay.set_glossary(self._glossary)
         with self._vad_lock:
             self._vad.update_settings(settings)
         if "style" in settings and self._overlay:
@@ -1718,6 +1789,7 @@ class LiveTranslateApp:
             key in settings
             for key in (
                 "soniox_context", "soniox_segmentation", "soniox_mixed_language",
+                "soniox_languages",
             )
         ):
             manager = self._soniox_manager()
@@ -1733,7 +1805,23 @@ class LiveTranslateApp:
                     changes["mixed_language"] = bool(
                         settings.get("soniox_mixed_language")
                     )
+                if "soniox_languages" in settings:
+                    raw_languages = settings.get("soniox_languages")
+                    if isinstance(raw_languages, (list, tuple)):
+                        languages = tuple(
+                            lang for lang in raw_languages if lang in ("ru", "en")
+                        )
+                        changes["language_hints"] = languages or ("ru",)
                 manager.apply_config(**changes)
+                if "language_hints" in changes and self._overlay:
+                    language_label = "+".join(changes["language_hints"])
+                    display_name = f"Soniox Cloud ({language_label}→zh)"
+                    with self._asr_lock:
+                        if self._asr_config is not None:
+                            self._asr_config["display_name"] = display_name
+                    self._overlay.update_asr_device(
+                        f"{display_name} [{self._asr_device}]"
+                    )
         if "audio_device" in settings:
             old_device = self._audio._device_name
             new_device = settings["audio_device"]
@@ -1793,6 +1881,12 @@ class LiveTranslateApp:
         if "auto_save_transcript" in settings:
             self._transcript.set_enabled(settings["auto_save_transcript"])
             self._publish_transcript_paths()
+        if "record_session_audio" in settings:
+            self._audio_recording_enabled = bool(settings["record_session_audio"])
+        if "recording_quality" in settings:
+            quality = settings.get("recording_quality")
+            if quality in {"high", "speech"}:
+                self._audio_recording_quality = quality
 
     def _mark_asr_unavailable(self, reason: str, client=None):
         with self._asr_lock:
@@ -1931,6 +2025,11 @@ class LiveTranslateApp:
                 context_text=config.get("soniox_context") or "",
                 segmentation=config.get("soniox_segmentation") or "accuracy",
                 mixed_language=bool(config.get("soniox_mixed_language")),
+                language_hints=(
+                    tuple(config.get("soniox_languages"))
+                    if isinstance(config.get("soniox_languages"), (list, tuple))
+                    else None
+                ),
                 sink=self._soniox_sink,
             )
         return self._load_asr_client(config)
@@ -2143,13 +2242,56 @@ class LiveTranslateApp:
             manager.feed(chunk)
 
     def _show_soniox_error(self, message: str) -> None:
-        """Surface a Soniox failure on the overlay (thread-safe facade)."""
+        """Surface an active Soniox failure as a transient notice.
+
+        Soniox callbacks can arrive after ``finish_and_drain`` or an engine
+        switch.  Those callbacks are useful in the log, but are no longer
+        user-facing failures: showing them as subtitle cards made a stopped
+        recording look broken and polluted exports.  Only the currently
+        selected manager in FAILED state may reach the overlay.
+        """
         if not self._overlay:
             return
-        self._msg_id += 1
-        self._overlay.settle_live_message(
-            self._msg_id, datetime.now().strftime("%H:%M:%S"), message, ""
-        )
+        stop_event = getattr(self, "_stop_event", None)
+        if (stop_event is not None and stop_event.is_set()) or self._asr_type != "soniox":
+            log.debug("Ignoring late Soniox error after teardown: %s", message)
+            return
+        # An ended meeting stays idle while the process remains alive.  Its
+        # cloud anchor is cleared before IDLE is announced; no network error
+        # from that old stream should appear in the next idle screen.
+        session_state = getattr(self, "_session_state", None)
+        soniox_anchor = getattr(self, "_soniox_anchor", None)
+        if (
+            session_state == SessionState.ENDING
+            or (
+                session_state == SessionState.IDLE
+                and soniox_anchor is None
+            )
+        ):
+            log.debug("Ignoring Soniox error outside an active recording: %s", message)
+            return
+        manager = getattr(getattr(self, "_asr", None), "manager", None)
+        if manager is not None:
+            try:
+                status = manager.status()
+            except Exception:
+                status = None
+            # A stale callback from an older Soniox manager commonly arrives
+            # while the replacement is connecting/live.  The active manager
+            # has already transitioned to FAILED before on_error is emitted.
+            if status is not None and status != SonioxStatus.FAILED:
+                log.debug(
+                    "Ignoring Soniox error while manager status is %s: %s",
+                    status, message,
+                )
+                return
+        show_notice = getattr(self._overlay, "show_notice", None)
+        if callable(show_notice):
+            show_notice(message, level="error", timeout=7000)
+        else:
+            # Compatibility with lightweight overlay facades used by plugins
+            # and older integrations: never fall back to a subtitle card.
+            log.warning("Overlay does not support transient notices: %s", message)
 
     def _take_soniox_timing(self) -> str:
         """Consume the current segment's timing stamps into a log suffix.
@@ -2213,7 +2355,9 @@ class LiveTranslateApp:
         self._soniox_committed.add(msg_id)
         timestamp = datetime.now().strftime("%H:%M:%S")
         self._asr_count += 1
-        log.info("Soniox segment [ru]%s: %s", timing, original_text)
+        source_language = getattr(segment, "language", None) or "ru"
+        source_language = str(source_language).lower()
+        log.info("Soniox segment [%s]%s: %s", source_language, timing, original_text)
 
         with self._session_boundary_lock:
             anchor = self._soniox_anchor
@@ -2223,9 +2367,15 @@ class LiveTranslateApp:
                 # the legacy auto-open wildcard, and cloud commits must not
                 # open ghost sessions.
                 if self._overlay:
-                    self._overlay.settle_live_message(
-                        msg_id, timestamp, original_text, segment.translation
-                    )
+                    if source_language == "ru":
+                        self._overlay.settle_live_message(
+                            msg_id, timestamp, original_text, segment.translation
+                        )
+                    else:
+                        self._overlay.settle_live_message(
+                            msg_id, timestamp, original_text, segment.translation,
+                            source_language=source_language,
+                        )
                 return
             msg_generation, expected_session = anchor
             if msg_generation != self._session_generation:
@@ -2237,13 +2387,19 @@ class LiveTranslateApp:
                     msg_generation, self._session_generation,
                 )
                 if self._overlay:
-                    self._overlay.settle_live_message(
-                        msg_id, timestamp, original_text, segment.translation
-                    )
+                    if source_language == "ru":
+                        self._overlay.settle_live_message(
+                            msg_id, timestamp, original_text, segment.translation
+                        )
+                    else:
+                        self._overlay.settle_live_message(
+                            msg_id, timestamp, original_text, segment.translation,
+                            source_language=source_language,
+                        )
                 return
             result = self._transcript.write_original(
                 msg_id, timestamp, original_text,
-                language="ru", session=expected_session,
+                language=source_language, session=expected_session,
             )
             if result == TranscriptWriter.WRITE_SESSION_MISMATCH:
                 self._finalize_untranslated(
@@ -2277,9 +2433,15 @@ class LiveTranslateApp:
                 # the old card leaked in the layout and the new one hung on
                 # "translating" forever).
                 if self._overlay:
-                    self._overlay.settle_live_message(
-                        msg_id, timestamp, original_text, segment.translation
-                    )
+                    if source_language == "ru":
+                        self._overlay.settle_live_message(
+                            msg_id, timestamp, original_text, segment.translation
+                        )
+                    else:
+                        self._overlay.settle_live_message(
+                            msg_id, timestamp, original_text, segment.translation,
+                            source_language=source_language,
+                        )
             elif self._overlay:
                 # WRITE_SKIPPED / WRITE_FAILED: subtitle-only display.
                 self._overlay.settle_live_message(
@@ -2293,8 +2455,13 @@ class LiveTranslateApp:
             )
         # The standalone subtitle window gets the final pair like every
         # other completed entry.
-        if self._subwin and self._subwin.isVisible() and segment.translation:
-            self._subwin.update_text(original_text, {"zh": segment.translation})
+        if self._subwin and self._subwin.isVisible():
+            LiveTranslateApp._push_subtitle_segment(self, SubtitleSegment(
+                segment_id=msg_id, original=original_text,
+                translation=segment.translation, source_lang="ru",
+                target_lang="zh", status=SubtitleStatus.FINAL,
+                translations={"zh": segment.translation},
+            ), skip_when_shared=True)
 
     def _finalize_untranslated(self, msg_id, reason: str, user_visible: bool):
         """Close out a message that will never receive a translation.
@@ -2305,10 +2472,11 @@ class LiveTranslateApp:
         """
         log.warning("Message %s left untranslated: %s", msg_id, reason)
         self._transcript.finalize_no_translation(msg_id)
-        if self._overlay and user_visible:
-            self._overlay.update_translation(
-                msg_id, f"[{t('error_translation_unavailable')}]", 0
+        if self._overlay:
+            translated = (
+                f"[{t('error_translation_unavailable')}]" if user_visible else ""
             )
+            self._overlay.update_translation(msg_id, translated, 0)
 
     def _submit_translation(self, msg_id, text, source_lang, extra_langs=None,
                             session_generation=None, expected_session=None):
@@ -2422,6 +2590,15 @@ class LiveTranslateApp:
             display_name = funasr_display_name(funasr_model)
         elif engine_type == "gigaam":
             display_name = gigaam_display_name(gigaam_model)
+        elif engine_type == "soniox":
+            configured_languages = settings.get("soniox_languages")
+            if isinstance(configured_languages, (list, tuple)):
+                language_label = "+".join(
+                    lang for lang in configured_languages if lang in ("ru", "en")
+                ) or "ru"
+            else:
+                language_label = "ru+en" if settings.get("soniox_mixed_language") else "ru"
+            display_name = f"Soniox Cloud ({language_label}→zh)"
 
         parent = (
             self._panel if self._panel and self._panel.isVisible() else self._overlay
@@ -2474,6 +2651,12 @@ class LiveTranslateApp:
             "soniox_mixed_language": (
                 bool(settings.get("soniox_mixed_language"))
                 if engine_type == "soniox"
+                else None
+            ),
+            "soniox_languages": (
+                list(settings["soniox_languages"])
+                if engine_type == "soniox"
+                and isinstance(settings.get("soniox_languages"), (list, tuple))
                 else None
             ),
         }
@@ -3027,6 +3210,9 @@ class LiveTranslateApp:
         return 0.0
 
     def _record_latency(self, kind: str, elapsed_ms: float):
+        update_latency = getattr(self._overlay, "update_latency", None)
+        if callable(update_latency):
+            update_latency(kind, elapsed_ms)
         with self._translation_stats_lock:
             values = self._asr_latencies if kind == "asr" else self._translation_latencies
             values.append(float(elapsed_ms))
@@ -3159,7 +3345,11 @@ class LiveTranslateApp:
                 tl_dict = {self._target_language: translated}
                 if extra_langs:
                     self._translate_extra_langs(text, source_lang, extra_langs, tl_dict)
-                self._subwin.update_text(text, tl_dict)
+                LiveTranslateApp._push_subtitle_segment(self, SubtitleSegment(
+                    segment_id=msg_id, original=text, translation=translated,
+                    source_lang=source_lang, target_lang=self._target_language,
+                    status=SubtitleStatus.FINAL, translations=tl_dict,
+                ))
         except RepetitionError:
             self._commit_translation_result(msg_id, text, None, generation)
             log.warning("Repetition loop detected, model may not support structured output well")
@@ -3241,12 +3431,84 @@ class LiveTranslateApp:
                 else:
                     log.error(f"Extra translate error: {e}", exc_info=True)
 
-    def _translate_subwin_only(self, text, source_lang, extra_langs):
+    def _translate_subwin_only(self, msg_id, text, source_lang, extra_langs):
         """Translate only for subtitle window when primary target == source language."""
         tl_dict = {self._target_language: text}  # same language, use original
         self._translate_extra_langs(text, source_lang, extra_langs, tl_dict)
         if self._subwin and self._subwin.isVisible():
-            self._subwin.update_text(text, tl_dict)
+            LiveTranslateApp._push_subtitle_segment(self, SubtitleSegment(
+                segment_id=msg_id, original=text, translation=text,
+                source_lang=source_lang, target_lang=self._target_language,
+                status=SubtitleStatus.FINAL, translations=tl_dict,
+            ))
+
+    def _push_subtitle_segment(
+        self, segment: SubtitleSegment, *, skip_when_shared: bool = False
+    ) -> None:
+        """Send rich state to modern subtitle windows with a legacy fallback."""
+        subwin = self._subwin
+        if subwin is None or not subwin.isVisible():
+            return
+        if skip_when_shared and getattr(subwin, "_uses_overlay_segment_stream", False):
+            return
+        update_segment = getattr(subwin, "update_segment", None)
+        if callable(update_segment):
+            update_segment(segment)
+            return
+        translations = segment.translations or {
+            segment.target_lang or "": segment.translation
+        }
+        subwin.update_text(segment.original, translations)
+
+    def retry_translation(self, msg_id: int, text: str, source_lang: str) -> None:
+        """Retry a failed display translation without duplicating its transcript row."""
+        # Soniox translations are produced on the consumed realtime stream;
+        # there is no per-subtitle request that can be replayed in place.
+        # Keep this guard even though the overlay normally never emits the
+        # signal for a Soniox card, so older/plugin overlays cannot trigger a
+        # misleading second translation path either.
+        provider = ""
+        if self._overlay:
+            get_provider = getattr(self._overlay, "message_provider", None)
+            if callable(get_provider):
+                provider = get_provider(msg_id)
+        if provider == "soniox":
+            log.debug("Ignoring per-card retry for Soniox message %s", msg_id)
+            return
+        executor = self._tl_executor
+        if executor is None or not text:
+            if self._overlay:
+                self._overlay.update_translation(
+                    msg_id, f"[{t('error_translation_unavailable')}]", 0
+                )
+            return
+        try:
+            executor.submit(self._retry_translation_async, msg_id, text, source_lang)
+        except RuntimeError:
+            if self._overlay:
+                self._overlay.update_translation(
+                    msg_id, f"[{t('error_translation_unavailable')}]", 0
+                )
+
+    def _retry_translation_async(self, msg_id: int, text: str, source_lang: str) -> None:
+        try:
+            with self._translation_lock:
+                base = self._translator
+                if base is None:
+                    raise TranslationUnavailable("No translation service is running")
+                request = base.fork_for_request(
+                    target_language=self._target_language,
+                    history_snapshot=list(self._translation_history),
+                )
+            translated = request.translate(text, source_lang)
+            if not translated:
+                raise TranslationUnavailable("Translation returned no text")
+            if self._overlay:
+                self._overlay.update_translation(msg_id, translated, 0)
+        except Exception as exc:
+            log.warning("Retry translation failed for msg %s: %s", msg_id, exc)
+            if self._overlay:
+                self._overlay.update_translation(msg_id, "[translation failed]", 0)
 
     def start(self):
         if self._running:
@@ -3365,6 +3627,8 @@ class LiveTranslateApp:
             )
             self._extra_tl_executor = None
 
+        if hasattr(self, "_finish_audio_recording"):
+            self._stop_step("session audio recording", self._finish_audio_recording)
         self._stop_step("transcript", self._transcript.close)
         if self._mem_periodic_timer is not None:
             self._stop_step("memory timer", self._mem_periodic_timer.stop)
@@ -3721,12 +3985,17 @@ class LiveTranslateApp:
                 if extra_langs:
                     try:
                         self._extra_tl_executor.submit(
-                            self._translate_subwin_only, original_text, source_lang, extra_langs
+                            self._translate_subwin_only, msg_id, original_text, source_lang, extra_langs
                         )
                     except RuntimeError:
                         pass
                 else:
-                    self._subwin.update_text(original_text, {target_lang: original_text})
+                    LiveTranslateApp._push_subtitle_segment(self, SubtitleSegment(
+                        segment_id=msg_id, original=original_text,
+                        translation=original_text, source_lang=source_lang,
+                        target_lang=target_lang, status=SubtitleStatus.FINAL,
+                        translations={target_lang: original_text},
+                    ))
         else:
             try:
                 self._submit_translation(
@@ -4200,11 +4469,16 @@ class LiveTranslateApp:
             if self._subwin and self._subwin.isVisible():
                 if extra_langs:
                     try:
-                        self._extra_tl_executor.submit(self._translate_subwin_only, original_text, source_lang, extra_langs)
+                        self._extra_tl_executor.submit(self._translate_subwin_only, msg_id, original_text, source_lang, extra_langs)
                     except RuntimeError:
                         pass
                 else:
-                    self._subwin.update_text(original_text, {target_lang: original_text})
+                    LiveTranslateApp._push_subtitle_segment(self, SubtitleSegment(
+                        segment_id=msg_id, original=original_text,
+                        translation=original_text, source_lang=source_lang,
+                        target_lang=target_lang, status=SubtitleStatus.FINAL,
+                        translations={target_lang: original_text},
+                    ))
         else:
             try:
                 self._submit_translation(
@@ -4331,8 +4605,16 @@ class LiveTranslateApp:
 
             chunk, mic_rms = item
 
-            if self._paused:
-                continue
+            # Recording follows the meeting session, not the subtitle pause
+            # toggle. Keep this inside the same boundary fence as the gate so
+            # ENDING cannot append post-session audio, while a paused ASR
+            # pipeline still preserves the classroom sound.
+            with self._session_boundary_lock:
+                if not self._session_end_gating:
+                    if hasattr(self, "_push_recording_audio"):
+                        self._push_recording_audio(chunk)
+                if self._paused:
+                    continue
 
             # np.dot avoids allocating a temporary squared array for every
             # 32 ms audio block on the real-time capture thread.
@@ -4787,6 +5069,13 @@ def main():
     live_trans._summary_task_registry = summary_registry
     live_trans.set_overlay(overlay)
     live_trans.set_subtitle_window(subwin)
+    # One segment stream feeds both render surfaces.  Legacy direct subtitle
+    # updates remain available for plugins, but the built-in pipeline uses ids
+    # so interim revisions replace in place.
+    overlay.segment_changed.connect(subwin.update_segment)
+    overlay.subtitles_cleared.connect(subwin.clear)
+    overlay.retry_translation_requested.connect(live_trans.retry_translation)
+    subwin._uses_overlay_segment_stream = True
     live_trans.set_panel(panel)
     # The records page marks the session currently being recorded; it reads
     # that from the writer the app owns (the panel is built before the app).

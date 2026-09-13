@@ -31,6 +31,8 @@ from PyQt6.QtWidgets import QApplication, QWidget, QVBoxLayout
 from platform_clickthrough import set_always_on_top, set_click_through
 from platform_fonts import default_cjk_font_family
 from platform_app import is_macos, position_is_visible
+from subtitle_state import SubtitleSegment, SubtitleStateStore, SubtitleStatus
+from i18n import t
 
 
 def _resolve_image_path(path: str) -> str:
@@ -45,8 +47,9 @@ def _resolve_image_path(path: str) -> str:
 
 # Default subtitle window settings
 DEFAULT_SUBTITLE_WIN_SETTINGS = {
+    "reading_layout_version": 2,
     "enabled": False,
-    "sentences": 1,
+    "sentences": 2,
     "window_width": 1000,
     "line_spacing": 8,
     "bg_color": "#000000",
@@ -95,6 +98,16 @@ DEFAULT_SUBTITLE_WIN_SETTINGS = {
 }
 
 
+def migrate_subtitle_settings(settings: dict | None) -> dict:
+    """Upgrade the old one-line default while preserving new explicit choices."""
+    migrated = dict(settings or {})
+    if int(migrated.get("reading_layout_version", 1)) < 2:
+        if migrated.get("sentences", 1) == 1:
+            migrated["sentences"] = 2
+        migrated["reading_layout_version"] = 2
+    return migrated
+
+
 def _merge_settings(base, override):
     """Merge settings into a structure this window owns outright.
 
@@ -103,7 +116,7 @@ def _merge_settings(base, override):
     editing a line in the panel silently rewrites the live subtitle config.
     """
     result = {**base}
-    for k, v in (override or {}).items():
+    for k, v in migrate_subtitle_settings(override).items():
         if k == "lines" and isinstance(v, list):
             result["lines"] = [
                 dict(line) if isinstance(line, dict) else line for line in v
@@ -511,6 +524,7 @@ class SubtitleWindow(QWidget):
     """
 
     update_text_signal = pyqtSignal(str, str)  # original, translations_json
+    update_segment_signal = pyqtSignal(str)
     position_changed = pyqtSignal()
     window_closed = pyqtSignal()
 
@@ -519,6 +533,7 @@ class SubtitleWindow(QWidget):
         self._settings = _merge_settings(DEFAULT_SUBTITLE_WIN_SETTINGS, settings)
         self._text_widgets = []
         self._sentences = []  # [(original, {lang: text, ...}), ...]
+        self._segment_store = SubtitleStateStore(max_segments=50)
         self._drag_pos = None
         self._bg_pixmap = None
         self._click_through = bool(self._settings.get("click_through", False))
@@ -544,6 +559,7 @@ class SubtitleWindow(QWidget):
 
         self._setup_ui()
         self.update_text_signal.connect(self._on_update_text)
+        self.update_segment_signal.connect(self._on_update_segment)
 
     @staticmethod
     def _is_pos_visible(x, y, margin=50):
@@ -829,6 +845,35 @@ class SubtitleWindow(QWidget):
             translations = {"": translations}
         self.update_text_signal.emit(original, json.dumps(translations, ensure_ascii=False))
 
+    def update_segment(self, segment: SubtitleSegment | str):
+        """Thread-safe shared-state update from the main reading overlay."""
+        payload = segment if isinstance(segment, str) else segment.to_json()
+        self.update_segment_signal.emit(payload)
+
+    @pyqtSlot(str)
+    def _on_update_segment(self, payload: str):
+        segment = SubtitleSegment.from_json(payload)
+        self._segment_store.upsert(segment)
+        visible = self._segment_store.values()[-max(1, self._settings.get("sentences", 2)):]
+        self._sentences = []
+        for item in visible:
+            translation = item.translation
+            if item.status == SubtitleStatus.ERROR:
+                translation = t("translation_failed")
+            elif not translation and item.status in (
+                SubtitleStatus.PROVISIONAL, SubtitleStatus.TRANSLATING
+            ):
+                translation = t("translating")
+            translations = dict(item.translations)
+            if translation and not translations:
+                translations[item.target_lang or ""] = translation
+            self._sentences.append((item.original, translations))
+
+        if self._is_hidden_by_timeout:
+            self._restore_from_auto_hide()
+        self._refresh_display()
+        self._restart_auto_hide_timer()
+
     @pyqtSlot(str, str)
     def _on_update_text(self, original: str, translations_json: str):
         """Queue one final subtitle, honouring the minimum display time.
@@ -952,6 +997,7 @@ class SubtitleWindow(QWidget):
 
     def clear(self):
         self._sentences.clear()
+        self._segment_store.clear()
         self._cancel_pending_segments()
         self._auto_hide_timer.stop()
         self._is_hidden_by_timeout = False

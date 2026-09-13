@@ -88,6 +88,10 @@ class SessionItem(QListWidgetItem):
             )
         if record.get("translation_model"):
             parts.append(str(record["translation_model"]))
+        if record.get("files", {}).get("audio_mp3"):
+            parts.append(t("records_audio_ready"))
+        elif record.get("files", {}).get("audio_wav"):
+            parts.append(t("records_audio_wav_only"))
         state = _state_badge(record, session_state)
         if state:
             parts.append(state)

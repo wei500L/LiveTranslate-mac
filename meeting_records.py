@@ -133,6 +133,10 @@ def list_sessions(base_dir: Path, active_session: str | None = None,
             )
             if path.is_file():
                 record["files"].setdefault(kind, str(path))
+        for kind, suffix in (("audio_wav", "_audio.wav"), ("audio_mp3", "_audio.mp3")):
+            audio = base_dir / f"livetrans_{stamp}{suffix}"
+            if audio.is_file():
+                record["files"].setdefault(kind, str(audio))
         record["title"] = _session_title(record, base_dir)
         record["is_active"] = bool(
             active_session and stamp == active_session

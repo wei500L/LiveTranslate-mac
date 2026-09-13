@@ -42,6 +42,16 @@ foreach ($d in $DropList) {
 }
 Write-Ok "Source exported"
 
+# Optional legal FFmpeg bundle.  The runtime first looks in this directory,
+# then falls back to a system ffmpeg on PATH.  Keeping the binary out of the
+# source archive lets release builds supply the platform-appropriate binary
+# without committing third-party executables to the repository.
+$FfmpegSource = Join-Path $ProjectDir "ffmpeg"
+if (Test-Path $FfmpegSource) {
+    Copy-Item -Recurse -Force $FfmpegSource (Join-Path $Stage "ffmpeg")
+    Write-Ok "Bundled FFmpeg"
+}
+
 # ── 3. Download and bundle uv ──
 Write-Step "Downloading uv..."
 $UvZip = Join-Path $OutDir "uv.zip"

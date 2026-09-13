@@ -317,6 +317,25 @@ class TranscriptWriter:
             if self._session_open:
                 self._write_meta_locked()
 
+    def set_audio_artifacts(self, *, wav=None, mp3=None, status="none",
+                            duration_seconds=0.0, error=None):
+        """Attach recorder paths/status to this session's metadata."""
+        with self._lock:
+            if not self._session_ts:
+                return False
+            if wav:
+                self._paths["audio_wav"] = str(wav)
+            if mp3:
+                self._paths["audio_mp3"] = str(mp3)
+            self._info.update({
+                "audio_status": status,
+                "audio_duration_seconds": round(float(duration_seconds or 0), 2),
+                "audio_error": error,
+            })
+            if self._session_open:
+                self._write_meta_locked()
+            return True
+
     def rename_session(self, title: str, expected_session: str | None = None) -> bool:
         """Rename the open session, inside the writer's lock.
 
@@ -371,6 +390,8 @@ class TranscriptWriter:
         ("translation", ".txt"),
         (MARKDOWN_KIND, ".md"),
         (META_KIND, ".json"),
+        ("audio", ".wav"),
+        ("audio", ".mp3"),
     )
 
     def _stamp_files_exist(self, stamp: str) -> bool:
@@ -1258,6 +1279,10 @@ def read_session_meta(base_dir: Path) -> list[dict]:
         markdown = base_dir / f"livetrans_{stamp}_{TranscriptWriter.MARKDOWN_KIND}.md"
         if markdown.is_file():
             record["files"][TranscriptWriter.MARKDOWN_KIND] = str(markdown)
+        for kind, suffix in (("audio_wav", "_audio.wav"), ("audio_mp3", "_audio.mp3")):
+            audio = base_dir / f"livetrans_{stamp}{suffix}"
+            if audio.is_file():
+                record["files"][kind] = str(audio)
 
     return sorted(
         sessions.values(),

@@ -34,6 +34,7 @@ class RecordingOverlay:
         self.messages = []      # (msg_id, timestamp, original, provider)
         self.live = []          # (msg_id, original, translation, final)
         self.settles = []       # (msg_id, timestamp, original, translation)
+        self.notices = []       # (message, level, timeout)
         self.stats = []
         self.connections = []
         self._lock = threading.Lock()
@@ -60,6 +61,10 @@ class RecordingOverlay:
         with self._lock:
             self.settles.append((msg_id, timestamp, original, translation))
 
+    def show_notice(self, message, level="error", timeout=6000):
+        with self._lock:
+            self.notices.append((message, level, timeout))
+
 
 class FakeSubwin:
     def __init__(self):
@@ -74,11 +79,15 @@ class FakeSubwin:
 
 
 class FakeManager:
-    def __init__(self):
+    def __init__(self, state=main.SonioxStatus.LIVE):
         self.fed = []
+        self.state = state
 
     def feed(self, chunk):
         self.fed.append(chunk)
+
+    def status(self):
+        return self.state
 
 
 class FakeSonioxClient:
@@ -118,6 +127,7 @@ class StandIn:
         self._asr_type = "soniox" if engine is not None else None
         self._session_work = main._SessionWorkTracker()
         self._session_state_callbacks = []
+        self._stop_event = threading.Event()
 
         # Bind the real methods.
         self._commit_soniox_segment = main.LiveTranslateApp._commit_soniox_segment.__get__(self)
@@ -139,6 +149,23 @@ class StandIn:
 @pytest.fixture()
 def app(tmp_path):
     return StandIn(tmp_path, engine=FakeSonioxClient())
+
+
+def test_late_connect_failure_after_recording_end_is_ignored(app):
+    """A terminal callback must not become a subtitle card after ENDING."""
+    app._show_soniox_error = main.LiveTranslateApp._show_soniox_error.__get__(app)
+    app._asr.manager.state = main.SonioxStatus.FAILED
+    app._soniox_anchor = (app._session_generation, "session")
+    app._session_state = main.SessionState.ENDING
+
+    app._show_soniox_error("Soniox connection failed")
+    assert app._overlay.notices == []
+    assert app._overlay.settles == []
+
+    app._session_state = main.SessionState.ACTIVE
+    app._show_soniox_error("Soniox connection failed")
+    assert len(app._overlay.notices) == 1
+    assert app._overlay.settles == []
 
 
 def test_commit_writes_original_and_translation_exactly_once(app, tmp_path):

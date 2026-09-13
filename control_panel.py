@@ -733,15 +733,30 @@ class ControlPanel(QWidget):
         self._soniox_seg_combo.setCurrentIndex(seg_idx)
         self._soniox_seg_combo.currentIndexChanged.connect(self._auto_save)
         soniox_layout.addWidget(self._soniox_seg_combo, 2, 1)
-        # Code-switching: measured on mixed ru+en lecture audio, the strict
-        # ru-only hint transliterates English terms into Cyrillic; with this
-        # checkbox the hints become ["ru","en"] and English terms survive in
-        # Latin script (and in the Chinese translation) verbatim.
-        self._soniox_mixed_cb = QCheckBox(t("label_soniox_mixed"))
-        self._soniox_mixed_cb.setToolTip(t("soniox_mixed_tooltip"))
-        self._soniox_mixed_cb.setChecked(bool(s.get("soniox_mixed_language", False)))
-        self._soniox_mixed_cb.toggled.connect(self._auto_save)
-        soniox_layout.addWidget(self._soniox_mixed_cb, 3, 0, 1, 2)
+        # Keep language hints independent: a Russian-only lecture should not
+        # pay the ambiguity cost of an English hint, while mixed classes can
+        # enable both. The legacy mixed-language setting is migrated in place
+        # so existing profiles keep their previous behaviour.
+        stored_languages = s.get("soniox_languages")
+        if not isinstance(stored_languages, (list, tuple)):
+            stored_languages = (
+                ["ru", "en"] if s.get("soniox_mixed_language") else ["ru"]
+            )
+        stored_languages = {str(lang).lower() for lang in stored_languages}
+        if not stored_languages & {"ru", "en"}:
+            stored_languages = {"ru"}
+
+        self._soniox_ru_cb = QCheckBox(t("label_soniox_russian"))
+        self._soniox_ru_cb.setToolTip(t("soniox_russian_tooltip"))
+        self._soniox_ru_cb.setChecked("ru" in stored_languages)
+        self._soniox_ru_cb.toggled.connect(self._on_soniox_language_toggled)
+        soniox_layout.addWidget(self._soniox_ru_cb, 3, 0)
+
+        self._soniox_en_cb = QCheckBox(t("label_soniox_english"))
+        self._soniox_en_cb.setToolTip(t("soniox_english_tooltip"))
+        self._soniox_en_cb.setChecked("en" in stored_languages)
+        self._soniox_en_cb.toggled.connect(self._on_soniox_language_toggled)
+        soniox_layout.addWidget(self._soniox_en_cb, 3, 1)
         soniox_layout.addWidget(QLabel(t("label_soniox_context")), 4, 0)
         self._soniox_context_edit = QPlainTextEdit(
             (s.get("soniox_context") or "").strip()
@@ -750,10 +765,18 @@ class ControlPanel(QWidget):
         self._soniox_context_edit.setMaximumHeight(96)
         self._soniox_context_edit.textChanged.connect(self._auto_save)
         soniox_layout.addWidget(self._soniox_context_edit, 4, 1)
+        soniox_layout.addWidget(QLabel(t("label_soniox_glossary")), 5, 0)
+        self._soniox_glossary_edit = QPlainTextEdit(
+            (s.get("soniox_glossary") or "").strip()
+        )
+        self._soniox_glossary_edit.setPlaceholderText(t("soniox_glossary_placeholder"))
+        self._soniox_glossary_edit.setMaximumHeight(110)
+        self._soniox_glossary_edit.textChanged.connect(self._auto_save)
+        soniox_layout.addWidget(self._soniox_glossary_edit, 5, 1)
         cloud_note = QLabel(t("soniox_note_cloud"))
         cloud_note.setWordWrap(True)
         cloud_note.setStyleSheet("color: #888; font-size: 11px;")
-        soniox_layout.addWidget(cloud_note, 5, 0, 1, 2)
+        soniox_layout.addWidget(cloud_note, 6, 0, 1, 2)
         layout.addWidget(self._soniox_group)
         self._soniox_group.setVisible(engine_idx == 5)
 
@@ -1411,6 +1434,25 @@ class ControlPanel(QWidget):
         ts_open_btn.clicked.connect(self._open_transcripts_folder)
         ts_layout.addWidget(ts_open_btn)
         layout.addWidget(ts_group)
+
+        audio_group = QGroupBox(t("group_recording_audio"))
+        audio_layout = QHBoxLayout(audio_group)
+        self._record_audio_cb = QCheckBox(t("label_record_session_audio"))
+        self._record_audio_cb.setChecked(s.get("record_session_audio", True))
+        self._record_audio_cb.toggled.connect(self._auto_save)
+        audio_layout.addWidget(self._record_audio_cb)
+        audio_layout.addWidget(QLabel(t("label_recording_quality")))
+        self._recording_quality_combo = QComboBox()
+        self._recording_quality_combo.addItem(t("recording_quality_high"), "high")
+        self._recording_quality_combo.addItem(t("recording_quality_speech"), "speech")
+        idx = self._recording_quality_combo.findData(
+            s.get("recording_quality", "high")
+        )
+        self._recording_quality_combo.setCurrentIndex(max(0, idx))
+        self._recording_quality_combo.currentIndexChanged.connect(self._auto_save)
+        audio_layout.addWidget(self._recording_quality_combo)
+        audio_layout.addStretch()
+        layout.addWidget(audio_group)
 
         top_row = QHBoxLayout()
         self._cache_total = QLabel("")
@@ -2261,6 +2303,21 @@ class ControlPanel(QWidget):
         self._current_settings["incremental_asr"] = self._incremental_asr_cb.isChecked()
         self._current_settings["interim_interval"] = round(self._interim_interval_spin.value(), 2)
 
+    def _on_soniox_language_toggled(self, checked: bool):
+        """Keep at least one Soniox hint enabled and persist the pair."""
+        if (
+            not checked
+            and not self._soniox_ru_cb.isChecked()
+            and not self._soniox_en_cb.isChecked()
+        ):
+            sender = self.sender()
+            if sender is not None:
+                sender.blockSignals(True)
+                sender.setChecked(True)
+                sender.blockSignals(False)
+            return
+        self._auto_save()
+
     def _on_ui_lang_changed(self, index):
         lang = "en" if index == 0 else "zh"
         self._current_settings["ui_lang"] = lang
@@ -2335,12 +2392,25 @@ class ControlPanel(QWidget):
             self._current_settings["soniox_context"] = (
                 self._soniox_context_edit.toPlainText().strip()
             )
+            self._current_settings["soniox_glossary"] = (
+                self._soniox_glossary_edit.toPlainText().strip()
+            )
             seg_values = ("accuracy", "balanced", "low_latency")
             self._current_settings["soniox_segmentation"] = seg_values[
                 self._soniox_seg_combo.currentIndex()
             ]
+            languages = [
+                lang for lang, checkbox in (
+                    ("ru", self._soniox_ru_cb),
+                    ("en", self._soniox_en_cb),
+                ) if checkbox.isChecked()
+            ]
+            if not languages:
+                languages = ["ru"]
+            self._current_settings["soniox_languages"] = languages
+            # Retain the legacy key for older app versions and old plugins.
             self._current_settings["soniox_mixed_language"] = (
-                self._soniox_mixed_cb.isChecked()
+                set(languages) == {"ru", "en"}
             )
         self._current_settings["funasr_model"] = self._selected_funasr_model()
         if hasattr(self, "_remote_url_edit"):
@@ -2387,6 +2457,13 @@ class ControlPanel(QWidget):
         if hasattr(self, "_auto_save_transcript_cb"):
             self._current_settings["auto_save_transcript"] = (
                 self._auto_save_transcript_cb.isChecked()
+            )
+        if hasattr(self, "_record_audio_cb"):
+            self._current_settings["record_session_audio"] = (
+                self._record_audio_cb.isChecked()
+            )
+            self._current_settings["recording_quality"] = (
+                self._recording_quality_combo.currentData() or "high"
             )
         if hasattr(self, "_style_preset"):
             self._current_settings["style"] = self._collect_style()

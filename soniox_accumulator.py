@@ -48,6 +48,8 @@ class SonioxToken:
     text: str
     is_final: bool = False
     translation_status: str | None = None
+    language: str | None = None
+    source_language: str | None = None
 
 
 @dataclass(frozen=True)
@@ -56,6 +58,7 @@ class SonioxSegment:
 
     original: str
     translation: str  # "" when the segment ended without a translation
+    language: str = "ru"  # SDK language code when available
 
 
 @dataclass(frozen=True)
@@ -86,6 +89,7 @@ class SonioxAccumulator:
         self._prov_original = ""
         self._prov_translation = ""
         self._tail_committed = False
+        self._segment_language = "ru"
 
     @property
     def live(self) -> SonioxLiveState:
@@ -124,6 +128,12 @@ class SonioxAccumulator:
                     self._final_translation += text
                 elif status in _ORIGINAL_STATUSES:
                     self._final_original += text
+                    token_language = (
+                        getattr(token, "language", None)
+                        or getattr(token, "source_language", None)
+                    )
+                    if token_language:
+                        self._segment_language = str(token_language)
                 # Unknown status values are dropped rather than guessed into
                 # either string.
             else:
@@ -156,10 +166,12 @@ class SonioxAccumulator:
         self._prov_original = ""
         self._prov_translation = ""
         self._tail_committed = False
+        self._segment_language = "ru"
 
     def _commit_current(self) -> SonioxSegment | None:
         original = self._final_original.strip()
         translation = self._final_translation.strip()
+        language = self._segment_language
         self._final_original = ""
         self._final_translation = ""
         self._prov_original = ""
@@ -167,8 +179,13 @@ class SonioxAccumulator:
         # A new segment begins on the next token: the finished-tail guard
         # must re-arm so a (defensive) second finished event can commit again.
         self._tail_committed = False
+        self._segment_language = "ru"
         if not _has_alnum(original):
             # Punctuation-only / empty segment: nothing user-facing, but the
             # state is cleared so it cannot leak into the next segment.
             return None
-        return SonioxSegment(original=original, translation=translation)
+        return SonioxSegment(
+            original=original,
+            translation=translation,
+            language=language,
+        )

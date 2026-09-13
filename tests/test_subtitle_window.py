@@ -222,6 +222,22 @@ def test_merge_settings_does_not_alias_the_defaults():
         assert a["lines"][0] is not b["lines"][0]
 
 
+def test_old_one_sentence_default_migrates_to_current_plus_previous():
+    merged = subtitle_window._merge_settings(
+        subtitle_window.DEFAULT_SUBTITLE_WIN_SETTINGS, {"sentences": 1}
+    )
+    assert merged["sentences"] == 2
+    assert merged["reading_layout_version"] == 2
+
+
+def test_new_explicit_one_sentence_choice_is_preserved():
+    merged = subtitle_window._merge_settings(
+        subtitle_window.DEFAULT_SUBTITLE_WIN_SETTINGS,
+        {"reading_layout_version": 2, "sentences": 1},
+    )
+    assert merged["sentences"] == 1
+
+
 class _Control:
     def __init__(self, value):
         self._value = value
@@ -258,6 +274,7 @@ class SettingsWidget:
         )()
         self._settings = {"lines": [{"type": "original", "enabled": True}]}
         self._spacing_spin = _Control(8)
+        self._sentences_spin = _Control(2)
         self._width_spin = _Control(1000)
         self._bg_color_btn = _Control("#000000")
         self._bg_opacity_spin = _Control(50)

@@ -1,4 +1,4 @@
-"""Soniox cloud realtime STT service manager (ru -> zh).
+"""Soniox cloud realtime STT service manager (configured languages -> zh).
 
 Owns the WebSocket session lifecycle for the "Soniox Cloud Realtime" ASR
 engine: a supervisor thread (connect / receive events / reconnect) and a send
@@ -46,6 +46,7 @@ log = logging.getLogger("LiveTranslate.soniox")
 SONIOX_MODEL = "stt-rt-v5"
 SONIOX_SAMPLE_RATE = 16000
 SONIOX_LANGUAGE_HINTS = ["ru"]
+SONIOX_ENGLISH_LANGUAGE_HINTS = ["en"]
 # Code-switching profile: measured on mixed ru+en lecture audio, a strict
 # ["ru"]-only hint transliterates English terms into Cyrillic ("algorithm
 # complexity" -> "алгоритм комплексити"), while ["ru", "en"] keeps them in
@@ -115,6 +116,10 @@ class SonioxRuntimeConfig:
     segmentation: str = "accuracy"
     mixed_language: bool = False
     enable_language_identification: bool = False
+    # Explicit language hints supersede the legacy mixed_language switch.
+    # None keeps the old ru / ru+en behaviour for callers that have not yet
+    # migrated their settings.
+    language_hints: tuple[str, ...] | None = None
 
 
 class SonioxSink(Protocol):
@@ -328,15 +333,19 @@ class SonioxServiceManager:
             self._send_cond.notify_all()
 
     def apply_config(self, **changes: Any) -> None:
-        """Runtime config change (context / segmentation): the SDK sends the
-        config per connection, so a graceful reconnect with the new config is
-        the only way to apply it. The current session is finalized and its
-        tail committed first (no segment is lost mid-flight)."""
+        """Runtime config change (context / segmentation / language hints).
+
+        The SDK sends the config per connection, so a graceful reconnect with
+        the new config is the only way to apply it. The current session is
+        finalized and its tail is committed first (no segment is lost
+        mid-flight)."""
         with self._lock:
             if self._stop_requested:
                 return
             changed = False
-            for key in ("context_text", "segmentation", "mixed_language"):
+            for key in (
+                "context_text", "segmentation", "mixed_language", "language_hints"
+            ):
                 if key in changes and changes[key] != getattr(self._config, key):
                     setattr(self._config, key, changes[key])
                     changed = True
@@ -473,11 +482,19 @@ class SonioxServiceManager:
         preset = SEGMENTATION_PRESETS.get(
             self._config.segmentation, SEGMENTATION_PRESETS["accuracy"]
         )
-        hints = (
-            SONIOX_MIXED_LANGUAGE_HINTS
-            if self._config.mixed_language
-            else SONIOX_LANGUAGE_HINTS
-        )
+        if self._config.language_hints is None:
+            hints = (
+                SONIOX_MIXED_LANGUAGE_HINTS
+                if self._config.mixed_language
+                else SONIOX_LANGUAGE_HINTS
+            )
+        else:
+            allowed = {"ru", "en"}
+            hints = [lang for lang in self._config.language_hints if lang in allowed]
+            # A blank hint list is not useful to the SDK. Keep the historical
+            # Russian default if a malformed/old settings file reaches here.
+            if not hints:
+                hints = list(SONIOX_LANGUAGE_HINTS)
         cfg = RealtimeSTTConfig(
             model=SONIOX_MODEL,
             audio_format="pcm_s16le",
@@ -487,7 +504,7 @@ class SonioxServiceManager:
             # strict is documented as "best results with one language hint";
             # with two hints (code-switching) the non-strict bias lets the
             # model follow the actual switches.
-            language_hints_strict=not self._config.mixed_language,
+            language_hints_strict=len(hints) == 1,
             enable_endpoint_detection=True,
             translation=TranslationConfig(
                 type="one_way", target_language=SONIOX_TARGET_LANGUAGE,

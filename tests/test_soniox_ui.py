@@ -59,8 +59,15 @@ def test_header_has_no_timestamp_or_latency_chips(app):
 def test_header_keeps_language_tag(app):
     msg = make_message(app, provider="soniox")
     html = msg._header_label.text()
-    assert "[ru]" in html
+    assert "RU ·" in html
+    assert "[ru]" not in html
     assert "Привет" in html
+
+
+def test_translation_uses_typographic_hierarchy_not_console_prompt(app):
+    msg = make_message(app)
+    msg.set_translation("你好", 100.0)
+    assert "&gt;" not in msg._trans_label.text()
 
 
 def test_provisional_live_uses_dim_colors(app):
@@ -132,6 +139,8 @@ def test_no_new_message_per_token(app):
 
 def test_monitor_bar_connection_status(app):
     bar = subtitle_overlay.MonitorBar()
+    assert not bar._rms_lbl.isVisible()
+    assert not bar._vad_lbl.isVisible()
     assert bar._connection is None
     bar.update_connection("live")
     assert bar._connection == "live"
@@ -146,12 +155,54 @@ def test_monitor_bar_connection_status(app):
     assert t("soniox_status_failed") not in bar._stats_label.text()
 
 
+def test_monitor_expand_button_has_clear_state_and_hides_cloud_vad(app):
+    bar = subtitle_overlay.MonitorBar()
+    assert bar._details_btn._expanded is False
+
+    bar.update_connection("live")
+    bar._details_btn.click()
+    assert bar._details_btn._expanded is True
+    assert bar._rms_bar.isHidden() is False
+    assert bar._vad_bar.isHidden() is True
+
+    bar._details_btn.click()
+    assert bar._details_btn._expanded is False
+    assert bar._rms_bar.isHidden() is True
+
+
+def test_local_diagnostics_still_show_vad_when_expanded(app):
+    bar = subtitle_overlay.MonitorBar()
+    bar.update_connection(None)
+    bar._details_btn.click()
+    assert bar._vad_bar.isHidden() is False
+
+
+def test_compact_status_shows_latest_latency(app):
+    bar = subtitle_overlay.MonitorBar()
+    bar.update_latency("asr", 78.4)
+    bar.update_latency("translation", 425.6)
+    assert "ASR 78ms" in bar._status_label.text()
+    assert "TL 426ms" in bar._status_label.text()
+    assert bar._stats_label.isHidden()
+
+
 def test_local_mode_shows_no_connection_status(app):
     bar = subtitle_overlay.MonitorBar()
     html = bar._stats_label.text()
     from i18n import t
 
     assert t("soniox_status_live") not in html
+
+
+def test_transient_notice_does_not_create_subtitle_card(app):
+    overlay = subtitle_overlay.SubtitleOverlay({})
+    overlay.show_notice("Soniox connection failed", timeout=1000)
+    for _ in range(5):
+        app.processEvents()
+    assert not overlay._notice_label.isHidden()
+    assert overlay._notice_label.text() == "Soniox connection failed"
+    assert overlay._messages == {}
+    overlay._notice_timer.stop()
 
 
 def test_provider_survives_the_signal_path(app):
@@ -302,3 +353,85 @@ def test_duplicate_add_with_same_id_does_not_leak_widget(app):
         and getattr(overlay._msg_layout.itemAt(i).widget(), "msg_id", None) == 20
     ]
     assert len(card_widgets) == 1
+
+
+def test_latest_two_cards_have_reading_hierarchy(app):
+    overlay = subtitle_overlay.SubtitleOverlay({})
+    for msg_id in (1, 2, 3):
+        overlay._on_add_message(msg_id, "12:00:00", str(msg_id), "en", 0.0)
+    assert overlay._messages[1]._focus_role == "history"
+    assert overlay._messages[2]._focus_role == "previous"
+    assert overlay._messages[3]._focus_role == "current"
+
+
+def test_error_is_a_retryable_state_not_translation_text(app):
+    overlay = subtitle_overlay.SubtitleOverlay({})
+    overlay._on_add_message(5, "12:00:00", "hello", "en", 0.0)
+    overlay._on_update_translation(5, "[error: timeout]", 0.0)
+    msg = overlay._messages[5]
+    from i18n import t
+
+    assert msg._status == "error"
+    assert msg._translated == ""
+    assert t("translation_failed") in msg._trans_label.text()
+    assert t("retry_translation") in msg._trans_label.text()
+
+
+def test_retry_reuses_the_same_card_and_returns_to_translating(app):
+    overlay = subtitle_overlay.SubtitleOverlay({})
+    overlay.add_message(6, "12:00:00", "hello", "en", 0.0)
+    app.processEvents()
+    overlay.update_translation(6, "[error: timeout]", 0.0)
+    app.processEvents()
+    requested = []
+    overlay.retry_translation_requested.connect(lambda *args: requested.append(args))
+
+    card = overlay._messages[6]
+    card._request_retry()
+
+    assert requested == [(6, "hello", "en")]
+    assert overlay._messages[6] is card
+    assert card._status == "translating"
+    from i18n import t
+    assert t("translating") in card._trans_label.text()
+    assert overlay._subtitle_state.get(6).status.value == "translating"
+
+
+def test_soniox_error_card_never_offers_in_place_retry(app):
+    overlay = subtitle_overlay.SubtitleOverlay({})
+    overlay.add_message(
+        16, "12:00:00", "ошибка", "ru", 0.0, provider="soniox"
+    )
+    app.processEvents()
+    overlay.update_translation(16, "[error: timeout]", 0.0)
+    app.processEvents()
+    requested = []
+    overlay.retry_translation_requested.connect(lambda *args: requested.append(args))
+
+    card = overlay._messages[16]
+    card._request_retry()
+
+    from i18n import t
+
+    assert card._status == "error"
+    assert card._error_retryable is False
+    assert t("retry_translation") not in card._trans_label.text()
+    assert requested == []
+    state = overlay._subtitle_state.get(16)
+    assert state.provider == "soniox"
+    assert state.retryable is False
+
+
+def test_scroll_updates_respect_manual_history_reading(app):
+    overlay = subtitle_overlay.SubtitleOverlay({})
+    sb = overlay._scroll.verticalScrollBar()
+    sb.setRange(0, 100)
+    sb.setValue(20)
+    overlay._follow_bottom = False
+    overlay._scroll_to_bottom()
+    assert sb.value() == 20
+
+    overlay._on_auto_scroll_toggled(True)
+    app.processEvents()
+    assert overlay._follow_bottom is True
+    assert sb.value() == sb.maximum()

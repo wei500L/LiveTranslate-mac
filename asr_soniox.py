@@ -27,7 +27,7 @@ log = logging.getLogger("LiveTranslate.ASR.Soniox")
 
 
 class SonioxASREngine:
-    """Soniox cloud realtime STT (ru -> zh), streaming-only."""
+    """Soniox cloud realtime STT (configured language hints -> zh)."""
 
     def __init__(
         self,
@@ -36,6 +36,7 @@ class SonioxASREngine:
         context_text: str = "",
         segmentation: str = "accuracy",
         mixed_language: bool = False,
+        language_hints: tuple[str, ...] | list[str] | None = None,
         sink: SonioxSink,
     ) -> None:
         if not api_key:
@@ -56,6 +57,9 @@ class SonioxASREngine:
                 context_text=context_text,
                 segmentation=segmentation,
                 mixed_language=mixed_language,
+                language_hints=(
+                    tuple(language_hints) if language_hints is not None else None
+                ),
             ),
             sink,
         )
@@ -90,7 +94,8 @@ class SonioxASREngine:
         return self._manager
 
     def set_language(self, language):
-        # Fixed ru -> zh; language is cloud-side config, not runtime state.
+        # Language hints are configured when the cloud session is created;
+        # local worker language updates do not apply to this streaming engine.
         pass
 
     def set_input_padding(self, pad_seconds):

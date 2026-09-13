@@ -93,7 +93,7 @@ Apple Silicon 专属。`./start.sh` 启动后,翻译设置里会出现 **HY-MT1.
 2. 用 **启动/停止本地服务** 控制服务;
 3. 选中该模型即用本地翻译,选中本身**不会**悄悄起服务,也不会静默回退到别的模型;应用退出时停掉自己拉起的 MLX 服务。
 
-## Soniox 云端实时识别(俄语 → 中文)
+## Soniox 云端实时识别(俄语/英语 → 中文)
 
 面向大学课堂、会议和远距离教师讲话的云端模式:音频**连续**上传 Soniox(`stt-rt-v5`,俄语),中文译文从同一条 WebSocket 流式返回,不再走本地翻译器。
 
@@ -110,8 +110,10 @@ Apple Silicon 专属。`./start.sh` 启动后,翻译设置里会出现 **HY-MT1.
 3. 选择该引擎,开始说话即可。悬浮窗底部一条"正在识别"的实时卡片:第一行俄语原文(较小)、第二行中文译文(较大),未定稿内容颜色较淡;每到一个语义分段点(endpoint)自动固化为历史消息。
 4. 可选:填写"课程主题 / 专业术语"提高识别与翻译准确率——每行一个主题/人名/术语;写成 `俄语词 => 中文译名` 的行会强制按该译名翻译(如 `предел => 极限`)。
 
+Soniox uses one consumed WebSocket stream for realtime recognition and translation, so finalized subtitles do not offer a misleading “click to retry” action; the connection layer still reconnects automatically. The subtitle glossary highlights configured terms locally and deterministically in both lines.
+
 **分段模式**:准确率优先(默认,适合会停顿犹豫的教师)/ 平衡 / 低延迟。
-**英俄混合**:教师夹带英语术语(俄语课堂常见)时勾选"英语/俄语混合识别"——实测对比:不勾选时英语术语被强行转写成西里尔拼写(algorithm complexity → алгоритм комплексити);勾选后英文术语按原文保留,中文译文同样保留英文术语。
+**Language hints**: Soniox settings expose independent "Recognize Russian" and "Recognize English" switches. Enable only Russian for Russian-only classes; enable both when the lecturer uses English terms or speech so English stays in Latin script and is preserved in the Chinese translation. At least one hint must remain enabled.
 
 **网络中断**:自动指数退避重连(悬浮窗显示"正在重连");连续失败达到上限后停止重试并提示,重新选择引擎即可恢复。 挂系统代理(HTTP/SOCKS)的机器可直接使用——依赖已包含代理支持;若代理软件未运行导致连不上,会显示"正在重连/连接失败"。暂停/恢复不会把暂停前后的句子错误拼接;结束会议、退出应用都会等待(有界)最后的识别结果落盘。
 
@@ -122,6 +124,12 @@ Apple Silicon 专属。`./start.sh` 启动后,翻译设置里会出现 **HY-MT1.
 SONIOX_API_KEY=你的Key RUN_SONIOX_LIVE_TEST=1 \
   .venv/bin/python -m pytest tests/test_soniox_live.py -q
 ```
+
+### Classroom glossary and audio recording
+
+Soniox settings support a local glossary with one `Russian => Chinese` entry per line, for example `последовательность => 数列`. Matching is deterministic and local; stress marks and case are normalized without an extra side model.
+
+Enable session audio in the records settings to continuously record the configured system/microphone mix while a recording session is active. Pausing subtitles does not stop audio. A WAV safety copy is written first and an MP3 is finalized when the session ends; if encoding fails, the WAV remains available. Release builds may ship FFmpeg in `ffmpeg/`, while development also uses `ffmpeg` from PATH.
 
 ## 翻译 API 配置
 
