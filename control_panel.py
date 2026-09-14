@@ -61,7 +61,9 @@ from model_manager import (
     normalize_funasr_model_key,
     resolve_custom_whisper_model,
 )
+from glossary_builtin import BUILTIN_GLOSSARY_SELECTIONS
 from i18n import t, LANGUAGES
+from terminology import short_cjk_translations
 from subtitle_settings import SubtitleSettingsWidget
 from platform_fonts import default_mono_font_family, default_ui_font_family
 from torch_backend import available_devices, mps_available, normalize_device
@@ -765,18 +767,53 @@ class ControlPanel(QWidget):
         self._soniox_context_edit.setMaximumHeight(96)
         self._soniox_context_edit.textChanged.connect(self._auto_save)
         soniox_layout.addWidget(self._soniox_context_edit, 4, 1)
-        soniox_layout.addWidget(QLabel(t("label_soniox_glossary")), 5, 0)
+        soniox_layout.addWidget(QLabel(t("label_soniox_glossary_builtin")), 5, 0)
+        self._soniox_glossary_builtin = QComboBox()
+        builtin_label_keys = {
+            "off": "soniox_glossary_builtin_off",
+            "linear_algebra": "soniox_glossary_builtin_linear_algebra",
+            "discrete_math": "soniox_glossary_builtin_discrete_math",
+            "both": "soniox_glossary_builtin_both",
+        }
+        self._soniox_glossary_builtin.addItems(
+            [t(builtin_label_keys[key]) for key in BUILTIN_GLOSSARY_SELECTIONS]
+        )
+        stored_builtin = s.get("soniox_glossary_builtin", "off")
+        builtin_idx = (
+            BUILTIN_GLOSSARY_SELECTIONS.index(stored_builtin)
+            if stored_builtin in BUILTIN_GLOSSARY_SELECTIONS
+            else 0
+        )
+        self._soniox_glossary_builtin.setCurrentIndex(builtin_idx)
+        self._soniox_glossary_builtin.currentIndexChanged.connect(self._auto_save)
+        soniox_layout.addWidget(self._soniox_glossary_builtin, 5, 1)
+        builtin_hint = QLabel(t("soniox_glossary_builtin_hint"))
+        builtin_hint.setWordWrap(True)
+        builtin_hint.setStyleSheet("color: #888; font-size: 11px;")
+        soniox_layout.addWidget(builtin_hint, 6, 0, 1, 2)
+        soniox_layout.addWidget(QLabel(t("label_soniox_glossary")), 7, 0)
         self._soniox_glossary_edit = QPlainTextEdit(
             (s.get("soniox_glossary") or "").strip()
         )
         self._soniox_glossary_edit.setPlaceholderText(t("soniox_glossary_placeholder"))
         self._soniox_glossary_edit.setMaximumHeight(110)
         self._soniox_glossary_edit.textChanged.connect(self._auto_save)
-        soniox_layout.addWidget(self._soniox_glossary_edit, 5, 1)
+        self._soniox_glossary_edit.textChanged.connect(self._update_glossary_warning)
+        soniox_layout.addWidget(self._soniox_glossary_edit, 7, 1)
+        # Visible, not silent: a single-character Chinese translation never
+        # highlights on the translation line (no word boundaries in CJK), so
+        # the user's own entries must say so instead of quietly losing half
+        # the feature.
+        self._soniox_glossary_warn = QLabel("")
+        self._soniox_glossary_warn.setWordWrap(True)
+        self._soniox_glossary_warn.setStyleSheet("color: #b3261e; font-size: 11px;")
+        self._soniox_glossary_warn.setVisible(False)
+        soniox_layout.addWidget(self._soniox_glossary_warn, 8, 0, 1, 2)
+        self._update_glossary_warning()
         cloud_note = QLabel(t("soniox_note_cloud"))
         cloud_note.setWordWrap(True)
         cloud_note.setStyleSheet("color: #888; font-size: 11px;")
-        soniox_layout.addWidget(cloud_note, 6, 0, 1, 2)
+        soniox_layout.addWidget(cloud_note, 9, 0, 1, 2)
         layout.addWidget(self._soniox_group)
         self._soniox_group.setVisible(engine_idx == 5)
 
@@ -2318,6 +2355,21 @@ class ControlPanel(QWidget):
             return
         self._auto_save()
 
+    def _update_glossary_warning(self):
+        """Surface single-character Chinese translations instead of dropping them."""
+        if not hasattr(self, "_soniox_glossary_warn"):
+            return
+        short = short_cjk_translations(self._soniox_glossary_edit.toPlainText())
+        if short:
+            self._soniox_glossary_warn.setText(
+                t("soniox_glossary_short_cjk_warning").format(
+                    terms=", ".join(short)
+                )
+            )
+            self._soniox_glossary_warn.setVisible(True)
+        else:
+            self._soniox_glossary_warn.setVisible(False)
+
     def _on_ui_lang_changed(self, index):
         lang = "en" if index == 0 else "zh"
         self._current_settings["ui_lang"] = lang
@@ -2394,6 +2446,11 @@ class ControlPanel(QWidget):
             )
             self._current_settings["soniox_glossary"] = (
                 self._soniox_glossary_edit.toPlainText().strip()
+            )
+            self._current_settings["soniox_glossary_builtin"] = (
+                BUILTIN_GLOSSARY_SELECTIONS[
+                    self._soniox_glossary_builtin.currentIndex()
+                ]
             )
             seg_values = ("accuracy", "balanced", "low_latency")
             self._current_settings["soniox_segmentation"] = seg_values[

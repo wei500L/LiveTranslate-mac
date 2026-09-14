@@ -86,6 +86,7 @@ from translator import RepetitionError, translator_from_model_config
 from mlx_service import MLXServiceManager, is_hy_mt_model
 from transcript_writer import TranscriptWriter
 from terminology import EMPTY_GLOSSARY, parse_glossary
+from glossary_builtin import merged_glossary_text
 from audio_recorder import AudioArtifacts, AudioRecorder
 
 from PyQt6.QtWidgets import (
@@ -1645,9 +1646,15 @@ class LiveTranslateApp:
         self._panel = panel
         # Settings are loaded before this signal connection exists. Apply the
         # saved glossary once here so highlighting works immediately at
-        # startup, not only after the user edits and saves the panel.
+        # startup, not only after the user edits and saves the panel. The
+        # built-in course table (if any) merges under the user's entries.
         initial_settings = panel.get_settings()
-        self._glossary = parse_glossary(initial_settings.get("soniox_glossary", ""))
+        self._glossary = parse_glossary(
+            merged_glossary_text(
+                initial_settings.get("soniox_glossary_builtin"),
+                initial_settings.get("soniox_glossary", ""),
+            )
+        )
         if self._overlay:
             self._overlay.set_glossary(self._glossary)
         # One manager, not two. The panel starts the service and the app stops
@@ -1749,8 +1756,15 @@ class LiveTranslateApp:
             self._overlay.set_models(models, active_idx)
 
     def _on_settings_changed(self, settings):
-        if "soniox_glossary" in settings:
-            self._glossary = parse_glossary(settings.get("soniox_glossary", ""))
+        if "soniox_glossary" in settings or "soniox_glossary_builtin" in settings:
+            # User entries come last, so they override a built-in entry on the
+            # same normalized original (parse_glossary keeps the last duplicate).
+            self._glossary = parse_glossary(
+                merged_glossary_text(
+                    settings.get("soniox_glossary_builtin"),
+                    settings.get("soniox_glossary", ""),
+                )
+            )
             if self._overlay:
                 self._overlay.set_glossary(self._glossary)
         with self._vad_lock:

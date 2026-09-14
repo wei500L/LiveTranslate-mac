@@ -176,7 +176,12 @@ soniox_api_key (env SONIOX_API_KEY wins; filtered from the panel's settings log)
 soniox_context, soniox_segmentation (accuracy/balanced/low_latency endpoint
 presets; context/segmentation changes apply via manager.apply_config — a graceful
 reconnect — without a full engine reload; a key change is a signature change and
-reloads). Language locks: source ru, target zh (GigaAM lock pattern). Offline
+reloads), and the subtitle-highlight glossary pair: soniox_glossary (the user's
+free-text entries) + soniox_glossary_builtin (off/linear_algebra/discrete_math/
+both — the built-in course table merged UNDER the user's entries by
+glossary_builtin.merged_glossary_text; never persisted and never pre-filled into
+the panel's text box, see glossary_builtin.py). Language locks: source ru, target
+zh (GigaAM lock pattern). Offline
 tests: tests/test_soniox_{accumulator,client,pipeline,ui,sdk_contract}.py; the
 gated live test (SONIOX_API_KEY + RUN_SONIOX_LIVE_TEST=1) is the only network
 toucher.
@@ -481,6 +486,40 @@ pdf_exporter.py          PDF minutes export via QTextDocument + QPdfWriter (A4,
                          mm margins, two-pass print: paginate once then draw
                          per-page with footer; no per-page doc clone). Fonts
                          resolved from system availability with CJK fallback.
+terminology.py          Deterministic subtitle glossary: parse_glossary() parses
+                         ``original => translation`` lines (``#`` comments, last
+                         duplicate wins by normalized original; NFKC + combining-
+                         mark strip + casefold, which also folds Russian ``ё`` to
+                         ``е`` so either spelling matches). Glossary matching
+                         requires word boundaries for Latin/Cyrillic needles but
+                         not CJK — and a **lone CJK character is never a match
+                         needle on either side**: Chinese has no word boundaries,
+                         so a one-character translation (基) would highlight
+                         inside unrelated words (基本概念). Such entries stay in
+                         ``entries`` (the source side still highlights and the
+                         hover title still shows the pairing) and are only
+                         excluded from the matching term tuples;
+                         short_cjk_translations() backs the panel's visible
+                         warning so a user entry is never dropped silently.
+glossary_builtin.py     Built-in course glossaries (LINEAR_ALGEBRA /
+                         DISCRETE_MATH, ~200 entries each) as plain
+                         parse_glossary()-shaped text constants. Russian is
+                         inflected and matching is literal, so each term ships
+                         its nominative plus the oblique cases actually heard in
+                         a lecture (матрица alone never matches матрицу);
+                         translations are ≥2 Chinese characters wherever a
+                         standard two-character rendering exists (基底 not 基,
+                         维数 not 维). The deliberate exceptions — terms whose
+                         only standard translation is one character (秩/行/图/
+                         树/…) — are registered in SINGLE_CHAR_TRANSLATIONS and
+                         rely on terminology.py's CJK length rule to stay
+                         inert on the translation side. merged_glossary_text()
+                         concatenates built-in + user text (user last, so user
+                         entries override on the same normalized original). The
+                         built-in text is NEVER persisted to user_settings.json
+                         and never pre-filled into the panel's text box: a value
+                         written there once is frozen at that build forever (the
+                         same trap migrate_style guards against).
 torch_backend.py         Device capability layer (mps/cuda availability, device normalization)
 ui_theme.py              Shared Qt styling
 i18n.py                  t() lookup, LANGUAGES list, system language detection

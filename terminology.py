@@ -21,11 +21,39 @@ def normalize_term(value: str) -> str:
 
     Russian stress marks are combining characters.  Removing combining marks
     also makes a stressed and unstressed spelling compare equal without
-    changing the text shown to the user.
+    changing the text shown to the user.  ``ё`` is folded to ``е`` for the
+    same reason: it is not a combining character (NFKC recomposes it), but
+    recognition output and everyday typing freely mix both spellings, so a
+    term written one way must match the other.
     """
     text = unicodedata.normalize("NFKC", value or "")
     text = "".join(ch for ch in text if not unicodedata.combining(ch))
-    return text.casefold().strip()
+    return text.casefold().replace("ё", "е").strip()
+
+
+def _is_cjk_char(char: str) -> bool:
+    """Scripts written without spaces between words (CJK, kana, hangul)."""
+    code = ord(char)
+    return (
+        0x3040 <= code <= 0x30FF  # hiragana + katakana
+        or 0x3400 <= code <= 0x4DBF  # CJK extension A
+        or 0x4E00 <= code <= 0x9FFF  # CJK unified ideographs
+        or 0xAC00 <= code <= 0xD7A3  # hangul syllables
+        or 0xF900 <= code <= 0xFAFF  # CJK compatibility ideographs
+    )
+
+
+def _needle_can_match(needle: str) -> bool:
+    """Reject lone CJK characters as match needles.
+
+    Latin/Cyrillic needles are guarded by word boundaries, but CJK text has
+    no spaces, so a single-character Chinese translation (``基``) would
+    highlight inside completely unrelated words (``基本概念``) on the
+    translation line.  Such entries stay in ``Glossary.entries`` — the
+    source side still highlights and the hover title still shows the
+    pairing — they are only excluded from the matching term tuples.
+    """
+    return not (len(needle) == 1 and _is_cjk_char(needle))
 
 
 @dataclass(frozen=True)
@@ -48,11 +76,13 @@ class Glossary:
             (entry, index)
             for index, entry in enumerate(entries)
             if entry.normalized_original
+            and _needle_can_match(entry.normalized_original)
         )
         self._translation_terms = tuple(
             (entry, index)
             for index, entry in enumerate(entries)
             if entry.normalized_translation
+            and _needle_can_match(entry.normalized_translation)
         )
 
     @staticmethod
@@ -64,7 +94,7 @@ class Glossary:
             normalized = unicodedata.normalize("NFKC", char)
             normalized = "".join(
                 ch for ch in normalized if not unicodedata.combining(ch)
-            ).casefold()
+            ).casefold().replace("ё", "е")
             normalized_chars.extend(normalized)
             index_map.extend([index] * len(normalized))
         return "".join(normalized_chars), index_map
@@ -194,6 +224,22 @@ def parse_glossary(text: str | None) -> Glossary:
             normalized_translation=normalized_translation,
         )
     return Glossary(tuple(entries.values()))
+
+
+def short_cjk_translations(text: str | None) -> list[str]:
+    """Translations from a glossary text that the CJK rule keeps inert.
+
+    Backs the panel's visible warning: a user entry with a single-character
+    Chinese translation is still parsed and still highlights the source
+    side, but it never highlights on the translation line — which must be
+    told to the user, not dropped silently.
+    """
+    inert: list[str] = []
+    for entry in parse_glossary(text).entries:
+        if not _needle_can_match(entry.normalized_translation):
+            if entry.translation not in inert:
+                inert.append(entry.translation)
+    return inert
 
 
 EMPTY_GLOSSARY = Glossary()
