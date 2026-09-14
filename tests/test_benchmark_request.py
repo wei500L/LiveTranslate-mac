@@ -88,7 +88,9 @@ def test_hy_mt_benchmarks_with_its_managed_profile():
     )
     assert kwargs["temperature"] == 0.0   # greedy; see the preset's comment
     assert kwargs["max_tokens"] == 128
-    assert kwargs["extra_body"]["repetition_penalty"] == 1.05
+    # Nothing extra: repetition_penalty would disqualify the request from
+    # mlx_lm.server's batch path (see the preset's comment).
+    assert "extra_body" not in kwargs
     assert kwargs["messages"][0]["role"] == "user"
 
 

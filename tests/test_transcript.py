@@ -1099,6 +1099,9 @@ class _AdoptionApp:
         # The ENDING-flush hand-off (_flush_for_session_end) gates on ASR
         # readiness; tests that need the not-ready branch flip it.
         self._asr_ready = True
+        # Local-engine stand-in: the Soniox ENDING drain is dead code here.
+        self._asr_type = "whisper"
+        self._asr = None
         self._target_language = "ru"
         self._asr_count = 0
         self._msg_id = 0
@@ -1153,6 +1156,7 @@ class _AdoptionApp:
     _flush_for_session_end = None
     _enqueue_final_segment = None
     _run_session_end = None
+    _soniox_engine_active = None  # bound in _bind() with the real method
     pause = None
     resume = None
 
@@ -1173,6 +1177,7 @@ def _make_adoption_app(tmp_path):
             "_do_interim_asr", "_reset_interim_state",
             "_process_interim_final", "_flush_for_session_end",
             "_enqueue_final_segment", "_run_session_end",
+            "_soniox_engine_active", "_soniox_manager",
             "pause", "resume",
         ):
             setattr(_AdoptionApp, name, getattr(real, name))
@@ -1273,24 +1278,34 @@ class _FakeInterimVAD:
     def __init__(self, seconds: float):
         self._samples = [0.0] * int(seconds * 16000)
         self.trimmed = 0
+        self._buffer_epoch = 0
+        self.refused_trims = 0
 
     def peek_buffer(self):
         if not self._samples:
             return None
-        return self._samples, len(self._samples) / 16000
+        return self._samples, len(self._samples) / 16000, self._buffer_epoch
 
-    def trim_front(self, samples):
+    def trim_front(self, samples, epoch=None):
+        if epoch is not None and epoch != self._buffer_epoch:
+            self.refused_trims += 1
+            return False
         self.trimmed += samples
         self._samples = self._samples[samples:]
+        return True
 
     def _flush_all(self):
         if not self._samples:
             return None
         segment, self._samples = self._samples, []
+        # A flush ends the utterance: an interim trim measured against the
+        # old buffer must not be applied after this.
+        self._buffer_epoch += 1
         return segment
 
     flush = _flush_all
     force_flush = _flush_all
+    flush_final = _flush_all
 
     def _reset(self):
         self._samples = []
@@ -2250,3 +2265,43 @@ def test_pause_failure_paths_do_not_leak_or_corrupt(tmp_path):
     assert app._interim_pending == ""
     assert app._asr_queue.empty()
     app._stop_event.clear()
+
+
+def test_interim_trim_is_refused_when_the_utterance_ends_mid_recognition(tmp_path):
+    """[B1] _do_interim_asr peeks the buffer under _vad_lock, drops the lock
+    for the whole of recognition, then trims. In that window the capture
+    thread can end the utterance (silence limit), split it (max duration) or
+    discard it as noise -- after any of those, the trim it computed describes
+    audio the buffer no longer holds, and applying it ate the head of the
+    *next* sentence.
+
+    The epoch peek_buffer hands out is what makes the two calls one
+    transaction. This test drives the turnover from inside _run_asr, which is
+    exactly where the real race lands, so it fails both if trim_front stops
+    checking the epoch and if this caller stops passing it.
+    """
+    app, writer, main = _make_adoption_app(tmp_path)
+    vad = _FakeInterimVAD(4.0)
+    app._vad = vad
+
+    def _asr_that_outlives_the_utterance(audio, kind, **kw):
+        # The capture thread ends the utterance while recognition runs.
+        vad._flush_all()
+        vad._samples = [0.0] * int(1.2 * 16000)  # the next sentence begins
+        return (
+            {"text": "Первое предложение. Хвост", "language": "ru"},
+            120,
+        )
+
+    app._run_asr = _asr_that_outlives_the_utterance
+    app._split_sentences = lambda text, lang: ["Первое предложение.", "Хвост"]
+
+    app._do_interim_asr(generation=0, expected_session=None)
+
+    assert vad.refused_trims == 1, "the stale trim was applied to the next sentence"
+    assert vad.trimmed == 0
+    assert len(vad._samples) == int(1.2 * 16000), "next sentence was trimmed"
+    # The commit still stands, and the echo tail still guards the vad_flush
+    # that is queued behind this pass.
+    assert app._interim_committed_tail
+    assert app._interim_active is True

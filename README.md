@@ -16,6 +16,7 @@
 - **本地翻译模型**:Apple Silicon 上可一键准备 **HY-MT1.5-7B(MLX 4-bit)**,由应用托管独立 MLX 服务,完全离线翻译
 - **任意 OpenAI 兼容 API**:DeepSeek、Grok、Qwen、GPT、Ollama、vLLM……流式输出、JSON 结构化输出、上下文历史、按模型关闭 thinking,全部可配
 - **远程 ASR**:把识别负载放到有 GPU 的机器上,见 [REMOTE_ASR.md](REMOTE_ASR.md)
+- **Soniox 云端实时识别(俄语→中文)**:连续音频直传云端,不经本地 VAD——安静、远距离的课堂语音也能识别,翻译由同一条流式连接返回,见下文专节
 - **会议记录**:按会话保存原文/译文/全文 + Markdown 记录 + JSON 元数据,设置面板内直接回看
 - **透明悬浮窗**:置顶、点击穿透、拖拽、14 套配色主题;另有供 OBS 采集的独立字幕窗
 - **内置基准测试**:对比各翻译模型的速度与质量
@@ -91,6 +92,44 @@ Apple Silicon 专属。`./start.sh` 启动后,翻译设置里会出现 **HY-MT1.
 1. 点 **准备本地模型(Prepare Local Model)**:安装隔离的 MLX 运行时(`.mlx-venv`,与主环境 PyTorch 栈互不干扰),将 ModelScope 官方权重转为 4-bit,临时的 BF16 源文件用完自动删除;
 2. 用 **启动/停止本地服务** 控制服务;
 3. 选中该模型即用本地翻译,选中本身**不会**悄悄起服务,也不会静默回退到别的模型;应用退出时停掉自己拉起的 MLX 服务。
+
+## Soniox 云端实时识别(俄语/英语 → 中文)
+
+面向大学课堂、会议和远距离教师讲话的云端模式:音频**连续**上传 Soniox(`stt-rt-v5`,俄语),中文译文从同一条 WebSocket 流式返回,不再走本地翻译器。
+
+**与本地模式的区别**:本地链路依赖本地 VAD 判断"哪些音频是语音"——老师声音小、离麦克风远时整句会被漏掉。Soniox 模式把连续音频(含安静片段)直接上传,由云端识别;VAD/最短最长语音等设置对该模式不生效(设置页中会隐藏)。
+
+**使用步骤**:
+
+1. 在 [Soniox Console](https://console.soniox.com/) 注册并创建 API Key。
+2. 配置 Key(二选一,环境变量优先):
+   ```bash
+   export SONIOX_API_KEY=你的Key   # 优先级最高
+   ```
+   或在 设置 → VAD/ASR → 引擎选择 "Soniox 云端实时(俄语 → 中文)" 后,在出现的 API Key 输入框填写。Key 以**明文**保存在本机 `user_settings.json`(与翻译模型 Key 相同的保存方式),不会出现在日志中。
+3. 选择该引擎,开始说话即可。悬浮窗底部一条"正在识别"的实时卡片:第一行俄语原文(较小)、第二行中文译文(较大),未定稿内容颜色较淡;每到一个语义分段点(endpoint)自动固化为历史消息。
+4. 可选:填写"课程主题 / 专业术语"提高识别与翻译准确率——每行一个主题/人名/术语;写成 `俄语词 => 中文译名` 的行会强制按该译名翻译(如 `предел => 极限`)。
+
+Soniox uses one consumed WebSocket stream for realtime recognition and translation, so finalized subtitles do not offer a misleading “click to retry” action; the connection layer still reconnects automatically. The subtitle glossary highlights configured terms locally and deterministically in both lines.
+
+**分段模式**:准确率优先(默认,适合会停顿犹豫的教师)/ 平衡 / 低延迟。
+**Language hints**: Soniox settings expose independent "Recognize Russian" and "Recognize English" switches. Enable only Russian for Russian-only classes; enable both when the lecturer uses English terms or speech so English stays in Latin script and is preserved in the Chinese translation. At least one hint must remain enabled.
+
+**网络中断**:自动指数退避重连(悬浮窗显示"正在重连");连续失败达到上限后停止重试并提示,重新选择引擎即可恢复。 挂系统代理(HTTP/SOCKS)的机器可直接使用——依赖已包含代理支持;若代理软件未运行导致连不上,会显示"正在重连/连接失败"。暂停/恢复不会把暂停前后的句子错误拼接;结束会议、退出应用都会等待(有界)最后的识别结果落盘。
+
+**费用提醒**:云端按音频流时长计费,选择该引擎即开始产生费用;不用时请切回本地引擎(如 GigaAM)。
+
+**可选的真实连通测试**(默认测试套件不访问网络):
+```bash
+SONIOX_API_KEY=你的Key RUN_SONIOX_LIVE_TEST=1 \
+  .venv/bin/python -m pytest tests/test_soniox_live.py -q
+```
+
+### Classroom glossary and audio recording
+
+Soniox settings support a local glossary with one `Russian => Chinese` entry per line, for example `последовательность => 数列`. Matching is deterministic and local; stress marks and case are normalized without an extra side model.
+
+Enable session audio in the records settings to continuously record the configured system/microphone mix while a recording session is active. Pausing subtitles does not stop audio. A WAV safety copy is written first and an MP3 is finalized when the session ends; if encoding fails, the WAV remains available. Release builds may ship FFmpeg in `ffmpeg/`, while development also uses `ffmpeg` from PATH.
 
 ## 翻译 API 配置
 

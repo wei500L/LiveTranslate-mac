@@ -449,6 +449,10 @@ class MeetingRecordsPage(QWidget):
         self._folder_btn.clicked.connect(self._open_folder_current)
         actions.addWidget(self._folder_btn)
 
+        self._audio_btn = QPushButton(t("records_play_audio"))
+        self._audio_btn.clicked.connect(self._open_audio_current)
+        actions.addWidget(self._audio_btn)
+
         self._delete_btn = QPushButton(t("btn_delete_record"))
         self._delete_btn.setObjectName("dangerButton")
         self._delete_btn.clicked.connect(
@@ -1101,6 +1105,10 @@ class MeetingRecordsPage(QWidget):
             self._summary_doc is not None and not worker_running
         )
         self._delete_btn.setEnabled(self._can_delete(record))
+        audio_files = (record or {}).get("files") or {}
+        self._audio_btn.setEnabled(
+            bool(audio_files.get("audio_mp3") or audio_files.get("audio_wav"))
+        )
         # Export is disabled in the UI while the record is ENDING (the seal
         # may still be writing; the handler's own authoritative check
         # remains the guard — a stale cache must not make the button lie).
@@ -1239,7 +1247,14 @@ class MeetingRecordsPage(QWidget):
             (t("records_info_translation_model"), str(record.get("translation_model") or "")),
             (t("records_info_source_lang"), str(record.get("source_language") or "")),
             (t("records_info_target_lang"), str(record.get("target_language") or "")),
+            (t("records_info_audio_status"), str(record.get("audio_status") or t("records_audio_none"))),
+            (t("records_info_audio_duration"), str(record.get("audio_duration_seconds") or 0)),
         ]
+        audio_files = record.get("files") or {}
+        if audio_files.get("audio_mp3"):
+            rows.append((t("records_info_audio_mp3"), audio_files["audio_mp3"]))
+        if audio_files.get("audio_wav"):
+            rows.append((t("records_info_audio_wav"), audio_files["audio_wav"]))
         lines = ["<table width='100%' cellspacing='6'>"]
         for i, (key, value) in enumerate(rows):
             if not value:
@@ -1779,6 +1794,21 @@ class MeetingRecordsPage(QWidget):
     def _open_folder_current(self):
         self._dir.mkdir(parents=True, exist_ok=True)
         _open_folder(self._dir)
+
+    def _open_audio_current(self):
+        record = self._current_record()
+        if not record:
+            return
+        files = record.get("files") or {}
+        path = files.get("audio_mp3") or files.get("audio_wav")
+        if not path:
+            return
+        if sys.platform == "darwin":
+            subprocess.Popen(["open", path])
+        elif sys.platform.startswith("win"):
+            os_startfile(path)
+        else:
+            subprocess.Popen(["xdg-open", path])
 
     def _delete_session(self, record: dict | None = None):
         """Delete one session's files. ``record`` is the explicit target

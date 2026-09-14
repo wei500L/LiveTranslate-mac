@@ -31,7 +31,7 @@ from platform_fonts import default_cjk_font_family
 
 from dialogs import available_screen_height, make_scroll_area
 from i18n import t, LANGUAGES
-from subtitle_window import DEFAULT_SUBTITLE_WIN_SETTINGS
+from subtitle_window import DEFAULT_SUBTITLE_WIN_SETTINGS, migrate_subtitle_settings
 
 _PROJECT_DIR = Path(__file__).parent
 
@@ -316,7 +316,10 @@ class SubtitleSettingsWidget(QWidget):
 
     def __init__(self, current_settings=None, parent=None):
         super().__init__(parent)
-        self._settings = {**DEFAULT_SUBTITLE_WIN_SETTINGS, **(current_settings or {})}
+        self._settings = {
+            **DEFAULT_SUBTITLE_WIN_SETTINGS,
+            **migrate_subtitle_settings(current_settings),
+        }
         self._debounce_timer = QTimer(self)
         self._debounce_timer.setSingleShot(True)
         self._debounce_timer.setInterval(200)
@@ -324,7 +327,11 @@ class SubtitleSettingsWidget(QWidget):
         self._build_ui()
 
     def update_settings(self, settings: dict):
-        self._settings = {**DEFAULT_SUBTITLE_WIN_SETTINGS, **(settings or {})}
+        self._settings = {
+            **DEFAULT_SUBTITLE_WIN_SETTINGS,
+            **migrate_subtitle_settings(settings),
+        }
+        self._sentences_spin.setValue(self._settings.get("sentences", 2))
         self._spacing_spin.setValue(self._settings.get("line_spacing", 8))
         self._width_spin.setValue(self._settings.get("window_width", 1000))
         self._bg_color_btn.set_color(self._settings.get("bg_color", "#000000"))
@@ -365,6 +372,14 @@ class SubtitleSettingsWidget(QWidget):
         self._width_spin.setValue(self._settings.get("window_width", 1000))
         self._width_spin.valueChanged.connect(self._on_change)
         g.addWidget(self._width_spin, r, 1)
+        r += 1
+
+        g.addWidget(QLabel(t("subwin_context_sentences")), r, 0)
+        self._sentences_spin = QSpinBox()
+        self._sentences_spin.setRange(1, 3)
+        self._sentences_spin.setValue(self._settings.get("sentences", 2))
+        self._sentences_spin.valueChanged.connect(self._on_change)
+        g.addWidget(self._sentences_spin, r, 1)
         r += 1
 
         g.addWidget(QLabel(t("subwin_line_spacing")), r, 0)
@@ -652,6 +667,8 @@ class SubtitleSettingsWidget(QWidget):
         window's live configuration behind its back.
         """
         s = {
+            "reading_layout_version": 2,
+            "sentences": self._sentences_spin.value(),
             "line_spacing": self._spacing_spin.value(),
             "window_width": self._width_spin.value(),
             "bg_color": self._bg_color_btn.color(),

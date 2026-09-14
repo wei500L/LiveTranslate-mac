@@ -88,3 +88,36 @@ def test_subtitle_button_shows_its_toggled_state(app):
     assert on != off
     handle.set_subtitle_checked(False)
     assert handle._subtitle_btn.styleSheet() == off
+
+
+def test_programmatic_set_mode_emits_mode_changed():
+    """set_mode() must announce the switch like the toggle button does.
+
+    It used to apply the mode silently, so any programmatic caller (a menu,
+    a restored window state) left the header compact while the monitor bar
+    stayed visible — the two halves of "compact" disagreed.
+    """
+    import os
+
+    os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+    from PyQt6.QtWidgets import QApplication
+
+    from subtitle_overlay import SubtitleOverlay
+
+    app = QApplication.instance() or QApplication([])
+    overlay = SubtitleOverlay({})
+    seen: list[str] = []
+    overlay.mode_changed.connect(seen.append)
+
+    overlay.set_mode("compact")
+    assert seen == ["compact"]
+    assert overlay._monitor.isHidden() is True
+
+    overlay.set_mode("full")
+    assert seen == ["compact", "full"]
+    assert overlay._monitor.isHidden() is False
+
+    # Same mode again: no state change, so no announcement.
+    overlay.set_mode("full")
+    assert seen == ["compact", "full"]
+    app.processEvents()

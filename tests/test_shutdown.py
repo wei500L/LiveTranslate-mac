@@ -245,6 +245,8 @@ class PausableApp:
     the ASR queue, the session bookkeeping and the overlay."""
 
     pause = main.LiveTranslateApp.pause
+    _soniox_engine_active = main.LiveTranslateApp._soniox_engine_active
+    _soniox_manager = main.LiveTranslateApp._soniox_manager
     _enqueue_asr = main.LiveTranslateApp._enqueue_asr
     _requeue_stop_sentinel = main.LiveTranslateApp._requeue_stop_sentinel
     _session_snapshot = main.LiveTranslateApp._session_snapshot
@@ -254,6 +256,8 @@ class PausableApp:
     def __init__(self, buffered_segment, interim_active=False, asr_ready=True):
         self._paused = False
         self._asr_ready = asr_ready
+        self._asr_type = "whisper"  # local engine: the soniox branch is dead
+        self._asr = None
         self._interim_active = interim_active
         self._interim_pending = "pending text"
         self._overlay = None
@@ -278,6 +282,14 @@ class PausableApp:
             segment, self.segment = self.segment, None
             return segment
 
+        def flush_final(self):
+            # What pause()/session-end/stop actually call: no min-speech
+            # gate, because there is no next onset to merge a short
+            # remainder with.
+            self.flushed = "flush_final"
+            segment, self.segment = self.segment, None
+            return segment
+
         def force_flush(self):
             self.flushed = "force_flush"
             segment, self.segment = self.segment, None
@@ -294,7 +306,7 @@ def test_pause_hands_off_the_in_flight_utterance():
     app = PausableApp(buffered_segment="half a sentence")
     app.pause()
     assert app._paused is True
-    assert app._vad.flushed == "flush"
+    assert app._vad.flushed == "flush_final"
     assert _payloads(app._asr_queue) == [("vad_flush", "half a sentence")]
 
 

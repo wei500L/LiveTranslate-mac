@@ -20,6 +20,7 @@ from PyQt6.QtWidgets import (
     QLineEdit,
     QListWidget,
     QListWidgetItem,
+    QPlainTextEdit,
     QMessageBox,
     QPushButton,
     QSlider,
@@ -27,6 +28,7 @@ from PyQt6.QtWidgets import (
     QProgressBar,
     QStackedWidget,
     QAbstractItemView,
+    QCheckBox,
     QTextEdit,
     QVBoxLayout,
     QWidget,
@@ -67,6 +69,8 @@ from mlx_service import (
     MLXServiceManager,
     ensure_hy_mt_model,
     is_hy_mt_model,
+    managed_port_for,
+    sync_managed_endpoint,
 )
 
 log = logging.getLogger("LiveTranslate.Panel")
@@ -200,6 +204,27 @@ def migrate_performance_settings(settings: dict | None) -> dict | None:
     return settings
 
 
+def migrate_style_settings(settings: dict | None) -> bool:
+    """Upgrade a stored overlay style across the two-line hierarchy redesign.
+
+    Returns whether anything changed (so the caller can persist it). Runs at
+    load time, *before* the panel fills its style controls: those controls
+    write the whole style dict back on the next auto-save, so a migration
+    applied only at render time would be reverted by the next settings save.
+    """
+    if not isinstance(settings, dict):
+        return False
+    style = settings.get("style")
+    if not isinstance(style, dict):
+        return False
+    from subtitle_overlay import migrate_style
+
+    upgraded, changed = migrate_style(style)
+    if changed:
+        settings["style"] = upgraded
+    return changed
+
+
 def active_index_after_removal(removed: int, active: int, remaining: int) -> int:
     """Where active_model points after `removed` is deleted from the list.
 
@@ -236,10 +261,11 @@ def _load_saved_settings() -> dict | None:
             old_version = int(data.get("performance_profile_version", 0) or 0)
             migrate_funasr_settings(data)
             migrate_performance_settings(data)
+            style_migrated = migrate_style_settings(data)
             mlx_changed = ensure_hy_mt_model(data, activate_if_ready=False) if sys.platform == "darwin" else False
             if int(data.get("performance_profile_version", 0) or 0) != old_version:
                 _save_settings(data)
-            elif mlx_changed:
+            elif mlx_changed or style_migrated:
                 _save_settings(data)
             log.info(f"Loaded saved settings from {SETTINGS_FILE}")
             return data
@@ -359,6 +385,10 @@ class ControlPanel(QWidget):
             mlx_changed = ensure_hy_mt_model(self._current_settings, activate_if_ready=False)
             if mlx_changed:
                 _save_settings(self._current_settings)
+            # The manager probes and starts on this port; it may move at
+            # runtime to dodge an occupied one, and _sync_mlx_endpoint_if_
+            # moved persists wherever it ended up.
+            self._mlx_manager.port = managed_port_for(self._current_settings)
 
         self._current_settings.setdefault(
             "funasr_model",
@@ -464,6 +494,7 @@ class ControlPanel(QWidget):
                 "Anime-Whisper (ja, anime/galgame)",
                 t("asr_gigaam"),
                 "Remote Whisper (remote GPU server)",
+                t("asr_soniox"),
             ]
         )
         engine_map_idx = {
@@ -472,6 +503,7 @@ class ControlPanel(QWidget):
             "anime-whisper": 2,
             "gigaam": 3,
             "remote-whisper": 4,
+            "soniox": 5,
         }
         engine_idx = engine_map_idx.get(s.get("asr_engine"), 0)
         self._asr_engine.setCurrentIndex(engine_idx)
@@ -503,7 +535,8 @@ class ControlPanel(QWidget):
             if self._asr_device.itemText(i).startswith(saved_dev):
                 self._asr_device.setCurrentIndex(i)
                 break
-        asr_layout.addWidget(QLabel(t("label_device")), 2, 0)
+        self._asr_device_label = QLabel(t("label_device"))
+        asr_layout.addWidget(self._asr_device_label, 2, 0)
         asr_layout.addWidget(self._asr_device, 2, 1)
         self._asr_device.currentIndexChanged.connect(self._auto_save)
 
@@ -621,7 +654,8 @@ class ControlPanel(QWidget):
         self._hub_combo.addItems([t("hub_modelscope"), t("hub_huggingface")])
         saved_hub = s.get("hub", "ms")
         self._hub_combo.setCurrentIndex(0 if saved_hub == "ms" else 1)
-        asr_layout.addWidget(QLabel(t("label_hub")), 8, 0)
+        self._hub_label = QLabel(t("label_hub"))
+        asr_layout.addWidget(self._hub_label, 8, 0)
         asr_layout.addWidget(self._hub_combo, 8, 1)
         self._hub_combo.currentIndexChanged.connect(self._auto_save)
 
@@ -676,8 +710,78 @@ class ControlPanel(QWidget):
         layout.addWidget(self._remote_group)
         self._remote_group.setVisible(engine_idx == 4)
 
-        mode_group = QGroupBox(t("group_vad_mode"))
-        mode_layout = QVBoxLayout(mode_group)
+        # --- Soniox cloud engine settings (visible only at engine index 5) ---
+        self._soniox_group = QGroupBox(t("group_soniox"))
+        soniox_layout = QGridLayout(self._soniox_group)
+        soniox_layout.addWidget(QLabel(t("label_soniox_api_key")), 0, 0)
+        self._soniox_key_edit = QLineEdit((s.get("soniox_api_key") or "").strip())
+        self._soniox_key_edit.setEchoMode(QLineEdit.EchoMode.Password)
+        self._soniox_key_edit.editingFinished.connect(self._auto_save)
+        soniox_layout.addWidget(self._soniox_key_edit, 0, 1)
+        key_hint = QLabel(t("soniox_api_key_hint"))
+        key_hint.setWordWrap(True)
+        key_hint.setStyleSheet("color: #888; font-size: 11px;")
+        soniox_layout.addWidget(key_hint, 1, 0, 1, 2)
+        soniox_layout.addWidget(QLabel(t("label_soniox_segmentation")), 2, 0)
+        self._soniox_seg_combo = QComboBox()
+        seg_keys = ("soniox_seg_accuracy", "soniox_seg_balanced", "soniox_seg_low_latency")
+        seg_values = ("accuracy", "balanced", "low_latency")
+        self._soniox_seg_combo.addItems([t(k) for k in seg_keys])
+        seg_idx = seg_values.index(
+            s.get("soniox_segmentation", "accuracy")
+        ) if s.get("soniox_segmentation", "accuracy") in seg_values else 0
+        self._soniox_seg_combo.setCurrentIndex(seg_idx)
+        self._soniox_seg_combo.currentIndexChanged.connect(self._auto_save)
+        soniox_layout.addWidget(self._soniox_seg_combo, 2, 1)
+        # Keep language hints independent: a Russian-only lecture should not
+        # pay the ambiguity cost of an English hint, while mixed classes can
+        # enable both. The legacy mixed-language setting is migrated in place
+        # so existing profiles keep their previous behaviour.
+        stored_languages = s.get("soniox_languages")
+        if not isinstance(stored_languages, (list, tuple)):
+            stored_languages = (
+                ["ru", "en"] if s.get("soniox_mixed_language") else ["ru"]
+            )
+        stored_languages = {str(lang).lower() for lang in stored_languages}
+        if not stored_languages & {"ru", "en"}:
+            stored_languages = {"ru"}
+
+        self._soniox_ru_cb = QCheckBox(t("label_soniox_russian"))
+        self._soniox_ru_cb.setToolTip(t("soniox_russian_tooltip"))
+        self._soniox_ru_cb.setChecked("ru" in stored_languages)
+        self._soniox_ru_cb.toggled.connect(self._on_soniox_language_toggled)
+        soniox_layout.addWidget(self._soniox_ru_cb, 3, 0)
+
+        self._soniox_en_cb = QCheckBox(t("label_soniox_english"))
+        self._soniox_en_cb.setToolTip(t("soniox_english_tooltip"))
+        self._soniox_en_cb.setChecked("en" in stored_languages)
+        self._soniox_en_cb.toggled.connect(self._on_soniox_language_toggled)
+        soniox_layout.addWidget(self._soniox_en_cb, 3, 1)
+        soniox_layout.addWidget(QLabel(t("label_soniox_context")), 4, 0)
+        self._soniox_context_edit = QPlainTextEdit(
+            (s.get("soniox_context") or "").strip()
+        )
+        self._soniox_context_edit.setPlaceholderText(t("soniox_context_placeholder"))
+        self._soniox_context_edit.setMaximumHeight(96)
+        self._soniox_context_edit.textChanged.connect(self._auto_save)
+        soniox_layout.addWidget(self._soniox_context_edit, 4, 1)
+        soniox_layout.addWidget(QLabel(t("label_soniox_glossary")), 5, 0)
+        self._soniox_glossary_edit = QPlainTextEdit(
+            (s.get("soniox_glossary") or "").strip()
+        )
+        self._soniox_glossary_edit.setPlaceholderText(t("soniox_glossary_placeholder"))
+        self._soniox_glossary_edit.setMaximumHeight(110)
+        self._soniox_glossary_edit.textChanged.connect(self._auto_save)
+        soniox_layout.addWidget(self._soniox_glossary_edit, 5, 1)
+        cloud_note = QLabel(t("soniox_note_cloud"))
+        cloud_note.setWordWrap(True)
+        cloud_note.setStyleSheet("color: #888; font-size: 11px;")
+        soniox_layout.addWidget(cloud_note, 6, 0, 1, 2)
+        layout.addWidget(self._soniox_group)
+        self._soniox_group.setVisible(engine_idx == 5)
+
+        self._vad_mode_group = QGroupBox(t("group_vad_mode"))
+        mode_layout = QVBoxLayout(self._vad_mode_group)
         self._vad_mode = QComboBox()
         self._vad_mode.addItems([t("vad_silero"), t("vad_energy"), t("vad_disabled")])
         mode_map = {"silero": 0, "energy": 1, "disabled": 2}
@@ -685,13 +789,33 @@ class ControlPanel(QWidget):
         self._vad_mode.currentIndexChanged.connect(self._on_vad_mode_changed)
         self._vad_mode.currentIndexChanged.connect(self._auto_save)
         mode_layout.addWidget(self._vad_mode)
-        layout.addWidget(mode_group)
+        layout.addWidget(self._vad_mode_group)
 
-        silero_group = QGroupBox(t("group_silero_threshold"))
-        silero_layout = QGridLayout(silero_group)
+        self._silero_group = QGroupBox(t("group_silero_threshold"))
+        silero_layout = QGridLayout(self._silero_group)
         self._vad_threshold_slider = QSlider(Qt.Orientation.Horizontal)
-        self._vad_threshold_slider.setRange(0, 100)
+        # Floor at 5%, not 0: at threshold 0.0 `confidence >= threshold` is
+        # always true, so every chunk counts as speech, silence never
+        # accumulates and nothing is ever split on a pause -- the VAD is off
+        # while still looking enabled. A user hunting for a setting that works
+        # on a quiet speaker will find that slider position and be worse off.
+        self._vad_threshold_slider.setRange(5, 100)
+        # Migrate, don't just clamp. setValue() below is wired to the handler
+        # only *after* this point, so a persisted 0.0 would leave the slider
+        # showing 5, the label showing "0%", _current_settings still holding
+        # 0.0 and the engine still running with the VAD effectively off --
+        # four answers to one question. Anyone who has 0.0 on disk got there
+        # hunting for a setting that works on a quiet speaker, which is
+        # exactly the person this floor exists for.
         vad_pct = int(s.get("vad_threshold", 0.5) * 100)
+        if vad_pct < 5:
+            log.info(
+                "Migrating vad_threshold %.2f -> 0.05: below 0.05 every chunk "
+                "counts as speech and no pause ever splits a segment",
+                vad_pct / 100.0,
+            )
+            vad_pct = 5
+            s["vad_threshold"] = 0.05
         self._vad_threshold_slider.setValue(vad_pct)
         self._vad_threshold_slider.valueChanged.connect(self._on_threshold_changed)
         self._vad_threshold_slider.sliderReleased.connect(self._auto_save)
@@ -700,10 +824,10 @@ class ControlPanel(QWidget):
         silero_layout.addWidget(QLabel(t("label_threshold")), 0, 0)
         silero_layout.addWidget(self._vad_threshold_slider, 0, 1)
         silero_layout.addWidget(self._vad_threshold_label, 0, 2)
-        layout.addWidget(silero_group)
+        layout.addWidget(self._silero_group)
 
-        energy_group = QGroupBox(t("group_energy_threshold"))
-        energy_layout = QGridLayout(energy_group)
+        self._energy_group = QGroupBox(t("group_energy_threshold"))
+        energy_layout = QGridLayout(self._energy_group)
         self._energy_slider = QSlider(Qt.Orientation.Horizontal)
         self._energy_slider.setRange(1, 100)
         energy_pm = int(s.get("energy_threshold", 0.03) * 1000)
@@ -715,10 +839,10 @@ class ControlPanel(QWidget):
         energy_layout.addWidget(QLabel(t("label_threshold")), 0, 0)
         energy_layout.addWidget(self._energy_slider, 0, 1)
         energy_layout.addWidget(self._energy_label, 0, 2)
-        layout.addWidget(energy_group)
+        layout.addWidget(self._energy_group)
 
-        timing_group = QGroupBox(t("group_timing"))
-        timing_layout = QGridLayout(timing_group)
+        self._timing_group = QGroupBox(t("group_timing"))
+        timing_layout = QGridLayout(self._timing_group)
         timing_layout.setColumnStretch(0, 1)
         timing_layout.setColumnMinimumWidth(1, 180)
         self._min_speech = QDoubleSpinBox()
@@ -761,8 +885,6 @@ class ControlPanel(QWidget):
         timing_layout.addWidget(QLabel(t("label_silence_dur")), 3, 0)
         timing_layout.addWidget(self._silence_duration, 3, 1)
 
-        from PyQt6.QtWidgets import QCheckBox
-
         self._incremental_asr_cb = QCheckBox(t("label_incremental_asr"))
         self._incremental_asr_cb.setToolTip(t("incremental_asr_tooltip"))
         self._incremental_asr_cb.setChecked(s.get("incremental_asr", False))
@@ -779,10 +901,11 @@ class ControlPanel(QWidget):
         self._interim_interval_spin.valueChanged.connect(self._on_timing_changed)
         self._interim_interval_spin.valueChanged.connect(self._auto_save)
         self._incremental_asr_cb.toggled.connect(self._interim_interval_spin.setEnabled)
-        timing_layout.addWidget(QLabel(t("label_interim_interval")), 5, 0)
+        self._interim_interval_label = QLabel(t("label_interim_interval"))
+        timing_layout.addWidget(self._interim_interval_label, 5, 0)
         timing_layout.addWidget(self._interim_interval_spin, 5, 1)
 
-        layout.addWidget(timing_group)
+        layout.addWidget(self._timing_group)
 
         layout.addStretch()
         return widget
@@ -1030,7 +1153,9 @@ class ControlPanel(QWidget):
 
         text_layout.addWidget(QLabel(t("label_original_font_size")), 1, 0)
         self._orig_font_size = QSpinBox()
-        self._orig_font_size.setRange(6, 24)
+        # 24 was the ceiling before window scaling: the translation base ships
+        # at 23, so a user could not raise it. Old values stay valid.
+        self._orig_font_size.setRange(6, 32)
         self._orig_font_size.setValue(
             s.get("original_font_size", DEFAULT_STYLE["original_font_size"])
         )
@@ -1063,7 +1188,7 @@ class ControlPanel(QWidget):
 
         text_layout.addWidget(QLabel(t("label_translation_font_size")), 4, 0)
         self._trans_font_size = QSpinBox()
-        self._trans_font_size.setRange(6, 24)
+        self._trans_font_size.setRange(6, 32)
         self._trans_font_size.setValue(
             s.get("translation_font_size", DEFAULT_STYLE["translation_font_size"])
         )
@@ -1081,12 +1206,13 @@ class ControlPanel(QWidget):
         )
         text_layout.addWidget(self._trans_color_btn, 5, 1)
 
-        text_layout.addWidget(QLabel(t("label_timestamp_color")), 6, 0)
-        self._ts_color_btn = self._make_color_btn(
-            s.get("timestamp_color", DEFAULT_STYLE["timestamp_color"])
-        )
-        self._ts_color_btn.clicked.connect(lambda: self._pick_color(self._ts_color_btn))
-        text_layout.addWidget(self._ts_color_btn, 6, 1)
+        # Scales the two sizes above with the overlay's width; the sizes are
+        # then the values used at the reference width (620px).
+        self._scale_with_window = QCheckBox(t("label_scale_with_window"))
+        self._scale_with_window.setChecked(s.get("scale_with_window", True))
+        self._scale_with_window.toggled.connect(self._on_style_value_changed)
+        self._scale_with_window.toggled.connect(self._auto_save)
+        text_layout.addWidget(self._scale_with_window, 6, 0, 1, 2)
 
         layout.addWidget(text_group)
 
@@ -1145,7 +1271,7 @@ class ControlPanel(QWidget):
             "translation_font_size": self._trans_font_size.value(),
             "original_color": self._orig_color_btn.property("hex_color"),
             "translation_color": self._trans_color_btn.property("hex_color"),
-            "timestamp_color": self._ts_color_btn.property("hex_color"),
+            "scale_with_window": self._scale_with_window.isChecked(),
             "window_opacity": self._window_opacity.value(),
         }
 
@@ -1174,10 +1300,7 @@ class ControlPanel(QWidget):
         self._trans_color_btn.setStyleSheet(
             f"background-color: {s['translation_color']}; border: 1px solid #888; border-radius: 3px;"
         )
-        self._ts_color_btn.setProperty("hex_color", s["timestamp_color"])
-        self._ts_color_btn.setStyleSheet(
-            f"background-color: {s['timestamp_color']}; border: 1px solid #888; border-radius: 3px;"
-        )
+        self._scale_with_window.setChecked(s.get("scale_with_window", True))
         self._window_opacity.setValue(s["window_opacity"])
 
     def _on_preset_changed(self, index):
@@ -1223,6 +1346,7 @@ class ControlPanel(QWidget):
             self._trans_font_combo,
             self._orig_font_size,
             self._trans_font_size,
+            self._scale_with_window,
             self._window_opacity,
         ):
             w.blockSignals(block)
@@ -1310,6 +1434,25 @@ class ControlPanel(QWidget):
         ts_open_btn.clicked.connect(self._open_transcripts_folder)
         ts_layout.addWidget(ts_open_btn)
         layout.addWidget(ts_group)
+
+        audio_group = QGroupBox(t("group_recording_audio"))
+        audio_layout = QHBoxLayout(audio_group)
+        self._record_audio_cb = QCheckBox(t("label_record_session_audio"))
+        self._record_audio_cb.setChecked(s.get("record_session_audio", True))
+        self._record_audio_cb.toggled.connect(self._auto_save)
+        audio_layout.addWidget(self._record_audio_cb)
+        audio_layout.addWidget(QLabel(t("label_recording_quality")))
+        self._recording_quality_combo = QComboBox()
+        self._recording_quality_combo.addItem(t("recording_quality_high"), "high")
+        self._recording_quality_combo.addItem(t("recording_quality_speech"), "speech")
+        idx = self._recording_quality_combo.findData(
+            s.get("recording_quality", "high")
+        )
+        self._recording_quality_combo.setCurrentIndex(max(0, idx))
+        self._recording_quality_combo.currentIndexChanged.connect(self._auto_save)
+        audio_layout.addWidget(self._recording_quality_combo)
+        audio_layout.addStretch()
+        layout.addWidget(audio_group)
 
         top_row = QHBoxLayout()
         self._cache_total = QLabel("")
@@ -1493,8 +1636,44 @@ class ControlPanel(QWidget):
         self._whisper_group.setVisible(index == 0)
         is_funasr = index == 1
         is_gigaam = index == 3
+        # Soniox streams continuous audio to the cloud: every local-engine
+        # knob below would mislead the user into tuning parameters that have
+        # no effect on the cloud path, so they are hidden, not just disabled.
+        is_soniox = index == 5
+        if hasattr(self, "_soniox_group"):
+            self._soniox_group.setVisible(is_soniox)
+        if hasattr(self, "_vad_mode_group"):
+            self._vad_mode_group.setVisible(not is_soniox)
+        if hasattr(self, "_silero_group"):
+            self._silero_group.setVisible(not is_soniox)
+        if hasattr(self, "_energy_group"):
+            self._energy_group.setVisible(not is_soniox)
+        if hasattr(self, "_timing_group"):
+            self._timing_group.setVisible(not is_soniox)
+        if hasattr(self, "_incremental_asr_cb"):
+            self._incremental_asr_cb.setVisible(not is_soniox)
+        if hasattr(self, "_interim_interval_spin"):
+            interim_visible = not is_soniox
+            if hasattr(self, "_interim_interval_label"):
+                self._interim_interval_label.setVisible(interim_visible)
+            self._interim_interval_spin.setVisible(interim_visible)
+        if hasattr(self, "_asr_device"):
+            self._asr_device.setVisible(not is_soniox)
+            if hasattr(self, "_asr_device_label"):
+                self._asr_device_label.setVisible(not is_soniox)
+        if hasattr(self, "_hub_combo"):
+            self._hub_combo.setVisible(not is_soniox)
+            if hasattr(self, "_hub_label"):
+                self._hub_label.setVisible(not is_soniox)
+        if is_soniox and hasattr(self, "_asr_lang"):
+            self._asr_lang.setEnabled(False)
+            ru_idx = self._asr_lang.findData("ru")
+            if ru_idx >= 0:
+                self._asr_lang.blockSignals(True)
+                self._asr_lang.setCurrentIndex(ru_idx)
+                self._asr_lang.blockSignals(False)
         if hasattr(self, "_asr_lang"):
-            self._asr_lang.setEnabled(not is_gigaam)
+            self._asr_lang.setEnabled(not (is_gigaam or is_soniox))
             if is_gigaam:
                 ru_idx = self._asr_lang.findData("ru")
                 if ru_idx >= 0:
@@ -1742,6 +1921,11 @@ class ControlPanel(QWidget):
                 active = self._current_settings.get("active_model", 0)
                 if isinstance(active, int) and 0 <= active < len(models):
                     model = models[active]
+            # The service may have started on a port other than the entry's
+            # (the configured one was occupied). The entry must follow, or
+            # the translator keeps targeting the old endpoint while the
+            # health monitor happily probes the new one.
+            sync_managed_endpoint(model, self._mlx_manager.port)
             _save_settings(self._current_settings)
             self._refresh_model_list()
             self._emit_models_list_changed()
@@ -1798,6 +1982,18 @@ class ControlPanel(QWidget):
             )
         self._update_mlx_controls()
 
+    def showEvent(self, event):
+        # Re-opening the panel revokes a close that closeEvent deferred while
+        # an MLX task was still running. Without this, the pending flag
+        # outlives the user's change of mind and the panel the user just
+        # opened either stays greyed out (setEnabled(False) is only undone
+        # here) or is closed out from under them moments later -- the two
+        # ways "I clicked Settings and it vanished" was reported.
+        if getattr(self, "_close_after_mlx_task", False):
+            self._close_after_mlx_task = False
+            self.setEnabled(True)
+        super().showEvent(event)
+
     def closeEvent(self, event):
         # The records page's summary worker must stop before the widget tree
         # it reports to goes away.
@@ -1831,6 +2027,33 @@ class ControlPanel(QWidget):
         self._mlx_status_cache = state
         if changed:
             self._update_mlx_controls()
+        self._sync_mlx_endpoint_if_moved()
+
+    def _sync_mlx_endpoint_if_moved(self):
+        """Persist a runtime port move into the active HY-MT entry.
+
+        The manager learns the port the service really runs on either by
+        starting it (task success) or by reading the owned process's command
+        line (health probe adoption). The entry -- and with it the
+        translator's api_base -- must follow, or translations keep hitting
+        an endpoint nothing listens on while the monitor reports healthy.
+        """
+        models = self._current_settings.get("models", [])
+        active = self._current_settings.get("active_model")
+        if not (isinstance(active, int) and 0 <= active < len(models)):
+            return
+        model = models[active]
+        if not is_hy_mt_model(model):
+            return
+        if sync_managed_endpoint(model, self._mlx_manager.port):
+            _save_settings(self._current_settings)
+            self._refresh_model_list()
+            self._emit_models_list_changed()
+            self.model_changed.emit(model)
+            log.info(
+                "Managed MLX endpoint moved to port %s; settings updated",
+                self._mlx_manager.port,
+            )
 
     def request_mlx_health_check(self):
         if self._mlx_health_task is not None and self._mlx_health_task.isRunning():
@@ -1885,7 +2108,8 @@ class ControlPanel(QWidget):
             return
         self._close_after_mlx_task = False
         self.setEnabled(True)
-        QTimer.singleShot(0, self.close)
+        if self.isVisible():
+            QTimer.singleShot(0, self.close)
 
     def _emit_models_list_changed(self):
         models = self._current_settings.get("models", [])
@@ -2079,6 +2303,21 @@ class ControlPanel(QWidget):
         self._current_settings["incremental_asr"] = self._incremental_asr_cb.isChecked()
         self._current_settings["interim_interval"] = round(self._interim_interval_spin.value(), 2)
 
+    def _on_soniox_language_toggled(self, checked: bool):
+        """Keep at least one Soniox hint enabled and persist the pair."""
+        if (
+            not checked
+            and not self._soniox_ru_cb.isChecked()
+            and not self._soniox_en_cb.isChecked()
+        ):
+            sender = self.sender()
+            if sender is not None:
+                sender.blockSignals(True)
+                sender.setChecked(True)
+                sender.blockSignals(False)
+            return
+        self._auto_save()
+
     def _on_ui_lang_changed(self, index):
         lang = "en" if index == 0 else "zh"
         self._current_settings["ui_lang"] = lang
@@ -2131,7 +2370,9 @@ class ControlPanel(QWidget):
 
     def _apply_settings(self):
         self._current_settings["asr_language"] = (
-            "ru" if self._asr_engine.currentIndex() == 3 else self._get_asr_lang_code()
+            "ru"
+            if self._asr_engine.currentIndex() in (3, 5)
+            else self._get_asr_lang_code()
         )
         engine_map = {
             0: "whisper",
@@ -2139,10 +2380,38 @@ class ControlPanel(QWidget):
             2: "anime-whisper",
             3: "gigaam",
             4: "remote-whisper",
+            5: "soniox",
         }
         self._current_settings["asr_engine"] = engine_map.get(
             self._asr_engine.currentIndex(), "whisper"
         )
+        if hasattr(self, "_soniox_key_edit"):
+            self._current_settings["soniox_api_key"] = (
+                self._soniox_key_edit.text().strip()
+            )
+            self._current_settings["soniox_context"] = (
+                self._soniox_context_edit.toPlainText().strip()
+            )
+            self._current_settings["soniox_glossary"] = (
+                self._soniox_glossary_edit.toPlainText().strip()
+            )
+            seg_values = ("accuracy", "balanced", "low_latency")
+            self._current_settings["soniox_segmentation"] = seg_values[
+                self._soniox_seg_combo.currentIndex()
+            ]
+            languages = [
+                lang for lang, checkbox in (
+                    ("ru", self._soniox_ru_cb),
+                    ("en", self._soniox_en_cb),
+                ) if checkbox.isChecked()
+            ]
+            if not languages:
+                languages = ["ru"]
+            self._current_settings["soniox_languages"] = languages
+            # Retain the legacy key for older app versions and old plugins.
+            self._current_settings["soniox_mixed_language"] = (
+                set(languages) == {"ru", "en"}
+            )
         self._current_settings["funasr_model"] = self._selected_funasr_model()
         if hasattr(self, "_remote_url_edit"):
             url = self._remote_url_edit.text().strip()
@@ -2189,12 +2458,19 @@ class ControlPanel(QWidget):
             self._current_settings["auto_save_transcript"] = (
                 self._auto_save_transcript_cb.isChecked()
             )
+        if hasattr(self, "_record_audio_cb"):
+            self._current_settings["record_session_audio"] = (
+                self._record_audio_cb.isChecked()
+            )
+            self._current_settings["recording_quality"] = (
+                self._recording_quality_combo.currentData() or "high"
+            )
         if hasattr(self, "_style_preset"):
             self._current_settings["style"] = self._collect_style()
         safe = {
             k: v
             for k, v in self._current_settings.items()
-            if k not in ("models", "system_prompt")
+            if k not in ("models", "system_prompt", "soniox_api_key")
         }
         log.info(f"Settings applied: {safe}")
         self.settings_changed.emit(dict(self._current_settings))

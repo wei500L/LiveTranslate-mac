@@ -14,6 +14,7 @@ from platform_fonts import (
 )
 from platform_config import normalize_config
 from torch_backend import normalize_device
+import platform_app
 import platform_clickthrough
 import torch_backend
 import platform_permissions
@@ -295,3 +296,123 @@ def test_worker_routes_mps_to_torch_but_cpu_int8_to_whisper(monkeypatch, tmp_pat
     assert calls["whisper"]["device"] == "cpu"
     assert calls["whisper"]["compute_type"] == "int8"
     assert calls["funasr"]["device"] == "mps"
+
+
+def test_visible_on_all_spaces_moves_only_the_collection_behavior(monkeypatch):
+    """A window shown while another app is fullscreen is created on the Space
+    behind it: Qt reports it visible, the user sees nothing. Pinning fixes
+    the Spaces and nothing else -- a settings window must not end up staying
+    on top of the video."""
+    native = _FakePinnableWindow()
+    window = SimpleNamespace(windowHandle=lambda: native)
+    monkeypatch.setattr(platform_clickthrough.sys, "platform", "darwin")
+
+    assert platform_clickthrough.set_visible_on_all_spaces(window, True)
+    assert native.spaces_behavior & (1 << 0)  # can join all Spaces
+    assert native.spaces_behavior & (1 << 8)  # visible over fullscreen apps
+    assert native.level == 0  # left at the normal level, not raised
+    assert native.hides_on_deactivate is None
+
+    assert platform_clickthrough.set_visible_on_all_spaces(window, False)
+    assert native.spaces_behavior & ((1 << 0) | (1 << 8)) == 0
+
+
+def test_visible_on_all_spaces_is_a_noop_off_macos(monkeypatch):
+    monkeypatch.setattr(platform_clickthrough.sys, "platform", "win32")
+    window = SimpleNamespace(windowHandle=lambda: None, winId=lambda: 1)
+    assert platform_clickthrough.set_visible_on_all_spaces(window, True) is False
+
+
+def test_visible_on_all_spaces_survives_missing_native_window(monkeypatch):
+    monkeypatch.setattr(platform_clickthrough.sys, "platform", "darwin")
+    window = SimpleNamespace(windowHandle=lambda: None)
+    assert platform_clickthrough.set_visible_on_all_spaces(window, True) is False
+
+
+class _FakePanelWindow:
+    """Records the Qt calls present_window() is expected to make."""
+
+    def __init__(self, minimized=False):
+        self.minimized = minimized
+        self.calls = []
+
+    def isMinimized(self):
+        return self.minimized
+
+    def show(self):
+        self.calls.append("show")
+
+    def showNormal(self):
+        self.calls.append("showNormal")
+
+    def raise_(self):
+        self.calls.append("raise_")
+
+    def activateWindow(self):
+        self.calls.append("activateWindow")
+
+
+def test_present_window_restores_a_minimized_window(monkeypatch):
+    """isVisible() is True for a minimized window, so show() alone left it
+    minimized: the user clicked Settings and nothing appeared."""
+    monkeypatch.setattr(platform_app.sys, "platform", "win32")
+    window = _FakePanelWindow(minimized=True)
+    platform_app.present_window(window)
+    assert window.calls == ["showNormal", "raise_", "activateWindow"]
+
+
+def test_present_window_shows_a_hidden_window_and_activates_it(monkeypatch):
+    monkeypatch.setattr(platform_app.sys, "platform", "win32")
+    window = _FakePanelWindow()
+    platform_app.present_window(window)
+    assert window.calls == ["show", "raise_", "activateWindow"]
+
+
+def test_present_window_still_shows_when_a_later_step_fails(monkeypatch):
+    """Everything past show() is best-effort: a missing native handle must
+    not cost the user the window that has already been shown."""
+    monkeypatch.setattr(platform_app.sys, "platform", "win32")
+
+    class _Hostile(_FakePanelWindow):
+        def raise_(self):
+            raise RuntimeError("window handle is not available")
+
+    window = _Hostile()
+    platform_app.present_window(window)
+    assert "show" in window.calls
+    assert window.calls[-1] == "activateWindow"
+
+
+class _FakeWindowState:
+    def __init__(self, visible, minimized, active):
+        self._state = (visible, minimized, active)
+
+    def isVisible(self):
+        return self._state[0]
+
+    def isMinimized(self):
+        return self._state[1]
+
+    def isActiveWindow(self):
+        return self._state[2]
+
+
+def test_window_is_foreground_rejects_every_state_the_user_cannot_see():
+    """The toggle key. A visible-but-covered panel must read as "not in
+    front", or the click hides the window the user is asking for."""
+    assert platform_app.window_is_foreground(_FakeWindowState(True, False, True))
+    # Hidden -> present.
+    assert not platform_app.window_is_foreground(_FakeWindowState(False, False, False))
+    # Minimized -> present (isVisible() is still True here).
+    assert not platform_app.window_is_foreground(_FakeWindowState(True, True, False))
+    # Visible but behind another application, or on another Space -> present.
+    assert not platform_app.window_is_foreground(_FakeWindowState(True, False, False))
+
+
+def test_present_window_can_keep_a_focus_shy_window_unactivated(monkeypatch):
+    """The overlay must never take focus from the video it translates, so it
+    asks for the minimize restore without the activation step."""
+    monkeypatch.setattr(platform_app.sys, "platform", "win32")
+    window = _FakePanelWindow(minimized=True)
+    platform_app.present_window(window, activate=False)
+    assert window.calls == ["showNormal", "raise_"]

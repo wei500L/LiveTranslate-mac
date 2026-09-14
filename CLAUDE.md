@@ -20,7 +20,7 @@ start.bat                           # Windows
 ./start.sh                          # macOS
 ```
 
-Tests: `python -m pytest -q` (466 offline tests, no network or model downloads; 4 skipped — asr_server's stack-absent case, whose app-configured counterpart runs in its place, and the three bundle tests that need a project `.venv`). This must pass before any commit — CI runs the same command on macOS arm64 for every pull request and push to main, plus a light-recipe Windows smoke job covering the Windows-only share, and every release-producing job gates on it.
+Tests: `python -m pytest -q` (501 offline tests, no network or model downloads). Skips are environment-dependent: in a project `.venv` with the serving stack installed exactly one skips (`test_config_surfaces`'s stack-absent case, whose app-configured counterpart runs in its place); on a bare interpreter the three bundle tests that need a project `.venv` skip as well. This must pass before any commit — CI runs the same command on macOS arm64 for every pull request and push to main, plus a light-recipe Windows smoke job covering the Windows-only share, and every release-producing job gates on it.
 
 Linter: run `python -m ruff check --select F,E,W --ignore E501,E402 *.py` — ruff is installed in the project venv. E402 is intentionally ignored because `main.py` requires torch before PyQt6. On a machine where ruff is missing, fall back to `python -m compileall -q .` plus the test suite, and say so rather than reporting a lint pass that did not happen.
 
@@ -114,6 +114,72 @@ Additional ASR backends and the remote path:
 asr_gigaam.py    GigaAM-v3 backend (ai-sage, Russian-only, fixed language "ru")
 asr_remote.py    RemoteASREngine client — binary protocol to a separate ASR server
 asr_server.py    Standalone FastAPI ASR server (see REMOTE_ASR.md)
+
+Soniox cloud realtime engine (ru -> zh, streaming, bypasses local VAD):
+
+```
+soniox_accumulator.py  Pure token state machine (no I/O/SDK/Qt deps): provisional
+                       tokens REPLACE (never append-duplicate), final tokens append
+                       exactly once routed by translation_status (original/none ->
+                       original side, translation -> zh side), `<end>` never displayed
+                       and commits the segment exactly once (multiple <end> per event
+                       commit multiple segments; a second on empty state is a no-op),
+                       finished commits trailing finals exactly once (_tail_committed),
+                       flush() is the hard boundary (pause/ending), reset() drops all.
+soniox_client.py       SonioxServiceManager: supervisor thread (connect/receive/
+                       reconnect) + send thread (bounded PCM16 deque). Key invariant:
+                       a chunk is popped from the deque only AFTER send_byte_chunk
+                       returns — reconnect replays the unsent remainder once, never
+                       re-sends sent audio. feed() never blocks/raises (drop-oldest
+                       + counted metric beyond ~10s buffered). Generation is snapshotted
+                       at session start; every dispatched result carries it, so
+                       bump_generation() retroactively invalidates the whole in-flight
+                       session (capturing it per-event made the guard a tautology).
+                       The send runs OUTSIDE the manager lock (phase-2 unlock) — a slow
+                       socket must never block feed(). API key redaction: mask_key()
+                       output is the only logged form; redact_key() strips the key from
+                       exception text (SDK exceptions can embed the request URL).
+asr_soniox.py          SonioxASREngine: the in-process ASRClient-compatible shim
+                       (mirrors asr_remote.RemoteASREngine — status/pid=None/no-op
+                       setters). Streaming-only: transcribe() raises (unreachable —
+                       _run_asr is bypassed); audio flows via manager.feed() from the
+                       capture loop.
+```
+
+main.py Soniox integration: the capture loop branches INSIDE the producer fence
+right after the session-end gate check (`_soniox_engine_active()` -> `_soniox_feed`
+-> continue; the local VAD path is untouched for local engines — quiet audio goes
+to the cloud exactly like loud speech). Commits go through `_commit_soniox_segment`
+(the dedicated path — NOT _process_segment_text, which would re-submit to the
+translation executor): mirrors the boundary-fence section with a `_soniox_anchor`
+(generation, expected_session) set by begin_recording_session/_activate_asr and
+cleared by end/stop; write_original -> register/adopt -> write_translation /
+finalize_no_translation -> release in one fenced section; `_soniox_committed`
+msg_id set is the exactly-once guard against replayed commits (the writer accepts
+writes by msg_id without dedup). ENDING: after the gate goes up, a bounded
+`manager.finalize_for_end(deadline)` (sharing the 30s budget) drains the last
+segment before end_session(). pause()/resume() delegate to manager.pause/resume
+(SDK finalize on pause — no sentence splicing across the pause); stop() calls
+finish_and_drain then shutdown, all bounded. Overlay: one live card per segment
+(`_SonioxSink.on_live` allocates once, `update_live` updates in place, one-frame
+batched flush — never a card per token); `provider="soniox"` on ChatMessage selects the
+cloud no-translation hint (`soniox_no_translation` vs `same_language`) and nothing
+else — latency is never displayed for any engine (see the message-card paragraph
+below); MonitorBar shows the five-state connection indicator. Per-segment cloud
+timing is recorded in the log, not the UI: `_SonioxSink.on_live` stamps
+`_soniox_segment_started_at` / `_soniox_last_token_at` (monotonic) as the segment's
+provisional text arrives, and `_commit_soniox_segment` consumes them through
+`_take_soniox_timing()` into its `Soniox segment [ru] (live …, endpoint +…)` line —
+a segment with no provisionals logs no timing rather than a fabricated zero.
+Settings:
+soniox_api_key (env SONIOX_API_KEY wins; filtered from the panel's settings log),
+soniox_context, soniox_segmentation (accuracy/balanced/low_latency endpoint
+presets; context/segmentation changes apply via manager.apply_config — a graceful
+reconnect — without a full engine reload; a key change is a signature change and
+reloads). Language locks: source ru, target zh (GigaAM lock pattern). Offline
+tests: tests/test_soniox_{accumulator,client,pipeline,ui,sdk_contract}.py; the
+gated live test (SONIOX_API_KEY + RUN_SONIOX_LIVE_TEST=1) is the only network
+toucher.
 ```
 
 Cross-cutting modules:
@@ -724,9 +790,76 @@ DragHandle is a 2-row header bar:
 
 MonitorBar displays: ASR device, CPU/RAM/GPU usage, ASR/TL counts, token usage with cost estimation (¥/$ based on UI language).
 
+Message cards (`ChatMessage`) are **state-driven, one render path** for both
+chains — local and cloud. `update_streaming` / `set_translation` / `update_live` /
+`apply_style` only mutate state fields (`_streaming_partial`, `_live_provisional`,
+`_settled`, `_translated`, `_original`); a single `_render()` derives both lines
+through `_original_line_html()` + `_translation_line_html()`. There is no
+`_build_header_html` and no per-path HTML: the cloud-only visual (the dim colors)
+is driven by `_live_provisional`, which only `update_live` sets, so local cards
+never dim. No cursor glyph: two were shipped (a `▍` block, then a thin `│` bar)
+and both were removed — any trailing glyph crowds the last letter and, being
+part of the same text run, is what wraps onto a new line first; provisional text
+is carried by the dim color alone. `_decorate(escaped_text, role)` is the single
+extension point for per-role decoration (identity today; terminology
+highlighting would land there). The layout is a two-line hierarchy — small
+secondary original above, large high-contrast translation below
+(`original_font_size` 12 / `translation_font_size` 23 at the reference width,
+spacing 4); every preset must keep `original_color != translation_color` and
+`original_font_size < translation_font_size` at every scale
+(tests/test_overlay_style.py guards both).
+
+**Font sizes scale with the window width** (`scale_with_window`, default on).
+`font_scale_for_width()` maps width to a factor clamped to
+[`FONT_SCALE_MIN` 0.7, `FONT_SCALE_MAX` 1.8] against
+`FONT_SCALE_REFERENCE_WIDTH` 620 (the width the overlay opens at, so the
+settings numbers are what you see at the default size); `scaled_font_size()`
+rounds half up — never `round()`, whose banker's rounding can stall or shrink a
+size as the window grows. The overlay keeps `_base_style` (what the user
+configured, what gets persisted) separate from `_font_scale` /
+`_scaled_sizes` (derived): **`_applied_style` and `ChatMessage._current_style`
+must always hold the BASE style.** A derived value reaching either one makes
+each rescale multiply an already-scaled size (23 → 41 → 74) and makes the next
+panel auto-save find the styles unequal, re-running the full path. That full
+path costs ~70ms for 50 cards — and the cost is *not* the fonts (measured
+0.1ms for 50 cards' `setFont`; `_render` is ~0.0ms): it is the two
+`setStyleSheet` calls (whole-subtree re-polish) and `setWindowOpacity`
+(compositor on macOS). `ChatMessage.apply_font_scale()` therefore touches fonts
+only, and `_apply_font_scale()` never re-runs the QSS/opacity work.
+`_schedule_font_scale()` (from `resizeEvent`, behind a 150ms single-shot,
+deliberately not `_pos_save_timer`) compares *derived sizes*, not factors — the
+factor moves continuously, but a 23pt line only moves a point after ~27px of
+width, so an ordinary drag never even arms the timer. The compact-mode height
+animation preserves width, so it cannot trigger a rescale at all. New cards pick
+the scale up in `_append_card` (the single creation entry) rather than from a
+class variable, which would leak into tests that construct cards directly.
+
+**Timestamps and latency chips are not displayed** — for any engine. Timestamps
+survive in the model (`_timestamp`) for `export_messages` and in the transcript
+record; local ASR/translation latency lives in the PERF log
+(`_record_latency`), cloud per-segment timing in the `Soniox segment …` log line.
+`provider` is still a constructor field but only selects the settled
+no-translation hint. Consequence: window-level compact mode no longer changes
+card rendering at all (the removed-`_compact_mode` class variable is gone), so
+`_on_mode_changed` only hides the MonitorBar and re-emits.
+
+Removed style keys are dropped at load and hierarchy fields still holding a
+superseded shipped value are upgraded by `migrate_style()` (called from
+`control_panel.migrate_style_settings()` inside `_load_saved_settings`, then
+persisted). It must run at *load* time, before the panel fills its style
+controls: those write the whole dict back on the next auto-save, so a
+render-time-only migration would be reverted by the next settings save. A field
+the user actually customized keeps its value — only values in the superseded
+sets for that preset are upgraded (`_SUPERSEDED_STYLE_VALUES` /
+`_SUPERSEDED_PRESET_VALUES`). Those are **sets of every value ever shipped and
+since retuned** (11/14, 10/15 and 12/17 for the font sizes), not just the
+pre-redesign one: retuning the hierarchy again means adding the outgoing value to the set,
+or a style saved by the interim build is frozen at it. tests/test_overlay_style.py
+guards the table against a preset being retuned without extending it.
+
 Style system:
 - `DEFAULT_STYLE` and `STYLE_PRESETS` defined in `subtitle_overlay.py` — 14 presets including terminal themes (Dracula, Nord, Monokai, Solarized, Gruvbox, Tokyo Night, Catppuccin, One Dark, Everforest, Kanagawa)
-- Default style is high-contrast (pure black background, white translation text, 14pt)
+- Default style is high-contrast (pure black background, white translation text, 15pt)
 - Original and translation text have independent `font_family` fields (`original_font_family`, `translation_font_family`)
 - `SubtitleOverlay.apply_style(style)` updates container/header backgrounds, window opacity, and rebuilds all message HTML
 - Style dict stored in `user_settings.json` under `"style"` key; forwarded via `settings_changed` signal → `main.py` → `overlay.apply_style()`
@@ -735,7 +868,7 @@ Style system:
 Key overlay features:
 - **Top-most**: Toggles `WindowStaysOnTopHint`; requires `setWindowFlags()` + `show()` to take effect
 - **Click-through**: Uses Win32 `WS_EX_TRANSPARENT` on the scroll area while keeping header interactive
-- **Auto-scroll**: Controls whether new messages/translations auto-scroll to bottom
+- **Auto-scroll**: Controls whether new messages/translations auto-scroll to bottom. The view sticks to the bottom by *following the scrollbar's range change* (`_follow_bottom` / `_scroll_max`), so content that grows after layout is still followed; the follow is dropped when the user scrolls up, and `_follow_bottom` is compared against the last known maximum — never the live one, which our own `setValue` would have already grown inside the `rangeChanged` handler
 - **Model combo**: Populated from `user_settings.json` models list; switching emits `model_switch_requested` signal
 - **Target Language combo**: Emits `target_language_changed`; synced from settings on startup
 - **Compact mode animation**: Toggles between full and minimumHeight with 200ms size animation; uses `frameGeometry()` for actual window size to avoid Windows MINMAXINFO mismatch; skips animation when height difference < 10px
@@ -776,11 +909,21 @@ Continuous speech is processed incrementally to reduce latency (enabled by `incr
 
 ### VAD Behavior
 
-- **Progressive silence**: Buffer越长接受越短的停顿切分 (<3s=full, 3-6s=half, 6-10s=quarter of silence_limit)
-- **Adaptive silence**: Tracks recent pause durations, sets threshold to P75 × 1.2, auto-adjusts between 0.3s~2.0s
+- **Progressive silence**: Buffer越长接受越短的停顿切分. `_progressive_tiers` is `(min_buffer_seconds, multiplier at or above it)` and the *last* tier the buffer reaches wins, so the real ranges are **<6s=full, 6-10s=half, ≥10s=quarter**. The comments used to say <3s/3-6s/6-10s, one tier off from what the loop does; the measured behaviour is the one the censored-sample guard below is tuned to, so the wording was what got fixed.
+- **Adaptive silence**: Tracks recent pause durations, sets threshold to P75 × 1.2, auto-adjusts between 0.3s~2.0s. Two sampling rules make that estimate sound, and both are load-bearing:
+  - A pause that *reaches* the limit ends the segment, so its true length is never observed — it is recorded anyway, as a right-censored observation *at* the limit (`process_chunk`'s silence-split branch, before the three exits). Sampling only pauses that ended before the limit truncated the history at the very value it was used to compute, so P75 sat below the limit by construction and every update ratcheted it down — measured in the field: 0.80 → 0.50 → 0.46 → 0.42 → 0.38 → 0.35 → 0.31 → 0.30s (near-monotonic; one 0.38→0.42 recovery), pinned to `_adaptive_min`, until a 0.3s breath cut every sentence. Cuts that a *progressive tier* shortened are exempt (that is our own latency policy, not the speaker's rhythm).
+  - **Both kinds of observation are recorded in both silence modes; only `_update_adaptive_limit()` is gated on "auto".** Recording the censored one under `auto` while the exact one was recorded unconditionally left a spell in fixed mode filling `_pause_history` with sub-limit samples only — the same right-truncated sample that causes the collapse — so the first update after the user flipped the combo back to auto dropped the limit in a single step (measured 1.00s → 0.32s). The original bug, reachable from a dropdown.
+  - Pauses shorter than `_MIN_PAUSE_SAMPLE_SECONDS` (0.25s) are not sampled at all. Continuous speech is full of 0.1-0.2s intra-word dips which outnumber real sentence pauses ~2:1; sampling them made P75 describe the gaps *between words*. Measured against a known pause distribution, this floor alone is worth 1.4s of estimate.
+  - Verified on a 47-minute synthetic lecture: the limit now settles at 1.15-1.50s and stays there, against a true pause P75 of 1.45s. Before the fix it pinned to 0.29s inside the first minute and stayed for the whole session.
+  - **The estimator is not biased low, and the tier exemption is not cosmetic.** Right-censoring at the limit is self-correcting, because once ≥25% of pauses reach `L` the sample P75 *is* `L` and the update multiplies it by 1.2 — the fixed point is `L* = 1.2 × P75(pauses ≥ _MIN_PAUSE_SAMPLE_SECONDS)`, approached from below. The left truncation at 0.25s pushes the *other* way and much harder (it removes the majority of observations, raising the surviving P75 substantially). In a closed-loop simulation of the two together, recording every censored cut runs the limit to the `_adaptive_max` 2.0s ceiling; it is the progressive-tier exemption dropping the long-buffer cuts that lands it at the measured 1.2-1.5s. Do not remove that exemption as redundant — it is what holds the limit down. A survival-analysis (Kaplan-Meier) estimator is *not* the fix: it would give an unbiased P75 and leave the 1.2 multiplier equally arbitrary, and with ≥25% of the mass censored at a single `L` the survivor function is unidentifiable above `L`, which is the region of interest.
 - **Backtrack split**: Max duration时回溯smoothed confidence history找最低谷切分，remainder保留到下一段
-- **Speech density filter**: `_flush_segment()` discards segments where <25% of chunks are above confidence threshold
-- **Short segment merge**: Segments below `min_speech_duration` are NOT discarded — VAD does a soft-reset (`_is_speaking=False`) but keeps the buffer, which naturally merges with the next speech onset
+- **Noise filter**: `_flush_segment()` discards a segment only when **two** judgements agree it is noise: measured voiced duration below `_MIN_VOICED_SECONDS` (0.15s) **and** the old `density < 0.25` ratio. Requiring both makes "never stricter than the ratio rule it replaced" a property of the code rather than a hope, and each rescues what the other punishes:
+  - The **absolute floor** rescues the long sparse segment a ratio punishes — one sentence followed by a long board-writing pause measures 18-24% voiced, and `density < 0.25` alone threw the whole segment away so nothing reached ASR (22 such discards in the field, one holding 1.12s of speech). Lowering the VAD threshold could not rescue it either (0.5 → 0.05 moved density only 18% → 24%).
+  - The **ratio** rescues the short dense segment an absolute floor punishes. The two rules cross at exactly 1.0s of buffer, and `min_speech_duration` goes down to 0.1s in the panel, so a floor alone was a silent regression for anyone who lowered it (measured: a 0.48s segment at 40% density, kept before, discarded after).
+  - The floor counts only chunks **strictly above** `_segment_threshold`. The pre-speech ring buffer is stored *at* the threshold as a sentinel for "not measured" (its real confidence was below it), so counting it handed every fresh segment 0.096s of free credit and a trimmed or split remainder — whose pre-roll has been popped off the front — none at all: the same audio judged by two rules depending on where in the utterance it sat. `_MIN_VOICED_SECONDS` is 0.15 rather than 0.25 because 0.25 − 0.096 ≈ 0.154 is what the old constant actually demanded of a fresh segment; the calibration is preserved and the asymmetry is gone.
+  - The verdict is taken against `_segment_threshold`, the threshold the utterance was *accumulated* under, snapshotted at speech onset — judging a confidence history against a threshold it never saw discarded a 5.7s segment in the field (chunks accepted at 0.0, judged at 0.11).
+- **Short segment merge**: Segments below `min_speech_duration` are NOT discarded — VAD does a soft-reset (`_is_speaking=False`) but keeps the buffer, which naturally merges with the next speech onset. **That contract needs a next onset, so it does not hold at a boundary**: `pause()`, the session-end flush and `_flush_on_stop` call `flush_final()` (no min-speech gate, noise check still applied), never `flush()`. They used to call `flush()`, which with the shipped `min_speech_duration` of 2.0s silently ate every closing sentence shorter than two seconds — uncounted and unlogged.
+- **Buffer epoch**: `peek_buffer()` returns `(audio, duration, epoch)` and `trim_front(n, epoch)` refuses when the epoch moved. The interim ASR pass holds no lock across recognition, and in that window the capture thread can end the utterance, split it at max duration, or discard it as noise — after any of those, the trim it computed describes audio the buffer no longer holds. Applying it anyway deleted the head of the *next* sentence (measured: a 1.28s utterance trimmed to nothing) and left `_was_trimmed` set on a segment that was never trimmed. `_reset()` and `_split_at_best_pause()` bump the epoch. On a refusal `_do_interim_asr` keeps the committed text, the echo tail and `_interim_active`: the sentences are already written, and the flushed utterance's `vad_flush` is queued behind the pass, where `_process_interim_final` still needs both.
 - **Trimmed segment handling**: `_was_trimmed` flag (set by `trim_front`) ensures interim ASR remainders are `force_flush()`ed instead of being dropped by min_speech check
 
 ### Key Patterns
@@ -806,7 +949,7 @@ Continuous speech is processed incrementally to reduce latency (enabled by `incr
 - `Translator._build_system_prompt` catches format errors in user prompt templates, falls back to DEFAULT_PROMPT
 - Translation prompt presets: `PROMPT_PRESETS` in `translator.py` (daily/esports/anime), selectable via control panel combo
 - `translate_iter()` is a generator that yields accumulated partial text for streaming UI; `translate()` is the blocking equivalent
-- Streaming UI: `update_streaming_signal` → `ChatMessage.update_streaming()` with 50ms QTimer throttle; `set_translation()` finalizes
+- Streaming UI: `update_streaming_signal` → `ChatMessage.update_streaming()`, which renders immediately (the overlay's one-frame drain is the only batching; a second card-level throttle used to add up to another 50ms); `set_translation()` finalizes
 - `RepetitionError` raised when model output contains repetition loops (pattern length 8+); caught in `_translate_async`, shows user-facing warning
 - Changelog: `i18n/CHANGELOG_{lang}.md` files rendered as HTML in Settings → Changelog tab via `_load_latest_changelog()`. **Any user-visible change updates both `CHANGELOG_zh.md` and `CHANGELOG_en.md`** under a `## YYYY-MM-DD` heading — this is the project's established habit and every recent commit follows it. Write what changed for the user and why it mattered, not the diff; reference an issue number when there is one. Engineering-only changes (CI, packaging, dependencies) belong there too when they affect how the app is built or installed.
 

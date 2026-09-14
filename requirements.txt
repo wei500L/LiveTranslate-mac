@@ -9,6 +9,11 @@ httpx>=0.28.0
 # accepts. Without it httpx raises ImportError at request time.
 socksio>=1.0.0
 openai>=1.0.0
+soniox>=2.9,<3
+# websockets (soniox dependency) requires python-socks to
+# connect through a SOCKS system proxy; without it the connection
+# fails with ImportError on any proxied machine.
+python-socks>=2.4,<3
 psutil>=5.9.0
 
 # Audio capture (Windows WASAPI loopback)

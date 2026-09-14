@@ -22,7 +22,9 @@ def test_hy_mt_model_config_is_openai_compatible_and_local():
         "top_p": 1.0,
         "max_tokens": 128,
     }
-    assert model["extra_body"] == {"repetition_penalty": 1.05}
+    # Empty: any repetition_penalty would make mlx_lm.server route the request
+    # to its single-sequence path, serializing concurrent translations.
+    assert model["extra_body"] == {}
     assert is_hy_mt_model(model)
 
 
@@ -101,7 +103,9 @@ def test_hy_mt_request_uses_user_role_and_official_sampling(monkeypatch):
     assert request["temperature"] == 0.0
     assert request["top_p"] == 1.0
     assert request["max_tokens"] == 128
-    assert request["extra_body"] == {"repetition_penalty": 1.05}
+    # No extra_body at all: the field is empty and the Translator omits it,
+    # keeping the request eligible for mlx_lm.server's batch path.
+    assert "extra_body" not in request
     assert request["stream"] is True
 
 
@@ -422,8 +426,9 @@ def test_the_managed_preset_asks_for_greedy_decoding():
     config = hy_mt_model_config()
     assert config["overrides"]["temperature"] == 0.0
     assert config["context_turns"] == 2
-    # The runaway guard stays; top_k is meaningless under greedy decoding.
-    assert config["extra_body"] == {"repetition_penalty": 1.05}
+    # Empty by design: repetition_penalty would disable mlx_lm.server-side
+    # batching. The loop guard is app-side (RepetitionError + max_tokens cap).
+    assert config["extra_body"] == {}
 
 
 def test_stale_operational_params_are_migrated_away():
@@ -437,4 +442,192 @@ def test_stale_operational_params_are_migrated_away():
     model = settings["models"][0]
     assert model["overrides"]["temperature"] == 0.0
     assert model["context_turns"] == 2
-    assert "top_k" not in model["extra_body"]
+    # The old shipped extra_body (top_k, repetition_penalty) migrates to the
+    # now-empty preset wholesale; the empty dict is what keeps the request
+    # batchable on the server.
+    assert model["extra_body"] == {}
+
+
+# --- port selection: occupied ports are dodged, never fought over ----------------
+
+def test_a_persisted_port_survives_migration_without_an_env_pin(monkeypatch):
+    """A port the manager moved to at runtime must survive restarts."""
+    import mlx_service
+
+    monkeypatch.setattr(mlx_service, "MLX_PORT_FROM_ENV", False)
+    settings = {"models": [hy_mt_model_config()]}
+    settings["models"][0]["managed_service"]["port"] = 8082
+
+    changed = ensure_hy_mt_model(settings)
+
+    entry = settings["models"][0]
+    assert entry["managed_service"]["port"] == 8082
+    assert entry["api_base"] == "http://127.0.0.1:8082/v1"
+    # The api_base followed the port; nothing else needed to change.
+    assert changed is True
+
+    # Second pass is a no-op: the entry is already self-consistent.
+    assert ensure_hy_mt_model(settings) is False
+
+
+def test_an_explicit_env_port_wins_over_the_persisted_one(monkeypatch):
+    """LIVETRANSLATE_MLX_PORT stays the pin: changing it migrates settings."""
+    import mlx_service
+
+    monkeypatch.setattr(mlx_service, "MLX_PORT_FROM_ENV", True)
+    settings = {"models": [hy_mt_model_config()]}
+    settings["models"][0]["managed_service"]["port"] = 8082
+
+    ensure_hy_mt_model(settings)
+
+    entry = settings["models"][0]
+    assert entry["managed_service"]["port"] == mlx_service.MLX_PORT
+    assert entry["api_base"] == mlx_service.MLX_BASE_URL
+
+
+def test_managed_port_for_reads_the_entry_and_validates_it():
+    from mlx_service import managed_port_for
+
+    settings = {"models": [hy_mt_model_config()]}
+    settings["models"][0]["managed_service"]["port"] = 8085
+    assert managed_port_for(settings) == 8085
+
+    settings["models"][0]["managed_service"]["port"] = "8085"
+    assert managed_port_for(settings) == __import__("mlx_service").MLX_PORT
+
+    assert managed_port_for({}) == __import__("mlx_service").MLX_PORT
+
+
+def test_sync_managed_endpoint_rewrites_and_is_idempotent():
+    from mlx_service import sync_managed_endpoint
+
+    entry = hy_mt_model_config()
+
+    assert sync_managed_endpoint(entry, 8083) is True
+    assert entry["managed_service"]["port"] == 8083
+    assert entry["api_base"] == "http://127.0.0.1:8083/v1"
+    assert sync_managed_endpoint(entry, 8083) is False
+
+    # Garbage and non-managed entries are refused, not written.
+    assert sync_managed_endpoint(entry, 0) is False
+    assert sync_managed_endpoint({"name": "x"}, 8083) is False
+
+
+def test_next_free_port_skips_occupied_ports(tmp_path, monkeypatch):
+    manager = MLXServiceManager(root=tmp_path)
+    def _occupied(port=None):
+        return (manager.port if port is None else port) in (8080, 8081)
+
+    monkeypatch.setattr(manager, "_port_is_open", _occupied)
+
+    assert manager._next_free_port() == 8082
+
+
+def test_ensure_running_starts_on_the_next_free_port(tmp_path, monkeypatch):
+    """The occupied default is dodged, and the command binds the new port."""
+    import mlx_service
+
+    manager = MLXServiceManager(root=tmp_path)
+    monkeypatch.setattr(manager, "is_running", lambda: False)
+    monkeypatch.setattr(manager, "is_model_ready", lambda: True)
+    monkeypatch.setattr(manager, "is_environment_ready", lambda: True)
+    def _occupied(port=None):
+        return (manager.port if port is None else port) in (8080, 8081)
+
+    monkeypatch.setattr(manager, "_port_is_open", _occupied)
+
+    started = {}
+
+    class _FakeProcess:
+        pid = 4242
+
+        @staticmethod
+        def poll():
+            return None
+
+    def _fake_popen(command, **kwargs):
+        started["command"] = command
+        return _FakeProcess()
+
+    probed = {}
+
+    def _fake_probe(port=None):
+        probed["port"] = manager.port if port is None else port
+        return {"object": "list", "data": []}
+
+    monkeypatch.setattr(mlx_service.subprocess, "Popen", _fake_popen)
+    monkeypatch.setattr(manager, "_probe", _fake_probe)
+
+    manager.ensure_running(timeout=1.0)
+
+    assert manager.port == 8082
+    assert started["command"][started["command"].index("--port") + 1] == "8082"
+    assert probed["port"] == 8082
+    # The pid file names the process we spawned.
+    assert manager._read_pid() == 4242
+
+
+def test_ensure_running_gives_up_only_when_every_candidate_is_taken(
+    tmp_path, monkeypatch,
+):
+    import mlx_service
+    import pytest
+    from mlx_service import MLXServiceError
+
+    manager = MLXServiceManager(root=tmp_path)
+    monkeypatch.setattr(manager, "is_running", lambda: False)
+    monkeypatch.setattr(manager, "is_model_ready", lambda: True)
+    monkeypatch.setattr(manager, "is_environment_ready", lambda: True)
+    monkeypatch.setattr(manager, "_port_is_open", lambda port=None: True)
+    # The scan must exhaust before anything is spawned. The template
+    # translate mimics i18n and proves the {port}/{attempts} params resolve.
+    manager.translate = lambda key: "port {port} attempts {attempts}"
+
+    with pytest.raises(MLXServiceError) as excinfo:
+        manager.ensure_running(timeout=1.0)
+
+    assert "8080" in str(excinfo.value)
+    assert str(mlx_service.MLX_PORT_SCAN_ATTEMPTS) in str(excinfo.value)
+
+
+def test_is_running_adopts_the_port_from_the_owned_process(tmp_path, monkeypatch):
+    """The command line, not the persisted port, says where our server is."""
+    manager = MLXServiceManager(root=tmp_path)
+    manager.port = 8080
+    monkeypatch.setattr(manager, "_read_pid", lambda: 42)
+    monkeypatch.setattr(manager, "_pid_is_owned", lambda pid: True)
+    monkeypatch.setattr(manager, "_owned_process_port", lambda pid: 8082)
+
+    probed = {}
+
+    def _fake_probe(port=None):
+        probed["port"] = manager.port if port is None else port
+        return {"object": "list", "data": []}
+
+    monkeypatch.setattr(manager, "_probe", _fake_probe)
+
+    assert manager.is_running() is True
+    # Probed where the process actually listens, and adopted it.
+    assert probed["port"] == 8082
+    assert manager.port == 8082
+
+
+def test_owned_process_port_parses_the_command_line(tmp_path, monkeypatch):
+    import mlx_service
+
+    manager = MLXServiceManager(root=tmp_path)
+    monkeypatch.setattr(
+        mlx_service.subprocess,
+        "check_output",
+        lambda *a, **k: (
+            "mlx_lm.server --model /x/hy-mt --host 127.0.0.1 --port 8082"
+        ),
+    )
+    assert manager._owned_process_port(42) == 8082
+
+    monkeypatch.setattr(
+        mlx_service.subprocess,
+        "check_output",
+        lambda *a, **k: "mlx_lm.server --model /x/hy-mt",
+    )
+    assert manager._owned_process_port(42) is None
