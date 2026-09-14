@@ -4,6 +4,11 @@ Every preset must keep the two-line hierarchy the card layout is built
 on: the original line is secondary (smaller font, distinct color) and the
 translation line is primary. A preset where the two lines collapse to the
 same color/size flattens the layout back to what the redesign replaced.
+
+The checks themselves need no Qt, but the module they read from does, so
+the import is guarded: the light CI recipe installs neither PyQt6 nor
+psutil on purpose, and an unguarded collection-time import there aborts
+the whole run instead of skipping this file.
 """
 
 from __future__ import annotations
@@ -11,19 +16,23 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from subtitle_overlay import (  # noqa: E402
-    DEFAULT_STYLE,
-    FONT_SCALE_MAX,
-    FONT_SCALE_MIN,
-    FONT_SCALE_REFERENCE_WIDTH,
-    MIN_SCALED_FONT_PT,
-    STYLE_PRESETS,
-    font_scale_for_width,
-    migrate_style,
-    scaled_font_size,
+subtitle_overlay = pytest.importorskip(
+    "subtitle_overlay", reason="subtitle_overlay needs PyQt6"
 )
+
+DEFAULT_STYLE = subtitle_overlay.DEFAULT_STYLE
+FONT_SCALE_MAX = subtitle_overlay.FONT_SCALE_MAX
+FONT_SCALE_MIN = subtitle_overlay.FONT_SCALE_MIN
+FONT_SCALE_REFERENCE_WIDTH = subtitle_overlay.FONT_SCALE_REFERENCE_WIDTH
+MIN_SCALED_FONT_PT = subtitle_overlay.MIN_SCALED_FONT_PT
+STYLE_PRESETS = subtitle_overlay.STYLE_PRESETS
+font_scale_for_width = subtitle_overlay.font_scale_for_width
+migrate_style = subtitle_overlay.migrate_style
+scaled_font_size = subtitle_overlay.scaled_font_size
 
 
 def test_every_preset_keeps_two_line_hierarchy():

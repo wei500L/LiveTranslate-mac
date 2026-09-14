@@ -9,6 +9,12 @@ urllib.request.getproxies() — not just environment variables — so this hits
 any proxied machine even with a clean shell. python-socks is the declared
 dependency that makes that path work; this test pins it without touching the
 network.
+
+Guarded on ``websockets`` rather than on ``python-socks`` itself: skipping
+exactly when the dependency is missing would make the guard vacuous, since a
+missing dependency is the failure being pinned. The light CI recipe installs
+no websockets stack at all and skips this file; the full recipe installs both
+and runs it.
 """
 
 from __future__ import annotations
@@ -16,7 +22,13 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+pytest.importorskip(
+    "websockets", reason="websockets (a soniox dependency) is not installed"
+)
 
 
 def test_socks_proxy_dependency_is_importable():

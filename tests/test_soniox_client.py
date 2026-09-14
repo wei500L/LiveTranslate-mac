@@ -230,6 +230,21 @@ class RecordingSink:
             self.metrics.append(metrics)
 
 
+class _StandInConfig:
+    """Stand-in for the SDK's config dataclasses when soniox is absent.
+
+    The manager only *constructs* these and hands them to the client; the
+    fake session never reads them back, so accepting the keyword arguments is
+    the entire contract. This used to be a bare ``object``, which made every
+    connect fail with "object() takes no arguments" on a machine without the
+    SDK — invisible locally (the real types were importable) and fatal in the
+    light CI recipe, where they are not.
+    """
+
+    def __init__(self, **kwargs):
+        self.__dict__.update(kwargs)
+
+
 @pytest.fixture()
 def factory(monkeypatch):
     f = _Factory()
@@ -238,10 +253,12 @@ def factory(monkeypatch):
     monkeypatch.setattr(sys.modules[__name__], "_active_factory", f)
     monkeypatch.setattr(
         soniox_client, "_import_soniox",
-        lambda: (lambda **kw: FakeSonioxClient(**kw), object, object),
+        lambda: (lambda **kw: FakeSonioxClient(**kw), _StandInConfig, _StandInConfig),
     )
-    # The manager builds its config via _import_soniox types; provide the
-    # real soniox types when available, else minimal stand-ins.
+    # The manager builds its config via _import_soniox types; prefer the real
+    # soniox types when the SDK is installed, and keep the stand-ins above
+    # when it is not (the SDK-free path must stay runnable — these tests fake
+    # the SDK at the seam precisely so they can run without it).
     try:
         import soniox.types as real_types
 
@@ -319,6 +336,10 @@ def test_resolve_api_key_env_wins(monkeypatch):
 
 
 def test_parse_context_rules():
+    # parse_context builds the SDK's StructuredContext items, so the real
+    # soniox types are required: the light CI recipe (no SDK) skips this
+    # rather than failing on the import.
+    pytest.importorskip("soniox.types")
     assert parse_context("") is None
     assert parse_context("   \n  \n") is None
     ctx = parse_context("Курс лекций по термодинамике\nэнтропия => 熵\n")
@@ -686,6 +707,9 @@ def test_api_key_never_logged(factory, caplog):
 
 
 def test_metrics_count_reconnects(factory):
+    # apply_config with a real context rebuilds the SDK config through
+    # parse_context, which needs the real soniox types (see above).
+    pytest.importorskip("soniox.types")
     manager, sink = make_manager(factory)
     manager.start()
     assert factory.session_ready.wait(timeout=5.0)

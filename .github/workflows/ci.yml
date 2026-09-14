@@ -43,6 +43,10 @@ jobs:
         # skips here and still runs in the light release.yml environment —
         # the swap is count-neutral. The other 3 skips are the bundle tests
         # that need a project .venv, which a CI checkout lacks.
+        # python-socks is a declared runtime dependency (requirements*.txt):
+        # websockets takes its SOCKS branch on any machine with a system
+        # proxy and needs it there, so the recipe that mirrors the real
+        # runtime stack must carry it. test_soniox_proxy.py pins it.
         run: |
           python -m pip install --disable-pip-version-check \
             "numpy>=1.24,<2.3" \
@@ -63,7 +67,8 @@ jobs:
             "fastapi>=0.141,<1.0" \
             "uvicorn>=0.52,<1.0" \
             "faster-whisper>=1.0,<2" \
-            "soniox>=2.9,<3"
+            "soniox>=2.9,<3" \
+            "python-socks>=2.4,<3"
       - name: Run tests
         run: python -m pytest -q
 
