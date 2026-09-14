@@ -87,8 +87,8 @@ def test_yo_is_folded_to_e_for_matching():
 def test_builtin_glossaries_parse_without_duplicates():
     for text in (LINEAR_ALGEBRA, DISCRETE_MATH):
         glossary = parse_glossary(text)
-        # 120–200 entries per course, word-form expansion included.
-        assert 120 <= len(glossary.entries) <= 200
+        # 300–400 entries per course, word-form expansion included.
+        assert 300 <= len(glossary.entries) <= 400
         originals = [e.normalized_original for e in glossary.entries]
         assert len(originals) == len(set(originals))
     # Entries shared by both courses must agree on the translation, so the
@@ -137,11 +137,21 @@ def test_builtin_glossaries_cover_common_inflections():
         "Умножим матрицу на вектор, найдём ранг и базис."
     )
     assert rendered.count('class="term-highlight"') == 4
+    # Expansion-era terms: phrases and case forms added later still match.
+    rendered = la.highlight_original(
+        "Приведём матрицу к диагональному виду и разложим вектор "
+        "по элементам ортонормированного базиса."
+    )
+    assert rendered.count('class="term-highlight"') == 4
     dm = parse_glossary(DISCRETE_MATH)
     rendered = dm.highlight_original(
         "Рассмотрим граф, дерево и множество вершин."
     )
     assert rendered.count('class="term-highlight"') == 4
+    rendered = dm.highlight_original(
+        "Матрица смежности и полустепень захода задают ориентированный граф."
+    )
+    assert rendered.count('class="term-highlight"') == 3
 
 
 def test_merged_glossary_user_entries_override_builtin():

@@ -501,25 +501,31 @@ terminology.py          Deterministic subtitle glossary: parse_glossary() parses
                          excluded from the matching term tuples;
                          short_cjk_translations() backs the panel's visible
                          warning so a user entry is never dropped silently.
-glossary_builtin.py     Built-in course glossaries (LINEAR_ALGEBRA /
-                         DISCRETE_MATH, ~200 entries each) as plain
+glossary_builtin.py     Built-in course glossaries (LINEAR_ALGEBRA / DISCRETE_MATH,
+                         328 and 326 entries) as plain
                          parse_glossary()-shaped text constants. Russian is
                          inflected and matching is literal, so each term ships
                          its nominative plus the oblique cases actually heard in
-                         a lecture (матрица alone never matches матрицу);
-                         translations are ≥2 Chinese characters wherever a
-                         standard two-character rendering exists (基底 not 基,
-                         维数 not 维). The deliberate exceptions — terms whose
-                         only standard translation is one character (秩/行/图/
-                         树/…) — are registered in SINGLE_CHAR_TRANSLATIONS and
-                         rely on terminology.py's CJK length rule to stay
-                         inert on the translation side. merged_glossary_text()
-                         concatenates built-in + user text (user last, so user
-                         entries override on the same normalized original). The
-                         built-in text is NEVER persisted to user_settings.json
-                         and never pre-filled into the panel's text box: a value
-                         written there once is frozen at that build forever (the
-                         same trap migrate_style guards against).
+                         a lecture (матрица alone never matches матрицу; phrase
+                         entries carry only their 1–2 most common forms, so
+                         «к диагональному виду» is a separate entry from
+                         «приведение к диагональному виду»); translations are
+                         ≥2 Chinese characters wherever a standard
+                         two-character rendering exists (基底 not 基,
+                         维数 not 维). The discrete table carries the number
+                         theory / automata / coding / probability blocks a
+                         Russian discrete-math course typically includes. The
+                         deliberate exceptions — terms whose only standard
+                         translation is one character (秩/行/图/树/…) — are
+                         registered in SINGLE_CHAR_TRANSLATIONS and rely on
+                         terminology.py's CJK length rule to stay inert on the
+                         translation side. merged_glossary_text() concatenates
+                         built-in + user text (user last, so user entries
+                         override on the same normalized original). The built-in
+                         text is NEVER persisted to user_settings.json and never
+                         pre-filled into the panel's text box: a value written
+                         there once is frozen at that build forever (the same
+                         trap migrate_style guards against).
 torch_backend.py         Device capability layer (mps/cuda availability, device normalization)
 ui_theme.py              Shared Qt styling
 i18n.py                  t() lookup, LANGUAGES list, system language detection
